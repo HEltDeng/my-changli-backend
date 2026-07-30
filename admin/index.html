@@ -1,0 +1,62 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>我的长理 · 本地管理后台</title>
+  <link rel="stylesheet" href="/admin/styles.css">
+</head>
+<body>
+  <div id="toast" class="toast" aria-live="polite"></div>
+
+  <main id="login-view" class="login-shell">
+    <section class="login-card">
+      <div class="brand-mark">长理</div>
+      <p class="eyebrow">MY CHANGLI</p>
+      <h1>本地管理后台</h1>
+      <p class="muted">数据只保存在当前电脑，不对公网开放。</p>
+      <form id="login-form" class="stack">
+        <label>管理员用户名<input id="login-username" autocomplete="username" required></label>
+        <label>密码<input id="login-password" type="password" autocomplete="current-password" required></label>
+        <button class="primary" type="submit">安全登录</button>
+        <p id="login-error" class="error" role="alert"></p>
+      </form>
+    </section>
+  </main>
+
+  <div id="app-view" class="app-shell hidden">
+    <aside class="sidebar">
+      <div class="brand-row"><div class="brand-mark small">长理</div><div><strong>我的长理</strong><span>本地管理后台</span></div></div>
+      <nav id="nav">
+        <button data-page="overview" class="active">概览</button>
+        <button data-page="venues">场地与库存</button>
+        <button data-page="reservations">预约记录</button>
+        <button data-page="lost">失物招领</button>
+        <button data-page="announcements">公告</button>
+        <button data-page="config">版本与功能</button>
+        <button data-page="feedback">用户反馈</button>
+      </nav>
+      <button id="logout-button" class="ghost logout">退出登录</button>
+    </aside>
+
+    <section class="workspace">
+      <header class="topbar">
+        <div><p class="eyebrow">LOCAL ADMIN</p><h2 id="page-title">概览</h2></div>
+        <div class="local-pill"><span></span>仅本机</div>
+      </header>
+      <div id="page-content" class="content" aria-live="polite"></div>
+    </section>
+  </div>
+
+  <dialog id="dialog">
+    <form id="dialog-form" method="dialog">
+      <div id="dialog-content"></div>
+      <div class="dialog-actions">
+        <button value="cancel" class="ghost">取消</button>
+        <button id="dialog-confirm" value="default" class="primary">确认</button>
+      </div>
+    </form>
+  </dialog>
+  <script src="/admin/app.js"></script>
+</body>
+</html>
