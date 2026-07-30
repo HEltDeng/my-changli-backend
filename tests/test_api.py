@@ -60,6 +60,177 @@ class ApiTest(unittest.TestCase):
         self.assertEqual(200, status)
         return response["data"]["token"]
 
+    def phone_account(self, installation_id=None):
+        phone = "19" + "".join(str(secrets.randbelow(10)) for _ in range(9))
+        password = secrets.token_urlsafe(18)
+        payload = {
+            "phone": phone,
+            "password": password,
+            "nickname": "自动化测试用户",
+        }
+        if installation_id:
+            payload["installationId"] = installation_id
+        status, response = self.call("POST", "/api/v1/auth/register", payload)
+        self.assertEqual(201, status)
+        return phone, password, response["data"]["token"], response["data"]["user"]
+
+    def admin_token(self):
+        generated_secret = secrets.token_urlsafe(24)
+        digest, salt = server.password_record(generated_secret)
+        admin_id = "admin-" + secrets.token_hex(8)
+        username = "admin-" + secrets.token_hex(8)
+        with server.connection() as db:
+            db.execute(
+                """INSERT INTO users(
+                       id,username,password_hash,password_salt,role,account_type,nickname,created_at
+                   ) VALUES(?,?,?,?, 'ADMIN','ADMIN','测试管理员',?)""",
+                (admin_id, username, digest, salt, server.now_ms()),
+            )
+        status, login = self.call(
+            "POST",
+            "/api/v1/auth/login",
+            {"username": username, "password": generated_secret},
+        )
+        self.assertEqual(200, status)
+        return login["data"]["token"]
+
+    def test_phone_account_gate_and_device_data_migration(self):
+        installation_id = "migration-" + secrets.token_hex(8)
+        device = self.device_token(installation_id)
+        payload = {
+            "clientLocalId": "migrated-" + secrets.token_hex(8),
+            "type": "LOST",
+            "itemName": "测试物品",
+            "category": "OTHER",
+            "location": "本地测试地点",
+            "eventDate": date.today().isoformat(),
+        }
+        self.assertEqual(201, self.call("POST", "/api/v1/lost-found", payload, device)[0])
+        phone, password, token, user = self.phone_account(installation_id)
+        self.assertEqual("PHONE", user["accountType"])
+        self.assertNotIn(phone, json.dumps(user, ensure_ascii=False))
+        self.assertEqual(401, self.call("GET", "/api/v1/auth/me", token=device)[0])
+        self.assertEqual(200, self.call("GET", "/api/v1/auth/me", token=token)[0])
+        status, posts = self.call("GET", "/api/v1/lost-found?mine=true", token=token)
+        self.assertEqual(200, status)
+        self.assertTrue(any(row["itemName"] == "测试物品" for row in posts["data"]))
+        self.assertEqual(409, self.call(
+            "POST",
+            "/api/v1/auth/register",
+            {"phone": phone, "password": password, "nickname": "重复账号"},
+        )[0])
+        self.assertEqual(200, self.call(
+            "POST",
+            "/api/v1/auth/login",
+            {"phone": phone, "password": password},
+        )[0])
+
+    def test_reservation_rules_maintenance_and_admin_override(self):
+        _, _, user_token, user = self.phone_account()
+        admin = self.admin_token()
+        self.assertEqual(200, self.call(
+            "PUT",
+            "/api/v1/admin/reservation-rules",
+            {
+                "maxActivePerDay": 1,
+                "maxUserCancellationsPerDay": 1,
+                "cancelCutoffMinutes": 0,
+                "restrictionHoursAfterExcessCancel": 1,
+            },
+            admin,
+        )[0])
+        booking_date = (date.today() + timedelta(days=1)).isoformat()
+        request = {
+            "venueId": "badminton",
+            "date": booking_date,
+            "timeSlot": "09:00-10:00",
+            "courtNumber": 6,
+        }
+        status, created = self.call(
+            "POST", "/api/v1/sports/reservations", request, user_token
+        )
+        self.assertEqual(201, status)
+        request["courtNumber"] = 7
+        self.assertEqual(429, self.call(
+            "POST", "/api/v1/sports/reservations", request, user_token
+        )[0])
+        reservation_id = created["data"]["id"]
+        self.assertEqual(200, self.call(
+            "POST", f"/api/v1/sports/reservations/{reservation_id}/cancel", {}, user_token
+        )[0])
+        self.assertEqual(429, self.call(
+            "POST", "/api/v1/sports/reservations", request, user_token
+        )[0])
+        self.assertEqual(200, self.call(
+            "POST",
+            f"/api/v1/admin/users/{user['id']}/clear-restrictions",
+            {},
+            admin,
+        )[0])
+        self.assertEqual(201, self.call(
+            "POST", "/api/v1/sports/reservations", request, user_token
+        )[0])
+        self.assertEqual(200, self.call(
+            "PUT",
+            "/api/v1/admin/flags/sports_reservation",
+            {
+                "enabled": False,
+                "payload": {
+                    "status": "MAINTENANCE",
+                    "maintenanceNote": "自动化维护测试",
+                },
+            },
+            admin,
+        )[0])
+        status, error = self.call("GET", "/api/v1/sports/venues", token=user_token)
+        self.assertEqual(503, status)
+        self.assertEqual("FEATURE_UNAVAILABLE", error["error"]["code"])
+        self.assertEqual(200, self.call(
+            "PUT",
+            "/api/v1/admin/flags/sports_reservation",
+            {"enabled": True, "payload": {"status": "OPEN"}},
+            admin,
+        )[0])
+
+    def test_feedback_workflow_announcement_delete_and_audit(self):
+        _, _, user_token, _ = self.phone_account()
+        admin = self.admin_token()
+        status, feedback = self.call(
+            "POST",
+            "/api/v1/feedback",
+            {"category": "建议", "content": "本地自动化反馈", "appVersion": "test"},
+            user_token,
+        )
+        self.assertEqual(201, status)
+        feedback_id = feedback["data"]["id"]
+        self.assertEqual(200, self.call(
+            "PATCH",
+            f"/api/v1/admin/feedback/{feedback_id}",
+            {"status": "RESOLVED"},
+            admin,
+        )[0])
+        status, announcement = self.call(
+            "POST",
+            "/api/v1/admin/announcements",
+            {"title": "待删除公告", "content": "自动化测试", "enabled": True},
+            admin,
+        )
+        self.assertEqual(201, status)
+        announcement_id = announcement["data"]["id"]
+        self.assertEqual(200, self.call(
+            "DELETE", f"/api/v1/admin/announcements/{announcement_id}", token=admin
+        )[0])
+        status, bootstrap = self.call("GET", "/api/v1/public/bootstrap")
+        self.assertEqual(200, status)
+        self.assertFalse(any(
+            row["id"] == announcement_id for row in bootstrap["data"]["announcements"]
+        ))
+        status, audits = self.call("GET", "/api/v1/admin/audit-logs", token=admin)
+        self.assertEqual(200, status)
+        self.assertTrue(any(
+            row["action"] == "ANNOUNCEMENT_DELETED" for row in audits["data"]
+        ))
+
     def test_health_and_bootstrap(self):
         self.assertEqual(200, self.call("GET", "/health")[0])
         status, body = self.call("GET", "/api/v1/public/bootstrap")

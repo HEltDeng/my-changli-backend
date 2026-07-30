@@ -17,6 +17,7 @@ import secrets
 import sqlite3
 import time
 import uuid
+from functools import lru_cache
 from datetime import date, datetime, timedelta
 from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -74,21 +75,49 @@ def connection() -> sqlite3.Connection:
     return db
 
 
+def ensure_column(
+    db: sqlite3.Connection, table: str, column: str, definition: str
+) -> None:
+    columns = {
+        row["name"] for row in db.execute(f"PRAGMA table_info({table})").fetchall()
+    }
+    if column not in columns:
+        db.execute(f"ALTER TABLE {table} ADD COLUMN {column} {definition}")
+
+
 def initialize_database() -> None:
     UPLOADS.mkdir(parents=True, exist_ok=True)
     with connection() as db:
         db.executescript((ROOT / "schema.sql").read_text(encoding="utf-8"))
-        venue_columns = {
-            row["name"] for row in db.execute("PRAGMA table_info(venues)").fetchall()
-        }
-        if "operating_status" not in venue_columns:
-            db.execute(
-                "ALTER TABLE venues ADD COLUMN operating_status TEXT NOT NULL DEFAULT 'OPEN'"
-            )
-        if "maintenance_note" not in venue_columns:
-            db.execute(
-                "ALTER TABLE venues ADD COLUMN maintenance_note TEXT NOT NULL DEFAULT ''"
-            )
+        ensure_column(db, "venues", "operating_status", "TEXT NOT NULL DEFAULT 'OPEN'")
+        ensure_column(db, "venues", "maintenance_note", "TEXT NOT NULL DEFAULT ''")
+        ensure_column(db, "venues", "expected_restore_at", "INTEGER")
+        ensure_column(db, "users", "account_type", "TEXT NOT NULL DEFAULT 'DEVICE'")
+        ensure_column(db, "users", "nickname", "TEXT NOT NULL DEFAULT '长理同学'")
+        ensure_column(db, "users", "phone_hash", "TEXT")
+        ensure_column(db, "users", "phone_masked", "TEXT")
+        ensure_column(db, "users", "student_id", "TEXT")
+        ensure_column(db, "users", "real_name", "TEXT")
+        ensure_column(db, "users", "campus_verified", "INTEGER NOT NULL DEFAULT 0")
+        ensure_column(db, "users", "campus_verified_at", "INTEGER")
+        ensure_column(db, "users", "account_status", "TEXT NOT NULL DEFAULT 'ACTIVE'")
+        ensure_column(db, "reservations", "refund_status", "TEXT NOT NULL DEFAULT 'NOT_APPLICABLE'")
+        ensure_column(db, "reservations", "reservation_code", "TEXT")
+        ensure_column(db, "reservations", "verification_status", "TEXT NOT NULL DEFAULT 'NOT_REQUIRED'")
+        ensure_column(db, "reservations", "cancelled_at", "INTEGER")
+        ensure_column(db, "reservations", "cancelled_by", "TEXT")
+        ensure_column(db, "reservations", "cancel_reason", "TEXT")
+        ensure_column(db, "feedback", "workflow_status", "TEXT NOT NULL DEFAULT 'OPEN'")
+        db.execute("CREATE UNIQUE INDEX IF NOT EXISTS users_phone_hash ON users(phone_hash) WHERE phone_hash IS NOT NULL")
+        db.execute(
+            """UPDATE users SET account_type=CASE
+               WHEN role='ADMIN' THEN 'ADMIN'
+               WHEN username LIKE 'device_%' THEN 'DEVICE'
+               ELSE account_type END"""
+        )
+        db.execute(
+            "UPDATE feedback SET workflow_status=status WHERE workflow_status IS NULL OR workflow_status=''"
+        )
         timestamp = now_ms()
         venues = [
             ("badminton", "BADMINTON", "羽毛球馆", "场", 8, 20),
@@ -130,6 +159,31 @@ def initialize_database() -> None:
                    ON CONFLICT(key) DO NOTHING""",
                 (key, enabled, timestamp),
             )
+        db.execute(
+            """INSERT INTO reservation_rules(
+                   id,max_active_per_day,max_user_cancellations_per_day,
+                   cancel_cutoff_minutes,restriction_hours_after_excess_cancel,updated_at
+               ) VALUES('default',2,2,30,24,?)
+               ON CONFLICT(id) DO NOTHING""",
+            (timestamp,),
+        )
+        for feature_key in ("sports_reservation", "lost_found"):
+            row = db.execute(
+                "SELECT payload_json FROM remote_flags WHERE key=?", (feature_key,)
+            ).fetchone()
+            payload = json.loads(row["payload_json"] or "{}") if row else {}
+            if "status" not in payload:
+                payload.update(
+                    {
+                        "status": "OPEN",
+                        "maintenanceNote": "",
+                        "expectedRestoreAt": None,
+                    }
+                )
+                db.execute(
+                    "UPDATE remote_flags SET payload_json=?,updated_at=? WHERE key=?",
+                    (json.dumps(payload, ensure_ascii=False), timestamp, feature_key),
+                )
     bootstrap_admin()
 
 
@@ -154,8 +208,10 @@ def bootstrap_admin() -> None:
     digest, salt = password_record(password)
     with connection() as db:
         db.execute(
-            """INSERT INTO users(id,username,password_hash,password_salt,role,created_at)
-               VALUES(?,?,?,?, 'ADMIN', ?) ON CONFLICT(username) DO NOTHING""",
+            """INSERT INTO users(
+                   id,username,password_hash,password_salt,role,account_type,nickname,created_at
+               ) VALUES(?,?,?,?, 'ADMIN','ADMIN','本地管理员',?)
+               ON CONFLICT(username) DO NOTHING""",
             (str(uuid.uuid4()), username, digest, salt, now_ms()),
         )
 
@@ -190,6 +246,226 @@ def parse_iso_date(value: str, *, future_allowed: bool = True) -> str:
     if not future_allowed and parsed > date.today():
         raise ApiError(400, "INVALID_DATE", "日期不能晚于今天")
     return parsed.isoformat()
+
+
+def normalize_phone(value: Any) -> str:
+    phone = re.sub(r"\s+", "", str(value or ""))
+    if not re.fullmatch(r"1[3-9]\d{9}", phone):
+        raise ApiError(400, "INVALID_PHONE", "请输入有效的 11 位手机号")
+    return phone
+
+
+@lru_cache(maxsize=1)
+def phone_hash_secret() -> bytes:
+    configured = os.getenv("MY_CHANGLI_PHONE_HASH_SECRET", "").encode()
+    if len(configured) >= 32:
+        return configured
+    secret_path = DB_PATH.parent / ".phone-hash-secret"
+    secret_path.parent.mkdir(parents=True, exist_ok=True)
+    if secret_path.is_file():
+        existing = secret_path.read_bytes()
+        if len(existing) >= 32:
+            return existing
+    generated = secrets.token_bytes(48)
+    secret_path.write_bytes(generated)
+    return generated
+
+
+def phone_digest(phone: str) -> str:
+    return hmac.new(phone_hash_secret(), phone.encode(), hashlib.sha256).hexdigest()
+
+
+def phone_mask(phone: str) -> str:
+    return f"{phone[:3]}****{phone[-4:]}"
+
+
+def device_username(installation_id: str) -> str:
+    return "device_" + hashlib.sha256(installation_id.encode()).hexdigest()[:32]
+
+
+def migrate_device_data(
+    db: sqlite3.Connection, installation_id: str | None, target_user_id: str
+) -> bool:
+    if not installation_id:
+        return False
+    source = db.execute(
+        "SELECT * FROM users WHERE username=? AND account_type='DEVICE'",
+        (device_username(installation_id),),
+    ).fetchone()
+    if not source or source["id"] == target_user_id:
+        return False
+    source_id = source["id"]
+    db.execute(
+        """UPDATE lost_found_posts SET client_local_id=NULL
+           WHERE owner_user_id=? AND client_local_id IN (
+               SELECT client_local_id FROM lost_found_posts
+               WHERE owner_user_id=? AND client_local_id IS NOT NULL
+           )""",
+        (source_id, target_user_id),
+    )
+    db.execute("UPDATE reservations SET user_id=? WHERE user_id=?", (target_user_id, source_id))
+    db.execute(
+        "UPDATE lost_found_posts SET owner_user_id=? WHERE owner_user_id=?",
+        (target_user_id, source_id),
+    )
+    db.execute("UPDATE feedback SET user_id=? WHERE user_id=?", (target_user_id, source_id))
+    for table in ("lost_found_favorites", "lost_found_claims"):
+        db.execute(
+            f"""INSERT OR IGNORE INTO {table}(user_id,post_id,created_at)
+                SELECT ?,post_id,created_at FROM {table} WHERE user_id=?""",
+            (target_user_id, source_id),
+        )
+        db.execute(f"DELETE FROM {table} WHERE user_id=?", (source_id,))
+    db.execute(
+        """INSERT OR IGNORE INTO lost_found_reports(
+               id,user_id,post_id,reason,status,created_at
+           ) SELECT id,?,post_id,reason,status,created_at
+             FROM lost_found_reports WHERE user_id=?""",
+        (target_user_id, source_id),
+    )
+    db.execute("DELETE FROM lost_found_reports WHERE user_id=?", (source_id,))
+    db.execute(
+        "UPDATE reservation_events SET user_id=? WHERE user_id=?",
+        (target_user_id, source_id),
+    )
+    db.execute("DELETE FROM sessions WHERE user_id=?", (source_id,))
+    db.execute("DELETE FROM users WHERE id=?", (source_id,))
+    return True
+
+
+def serialize_user(user: sqlite3.Row) -> dict[str, Any]:
+    return {
+        "id": user["id"],
+        "role": user["role"],
+        "accountType": user["account_type"],
+        "nickname": user["nickname"],
+        "phoneMasked": user["phone_masked"],
+        "studentId": user["student_id"],
+        "realName": user["real_name"],
+        "campusVerified": bool(user["campus_verified"]),
+        "campusVerifiedAt": user["campus_verified_at"],
+        "accountStatus": user["account_status"],
+    }
+
+
+def write_audit(
+    db: sqlite3.Connection,
+    actor_user_id: str | None,
+    action: str,
+    entity_type: str,
+    entity_id: str | None,
+    details: dict[str, Any] | None = None,
+) -> None:
+    db.execute(
+        """INSERT INTO admin_audit_logs(
+               id,actor_user_id,action,entity_type,entity_id,details_json,created_at
+           ) VALUES(?,?,?,?,?,?,?)""",
+        (
+            str(uuid.uuid4()),
+            actor_user_id,
+            action,
+            entity_type,
+            entity_id,
+            json.dumps(details or {}, ensure_ascii=False, separators=(",", ":")),
+            now_ms(),
+        ),
+    )
+
+
+def write_reservation_event(
+    db: sqlite3.Connection,
+    reservation_id: str | None,
+    user_id: str | None,
+    actor_user_id: str | None,
+    action: str,
+    reason: str = "",
+    details: dict[str, Any] | None = None,
+) -> None:
+    db.execute(
+        """INSERT INTO reservation_events(
+               id,reservation_id,user_id,actor_user_id,action,reason,details_json,created_at
+           ) VALUES(?,?,?,?,?,?,?,?)""",
+        (
+            str(uuid.uuid4()),
+            reservation_id,
+            user_id,
+            actor_user_id,
+            action,
+            reason[:300],
+            json.dumps(details or {}, ensure_ascii=False, separators=(",", ":")),
+            now_ms(),
+        ),
+    )
+
+
+def feature_state(db: sqlite3.Connection, key: str) -> dict[str, Any]:
+    row = db.execute("SELECT * FROM remote_flags WHERE key=?", (key,)).fetchone()
+    if not row:
+        return {
+            "key": key,
+            "enabled": True,
+            "status": "OPEN",
+            "maintenanceNote": "",
+            "expectedRestoreAt": None,
+        }
+    payload = json.loads(row["payload_json"] or "{}")
+    status = str(payload.get("status", "OPEN")).upper()
+    if status not in {"OPEN", "CLOSED", "MAINTENANCE"}:
+        status = "OPEN"
+    return {
+        "key": key,
+        "enabled": bool(row["enabled"]),
+        "status": status,
+        "maintenanceNote": str(payload.get("maintenanceNote", ""))[:300],
+        "expectedRestoreAt": payload.get("expectedRestoreAt"),
+    }
+
+
+def ensure_feature_open(db: sqlite3.Connection, key: str, label: str) -> None:
+    state = feature_state(db, key)
+    if not state["enabled"] or state["status"] != "OPEN":
+        note = state["maintenanceNote"] or f"{label}暂时不可用，请稍后再试"
+        raise ApiError(503, "FEATURE_UNAVAILABLE", note)
+
+
+def reservation_rules(db: sqlite3.Connection) -> sqlite3.Row:
+    return db.execute(
+        "SELECT * FROM reservation_rules WHERE id='default'"
+    ).fetchone()
+
+
+def active_restriction(
+    db: sqlite3.Connection, user_id: str
+) -> sqlite3.Row | None:
+    return db.execute(
+        "SELECT * FROM user_restrictions WHERE user_id=?", (user_id,)
+    ).fetchone()
+
+
+def upsert_restriction(
+    db: sqlite3.Connection,
+    user_id: str,
+    reservation_blocked_until: int | None,
+    cancellation_blocked_until: int | None,
+    reason: str,
+) -> None:
+    db.execute(
+        """INSERT INTO user_restrictions(
+               user_id,reservation_blocked_until,cancellation_blocked_until,
+               reason,updated_at
+           ) VALUES(?,?,?,?,?)
+           ON CONFLICT(user_id) DO UPDATE SET
+           reservation_blocked_until=excluded.reservation_blocked_until,
+           cancellation_blocked_until=excluded.cancellation_blocked_until,
+           reason=excluded.reason,updated_at=excluded.updated_at""",
+        (
+            user_id,
+            reservation_blocked_until,
+            cancellation_blocked_until,
+            reason[:300],
+            now_ms(),
+        ),
+    )
 
 
 class ApiHandler(BaseHTTPRequestHandler):
@@ -236,6 +512,8 @@ class ApiHandler(BaseHTTPRequestHandler):
         ).fetchone()
         if not user:
             raise ApiError(401, "SESSION_EXPIRED", "登录状态已过期")
+        if user["account_status"] != "ACTIVE":
+            raise ApiError(403, "ACCOUNT_UNAVAILABLE", "账号当前不可用，请联系管理员")
         if role and user["role"] != role:
             raise ApiError(403, "FORBIDDEN", "权限不足")
         return user
@@ -331,6 +609,18 @@ class ApiHandler(BaseHTTPRequestHandler):
             return self.auth_login(), 200
         if method == "POST" and path == "/api/v1/auth/logout":
             return self.auth_logout(), 200
+        if method == "GET" and path == "/api/v1/auth/me":
+            return self.auth_me(), 200
+        if method == "PATCH" and path == "/api/v1/auth/profile":
+            return self.auth_profile(), 200
+        if method == "DELETE" and path == "/api/v1/auth/account":
+            return self.auth_delete_account(), 200
+        if path.startswith("/api/v1/sports/"):
+            with connection() as db:
+                ensure_feature_open(db, "sports_reservation", "体育预约")
+        if path.startswith("/api/v1/lost-found"):
+            with connection() as db:
+                ensure_feature_open(db, "lost_found", "失物招领")
         if method == "GET" and path == "/api/v1/sports/venues":
             return self.sports_venues(), 200
         if method == "GET" and path == "/api/v1/sports/availability":
@@ -375,46 +665,96 @@ class ApiHandler(BaseHTTPRequestHandler):
     def auth_device(self) -> dict[str, Any]:
         data = self.body_json()
         install_id = required_text(data, "installationId", 100)
-        username = "device_" + hashlib.sha256(install_id.encode()).hexdigest()[:32]
+        username = device_username(install_id)
         with connection() as db:
             user = db.execute("SELECT * FROM users WHERE username=?", (username,)).fetchone()
             if not user:
                 digest, salt = password_record(secrets.token_urlsafe(32))
                 user_id = str(uuid.uuid4())
                 db.execute(
-                    "INSERT INTO users VALUES(?,?,?,?, 'USER', ?)",
+                    """INSERT INTO users(
+                           id,username,password_hash,password_salt,role,account_type,
+                           nickname,account_status,created_at
+                       ) VALUES(?,?,?,?,'USER','DEVICE','测试设备','ACTIVE',?)""",
                     (user_id, username, digest, salt, now_ms()),
                 )
                 user = db.execute("SELECT * FROM users WHERE id=?", (user_id,)).fetchone()
-            return {"token": issue_token(db, user["id"]), "user": {"id": user["id"], "role": user["role"]}}
+            return {"token": issue_token(db, user["id"]), "user": serialize_user(user)}
 
     def auth_register(self) -> dict[str, Any]:
         data = self.body_json()
-        username = required_text(data, "username", 48)
+        phone = normalize_phone(data.get("phone"))
         password = required_text(data, "password", 200)
         if len(password) < 8:
             raise ApiError(400, "WEAK_PASSWORD", "密码至少 8 位")
+        nickname = str(data.get("nickname", "长理同学")).strip()[:30] or "长理同学"
+        digest_phone = phone_digest(phone)
+        username = "phone_" + digest_phone[:32]
         digest, salt = password_record(password)
         with connection() as db:
             user_id = str(uuid.uuid4())
             try:
                 db.execute(
-                    "INSERT INTO users VALUES(?,?,?,?, 'USER', ?)",
-                    (user_id, username, digest, salt, now_ms()),
+                    """INSERT INTO users(
+                           id,username,password_hash,password_salt,role,account_type,
+                           nickname,phone_hash,phone_masked,account_status,created_at
+                       ) VALUES(?,?,?,?,'USER','PHONE',?,?,?,'ACTIVE',?)""",
+                    (
+                        user_id,
+                        username,
+                        digest,
+                        salt,
+                        nickname,
+                        digest_phone,
+                        phone_mask(phone),
+                        now_ms(),
+                    ),
                 )
             except sqlite3.IntegrityError as exc:
-                raise ApiError(409, "USERNAME_EXISTS", "用户名已存在") from exc
-            return {"token": issue_token(db, user_id), "user": {"id": user_id, "role": "USER"}}
+                raise ApiError(409, "PHONE_EXISTS", "该手机号已经注册") from exc
+            migrated = migrate_device_data(
+                db, str(data.get("installationId", "")).strip() or None, user_id
+            )
+            user = db.execute("SELECT * FROM users WHERE id=?", (user_id,)).fetchone()
+            write_audit(
+                db,
+                user_id,
+                "USER_REGISTER",
+                "USER",
+                user_id,
+                {"migratedDeviceData": migrated},
+            )
+            return {"token": issue_token(db, user_id), "user": serialize_user(user)}
 
     def auth_login(self) -> dict[str, Any]:
         data = self.body_json()
-        username = required_text(data, "username", 48)
         password = required_text(data, "password", 200)
         with connection() as db:
-            user = db.execute("SELECT * FROM users WHERE username=?", (username,)).fetchone()
+            if str(data.get("phone", "")).strip():
+                phone = normalize_phone(data.get("phone"))
+                user = db.execute(
+                    "SELECT * FROM users WHERE phone_hash=?", (phone_digest(phone),)
+                ).fetchone()
+            else:
+                username = required_text(data, "username", 48)
+                user = db.execute(
+                    "SELECT * FROM users WHERE username=?", (username,)
+                ).fetchone()
             if not user or not verify_password(password, user["password_hash"], user["password_salt"]):
-                raise ApiError(401, "INVALID_CREDENTIALS", "用户名或密码错误")
-            return {"token": issue_token(db, user["id"]), "user": {"id": user["id"], "role": user["role"]}}
+                raise ApiError(401, "INVALID_CREDENTIALS", "账号或密码错误")
+            if user["account_status"] != "ACTIVE":
+                raise ApiError(403, "ACCOUNT_UNAVAILABLE", "账号当前不可用")
+            migrated = migrate_device_data(
+                db,
+                str(data.get("installationId", "")).strip() or None,
+                user["id"],
+            )
+            user = db.execute("SELECT * FROM users WHERE id=?", (user["id"],)).fetchone()
+            return {
+                "token": issue_token(db, user["id"]),
+                "user": serialize_user(user),
+                "migratedDeviceData": migrated,
+            }
 
     def auth_logout(self) -> dict[str, Any]:
         header = self.headers.get("Authorization", "")
@@ -423,6 +763,70 @@ class ApiHandler(BaseHTTPRequestHandler):
             with connection() as db:
                 db.execute("DELETE FROM sessions WHERE token_hash=?", (token_hash,))
         return {"loggedOut": True}
+
+    def auth_me(self) -> dict[str, Any]:
+        with connection() as db:
+            return serialize_user(self.current_user(db))
+
+    def auth_profile(self) -> dict[str, Any]:
+        data = self.body_json()
+        with connection() as db:
+            user = self.current_user(db)
+            nickname = str(data.get("nickname", user["nickname"])).strip()[:30]
+            if not nickname:
+                raise ApiError(400, "VALIDATION_ERROR", "昵称不能为空")
+            db.execute(
+                "UPDATE users SET nickname=? WHERE id=?", (nickname, user["id"])
+            )
+            return serialize_user(
+                db.execute("SELECT * FROM users WHERE id=?", (user["id"],)).fetchone()
+            )
+
+    def auth_delete_account(self) -> dict[str, Any]:
+        data = self.body_json()
+        password = required_text(data, "password", 200)
+        with connection() as db:
+            user = self.current_user(db)
+            if user["role"] == "ADMIN" or user["account_type"] != "PHONE":
+                raise ApiError(400, "ACCOUNT_DELETE_UNAVAILABLE", "该账号不能在 App 内注销")
+            if not verify_password(password, user["password_hash"], user["password_salt"]):
+                raise ApiError(401, "INVALID_CREDENTIALS", "密码错误")
+            timestamp = now_ms()
+            active_ids = [
+                row["id"]
+                for row in db.execute(
+                    "SELECT id FROM reservations WHERE user_id=? AND status='ACTIVE'",
+                    (user["id"],),
+                )
+            ]
+            db.execute(
+                """UPDATE reservations SET status='CANCELLED',cancelled_at=?,
+                   cancelled_by='ACCOUNT_DELETION',cancel_reason='账号注销',
+                   updated_at=? WHERE user_id=? AND status='ACTIVE'""",
+                (timestamp, timestamp, user["id"]),
+            )
+            for reservation_id in active_ids:
+                write_reservation_event(
+                    db,
+                    reservation_id,
+                    user["id"],
+                    user["id"],
+                    "ACCOUNT_DELETION_CANCEL",
+                    "账号注销",
+                )
+            random_digest, random_salt = password_record(secrets.token_urlsafe(40))
+            db.execute(
+                """UPDATE users SET account_status='DELETED',nickname='已注销用户',
+                   phone_hash=NULL,phone_masked=NULL,student_id=NULL,real_name=NULL,
+                   campus_verified=0,campus_verified_at=NULL,
+                   password_hash=?,password_salt=? WHERE id=?""",
+                (random_digest, random_salt, user["id"]),
+            )
+            db.execute("DELETE FROM sessions WHERE user_id=?", (user["id"],))
+            write_audit(
+                db, user["id"], "USER_ACCOUNT_DELETED", "USER", user["id"]
+            )
+            return {"deleted": True}
 
     def sports_venues(self) -> list[dict[str, Any]]:
         with connection() as db:
@@ -503,30 +907,54 @@ class ApiHandler(BaseHTTPRequestHandler):
             raise ApiError(400, "INVALID_DATE", "仅支持今天起未来 7 天")
         with connection() as db:
             user = self.current_user(db)
-            venue = db.execute(
-                "SELECT * FROM venues WHERE id=? AND enabled=1 AND operating_status='OPEN'",
-                (venue_id,),
-            ).fetchone()
-            if not venue or court not in range(1, venue["court_count"] + 1):
-                raise ApiError(400, "INVALID_INVENTORY", "场地选择无效")
-            slot_exists = db.execute(
-                """SELECT 1 FROM venue_time_slots WHERE venue_id=? AND enabled=1
-                   AND start_time || '-' || end_time=?""",
-                (venue_id, time_slot),
-            ).fetchone()
-            if not slot_exists:
-                raise ApiError(400, "INVALID_TIME_SLOT", "时间段不可预约")
-            blocked = db.execute(
-                """SELECT 1 FROM blocked_inventory WHERE venue_id=? AND booking_date=?
-                   AND time_slot=? AND court_number=?""",
-                (venue_id, booking_date, time_slot, court),
-            ).fetchone()
-            if blocked:
-                raise ApiError(409, "INVENTORY_UNAVAILABLE", "该场地当前不可预约")
             reservation_id = str(uuid.uuid4())
             timestamp = now_ms()
             try:
                 db.execute("BEGIN IMMEDIATE")
+                rules = reservation_rules(db)
+                restriction = active_restriction(db, user["id"])
+                if (
+                    restriction
+                    and restriction["reservation_blocked_until"]
+                    and restriction["reservation_blocked_until"] > timestamp
+                ):
+                    raise ApiError(
+                        429,
+                        "RESERVATION_RESTRICTED",
+                        restriction["reason"] or "当前账号暂时无法继续预约",
+                    )
+                active_count = db.execute(
+                    """SELECT COUNT(*) AS count FROM reservations
+                       WHERE user_id=? AND booking_date=? AND status='ACTIVE'""",
+                    (user["id"], booking_date),
+                ).fetchone()["count"]
+                if active_count >= rules["max_active_per_day"]:
+                    raise ApiError(
+                        429,
+                        "DAILY_RESERVATION_LIMIT",
+                        f"每天最多保留 {rules['max_active_per_day']} 条有效预约",
+                    )
+                venue = db.execute(
+                    """SELECT * FROM venues WHERE id=? AND enabled=1
+                       AND operating_status='OPEN'""",
+                    (venue_id,),
+                ).fetchone()
+                if not venue or court not in range(1, venue["court_count"] + 1):
+                    raise ApiError(400, "INVALID_INVENTORY", "场地选择无效或场馆维护中")
+                slot_exists = db.execute(
+                    """SELECT 1 FROM venue_time_slots WHERE venue_id=? AND enabled=1
+                       AND start_time || '-' || end_time=?""",
+                    (venue_id, time_slot),
+                ).fetchone()
+                if not slot_exists:
+                    raise ApiError(400, "INVALID_TIME_SLOT", "时间段不可预约")
+                blocked = db.execute(
+                    """SELECT 1 FROM blocked_inventory WHERE venue_id=? AND booking_date=?
+                       AND time_slot=? AND court_number=?""",
+                    (venue_id, booking_date, time_slot, court),
+                ).fetchone()
+                if blocked:
+                    raise ApiError(409, "INVENTORY_UNAVAILABLE", "该场地当前不可预约")
                 db.execute(
                     """INSERT INTO reservations(id,user_id,venue_id,booking_date,time_slot,
                        court_number,price_yuan,created_at,updated_at)
@@ -534,9 +962,43 @@ class ApiHandler(BaseHTTPRequestHandler):
                     (reservation_id, user["id"], venue_id, booking_date, time_slot, court,
                      venue["price_yuan"], timestamp, timestamp),
                 )
+                write_reservation_event(
+                    db,
+                    reservation_id,
+                    user["id"],
+                    user["id"],
+                    "CREATED",
+                    details={
+                        "bookingDate": booking_date,
+                        "timeSlot": time_slot,
+                        "courtNumber": court,
+                    },
+                )
                 db.execute("COMMIT")
+            except ApiError as exc:
+                write_reservation_event(
+                    db,
+                    None,
+                    user["id"],
+                    user["id"],
+                    "RESERVATION_REJECTED",
+                    exc.message,
+                    {"code": exc.code, "venueId": venue_id, "date": booking_date},
+                )
+                db.execute("COMMIT")
+                raise
             except sqlite3.IntegrityError as exc:
                 db.execute("ROLLBACK")
+                with connection() as event_db:
+                    write_reservation_event(
+                        event_db,
+                        None,
+                        user["id"],
+                        user["id"],
+                        "RESERVATION_REJECTED",
+                        "库存刚刚被其他用户预约",
+                        {"code": "INVENTORY_ALREADY_RESERVED"},
+                    )
                 raise ApiError(409, "INVENTORY_ALREADY_RESERVED", "该场地刚刚已被预约，请重新选择") from exc
             return self.reservation_by_id(db, reservation_id)
 
@@ -554,6 +1016,11 @@ class ApiHandler(BaseHTTPRequestHandler):
             "date": row["booking_date"], "timeSlot": row["time_slot"],
             "courtNumber": row["court_number"], "priceYuan": row["price_yuan"],
             "status": row["status"], "paymentStatus": row["payment_status"],
+            "refundStatus": row["refund_status"],
+            "verificationStatus": row["verification_status"],
+            "cancelledAtMillis": row["cancelled_at"],
+            "cancelledBy": row["cancelled_by"],
+            "cancelReason": row["cancel_reason"],
             "createdAtMillis": row["created_at"],
         }
 
@@ -569,13 +1036,111 @@ class ApiHandler(BaseHTTPRequestHandler):
     def sports_cancel(self, reservation_id: str) -> dict[str, Any]:
         with connection() as db:
             user = self.current_user(db)
-            changed = db.execute(
-                """UPDATE reservations SET status='CANCELLED',updated_at=?
+            timestamp = now_ms()
+            db.execute("BEGIN IMMEDIATE")
+            reservation = db.execute(
+                """SELECT * FROM reservations
                    WHERE id=? AND user_id=? AND status='ACTIVE'""",
-                (now_ms(), reservation_id, user["id"]),
-            ).rowcount
-            if not changed:
+                (reservation_id, user["id"]),
+            ).fetchone()
+            if not reservation:
+                db.execute("ROLLBACK")
                 raise ApiError(409, "CANNOT_CANCEL", "预约不存在或已取消")
+            rules = reservation_rules(db)
+            restriction = active_restriction(db, user["id"])
+            if (
+                restriction
+                and restriction["cancellation_blocked_until"]
+                and restriction["cancellation_blocked_until"] > timestamp
+            ):
+                write_reservation_event(
+                    db,
+                    reservation_id,
+                    user["id"],
+                    user["id"],
+                    "CANCEL_REJECTED",
+                    restriction["reason"] or "当前账号暂时无法继续取消预约",
+                    {"code": "CANCELLATION_RESTRICTED"},
+                )
+                db.execute("COMMIT")
+                raise ApiError(
+                    429,
+                    "CANCELLATION_RESTRICTED",
+                    restriction["reason"] or "当前账号暂时无法继续取消预约",
+                )
+            start_text = reservation["time_slot"].split("-", 1)[0]
+            start_at = datetime.strptime(
+                f"{reservation['booking_date']} {start_text}", "%Y-%m-%d %H:%M"
+            )
+            if datetime.now() + timedelta(minutes=rules["cancel_cutoff_minutes"]) >= start_at:
+                message = f"开场前 {rules['cancel_cutoff_minutes']} 分钟内不可自行取消"
+                write_reservation_event(
+                    db,
+                    reservation_id,
+                    user["id"],
+                    user["id"],
+                    "CANCEL_REJECTED",
+                    message,
+                    {"code": "CANCEL_CUTOFF"},
+                )
+                db.execute("COMMIT")
+                raise ApiError(409, "CANCEL_CUTOFF", message)
+            day_start = int(
+                datetime.combine(date.today(), datetime.min.time()).timestamp() * 1000
+            )
+            cancellation_count = db.execute(
+                """SELECT COUNT(*) AS count FROM reservation_events
+                   WHERE user_id=? AND action='USER_CANCELLED' AND created_at>=?""",
+                (user["id"], day_start),
+            ).fetchone()["count"]
+            if cancellation_count >= rules["max_user_cancellations_per_day"]:
+                blocked_until = timestamp + (
+                    rules["restriction_hours_after_excess_cancel"] * 60 * 60 * 1000
+                )
+                reason = (
+                    f"今日主动取消已达 {rules['max_user_cancellations_per_day']} 次，"
+                    f"请在限制结束后再试"
+                )
+                upsert_restriction(
+                    db, user["id"], blocked_until, blocked_until, reason
+                )
+                write_reservation_event(
+                    db,
+                    reservation_id,
+                    user["id"],
+                    user["id"],
+                    "CANCEL_REJECTED",
+                    reason,
+                    {"code": "DAILY_CANCELLATION_LIMIT"},
+                )
+                db.execute("COMMIT")
+                raise ApiError(429, "DAILY_CANCELLATION_LIMIT", reason)
+            db.execute(
+                """UPDATE reservations SET status='CANCELLED',cancelled_at=?,
+                   cancelled_by='USER',cancel_reason='用户主动取消',updated_at=?
+                   WHERE id=?""",
+                (timestamp, timestamp, reservation_id),
+            )
+            write_reservation_event(
+                db,
+                reservation_id,
+                user["id"],
+                user["id"],
+                "USER_CANCELLED",
+                "用户主动取消",
+            )
+            if cancellation_count + 1 >= rules["max_user_cancellations_per_day"]:
+                blocked_until = timestamp + (
+                    rules["restriction_hours_after_excess_cancel"] * 60 * 60 * 1000
+                )
+                reason = (
+                    f"今日主动取消已达 {rules['max_user_cancellations_per_day']} 次，"
+                    f"已暂时限制继续预约和取消"
+                )
+                upsert_restriction(
+                    db, user["id"], blocked_until, blocked_until, reason
+                )
+            db.execute("COMMIT")
             return self.reservation_by_id(db, reservation_id)
 
     def serialize_lost(self, db: sqlite3.Connection, row: sqlite3.Row, user_id: str) -> dict[str, Any]:
@@ -822,7 +1387,163 @@ class ApiHandler(BaseHTTPRequestHandler):
         self, method: str, path: str, query: dict[str, str]
     ) -> tuple[Any, int]:
         with connection() as db:
-            self.current_user(db, "ADMIN")
+            admin = self.current_user(db, "ADMIN")
+
+            if method == "GET" and path == "/api/v1/admin/users":
+                clauses = ["u.role='USER'"]
+                values: list[Any] = []
+                if query.get("q"):
+                    token = f"%{query['q'][:80]}%"
+                    clauses.append(
+                        """(u.nickname LIKE ? OR u.phone_masked LIKE ? OR
+                            u.student_id LIKE ? OR u.real_name LIKE ? OR u.id LIKE ?)"""
+                    )
+                    values.extend([token, token, token, token, token])
+                if query.get("status", "").upper() in {"ACTIVE", "SUSPENDED", "DELETED"}:
+                    clauses.append("u.account_status=?")
+                    values.append(query["status"].upper())
+                if query.get("accountType", "").upper() in {"PHONE", "DEVICE"}:
+                    clauses.append("u.account_type=?")
+                    values.append(query["accountType"].upper())
+                return [
+                    row_dict(row)
+                    for row in db.execute(
+                        """SELECT u.id,u.account_type,u.nickname,u.phone_masked,u.student_id,
+                                  u.real_name,u.campus_verified,u.campus_verified_at,
+                                  u.account_status,u.created_at,
+                                  (SELECT COUNT(*) FROM reservations r
+                                   WHERE r.user_id=u.id) AS reservation_count,
+                                  (SELECT COUNT(*) FROM reservation_events e
+                                   WHERE e.user_id=u.id AND e.action='USER_CANCELLED') AS cancellation_count,
+                                  ur.reservation_blocked_until,ur.cancellation_blocked_until,
+                                  ur.reason AS restriction_reason
+                           FROM users u
+                           LEFT JOIN user_restrictions ur ON ur.user_id=u.id
+                           WHERE """
+                        + " AND ".join(clauses)
+                        + " ORDER BY u.created_at DESC LIMIT 500",
+                        values,
+                    )
+                ], 200
+
+            match = re.fullmatch(r"/api/v1/admin/users/([^/]+)", path)
+            if method == "PATCH" and match:
+                data = self.body_json()
+                user = db.execute(
+                    "SELECT * FROM users WHERE id=? AND role='USER'", (match.group(1),)
+                ).fetchone()
+                if not user:
+                    raise ApiError(404, "USER_NOT_FOUND", "用户不存在")
+                account_status = str(
+                    data.get("accountStatus", user["account_status"])
+                ).upper()
+                if account_status not in {"ACTIVE", "SUSPENDED"}:
+                    raise ApiError(400, "VALIDATION_ERROR", "账号状态无效")
+                nickname = str(data.get("nickname", user["nickname"] or "长理同学")).strip()[:40]
+                student_id = str(data.get("studentId", user["student_id"] or "")).strip()[:32] or None
+                real_name = str(data.get("realName", user["real_name"] or "")).strip()[:40] or None
+                verified = 1 if bool(data.get("campusVerified", user["campus_verified"])) else 0
+                verified_at = user["campus_verified_at"]
+                if verified and not verified_at:
+                    verified_at = now_ms()
+                if not verified:
+                    verified_at = None
+                db.execute(
+                    """UPDATE users SET account_status=?,nickname=?,student_id=?,real_name=?,
+                       campus_verified=?,campus_verified_at=? WHERE id=?""",
+                    (
+                        account_status,
+                        nickname or "长理同学",
+                        student_id,
+                        real_name,
+                        verified,
+                        verified_at,
+                        user["id"],
+                    ),
+                )
+                write_audit(
+                    db,
+                    admin["id"],
+                    "USER_UPDATED",
+                    "USER",
+                    user["id"],
+                    {
+                        "accountStatus": account_status,
+                        "campusVerified": bool(verified),
+                    },
+                )
+                return serialize_user(
+                    db.execute("SELECT * FROM users WHERE id=?", (user["id"],)).fetchone()
+                ), 200
+
+            match = re.fullmatch(r"/api/v1/admin/users/([^/]+)/clear-restrictions", path)
+            if method == "POST" and match:
+                user = db.execute(
+                    "SELECT id FROM users WHERE id=? AND role='USER'", (match.group(1),)
+                ).fetchone()
+                if not user:
+                    raise ApiError(404, "USER_NOT_FOUND", "用户不存在")
+                db.execute("DELETE FROM user_restrictions WHERE user_id=?", (user["id"],))
+                write_audit(
+                    db, admin["id"], "USER_RESTRICTION_CLEARED", "USER", user["id"]
+                )
+                return {"id": user["id"], "restricted": False}, 200
+
+            if method == "GET" and path == "/api/v1/admin/reservation-rules":
+                return row_dict(reservation_rules(db)), 200
+
+            if method == "PUT" and path == "/api/v1/admin/reservation-rules":
+                data = self.body_json()
+                values = {
+                    "max_active_per_day": int(data.get("maxActivePerDay", 0)),
+                    "max_user_cancellations_per_day": int(
+                        data.get("maxUserCancellationsPerDay", 0)
+                    ),
+                    "cancel_cutoff_minutes": int(data.get("cancelCutoffMinutes", -1)),
+                    "restriction_hours_after_excess_cancel": int(
+                        data.get("restrictionHoursAfterExcessCancel", 0)
+                    ),
+                }
+                if (
+                    values["max_active_per_day"] not in range(1, 21)
+                    or values["max_user_cancellations_per_day"] not in range(1, 21)
+                    or values["cancel_cutoff_minutes"] not in range(0, 1441)
+                    or values["restriction_hours_after_excess_cancel"] not in range(1, 721)
+                ):
+                    raise ApiError(400, "VALIDATION_ERROR", "预约规则参数无效")
+                db.execute(
+                    """UPDATE reservation_rules SET max_active_per_day=?,
+                       max_user_cancellations_per_day=?,cancel_cutoff_minutes=?,
+                       restriction_hours_after_excess_cancel=?,updated_at=?
+                       WHERE id='default'""",
+                    (
+                        values["max_active_per_day"],
+                        values["max_user_cancellations_per_day"],
+                        values["cancel_cutoff_minutes"],
+                        values["restriction_hours_after_excess_cancel"],
+                        now_ms(),
+                    ),
+                )
+                write_audit(
+                    db,
+                    admin["id"],
+                    "RESERVATION_RULES_UPDATED",
+                    "RESERVATION_RULES",
+                    "default",
+                    values,
+                )
+                return row_dict(reservation_rules(db)), 200
+
+            if method == "GET" and path == "/api/v1/admin/audit-logs":
+                return [
+                    row_dict(row)
+                    for row in db.execute(
+                        """SELECT a.*,u.nickname AS actor_name
+                           FROM admin_audit_logs a
+                           LEFT JOIN users u ON u.id=a.actor_user_id
+                           ORDER BY a.created_at DESC LIMIT 300"""
+                    )
+                ], 200
 
             if method == "GET" and path == "/api/v1/admin/overview":
                 today = date.today().isoformat()
@@ -846,6 +1567,9 @@ class ApiHandler(BaseHTTPRequestHandler):
                     ).fetchone()["count"],
                     "enabledAnnouncements": db.execute(
                         "SELECT COUNT(*) AS count FROM announcements WHERE enabled=1"
+                    ).fetchone()["count"],
+                    "users": db.execute(
+                        "SELECT COUNT(*) AS count FROM users WHERE role='USER' AND account_status='ACTIVE'"
                     ).fetchone()["count"],
                 }, 200
 
@@ -916,6 +1640,19 @@ class ApiHandler(BaseHTTPRequestHandler):
                         or "场馆暂不可用",
                     ),
                 )
+                write_audit(
+                    db,
+                    admin["id"],
+                    "INVENTORY_BLOCKED",
+                    "INVENTORY",
+                    block_id,
+                    {
+                        "venueId": venue_id,
+                        "date": booking_date,
+                        "timeSlot": time_slot,
+                        "courtNumber": court_number,
+                    },
+                )
                 return {"blocked": True}, 200
 
             match = re.fullmatch(r"/api/v1/admin/inventory/block/([^/]+)", path)
@@ -925,6 +1662,9 @@ class ApiHandler(BaseHTTPRequestHandler):
                 ).rowcount
                 if not changed:
                     raise ApiError(404, "BLOCK_NOT_FOUND", "关闭记录不存在")
+                write_audit(
+                    db, admin["id"], "INVENTORY_UNBLOCKED", "INVENTORY", match.group(1)
+                )
                 return {"blocked": False}, 200
 
             match = re.fullmatch(r"/api/v1/admin/venues/([^/]+)", path)
@@ -945,6 +1685,13 @@ class ApiHandler(BaseHTTPRequestHandler):
                 maintenance_note = str(
                     data.get("maintenanceNote", venue["maintenance_note"])
                 ).strip()[:200]
+                expected_restore_at = data.get(
+                    "expectedRestoreAt", venue["expected_restore_at"]
+                )
+                if expected_restore_at in {"", 0, "0"}:
+                    expected_restore_at = None
+                elif expected_restore_at is not None:
+                    expected_restore_at = int(expected_restore_at)
                 if (
                     not name
                     or count < 1
@@ -955,7 +1702,8 @@ class ApiHandler(BaseHTTPRequestHandler):
                     raise ApiError(400, "VALIDATION_ERROR", "场馆配置无效")
                 db.execute(
                     """UPDATE venues SET name=?,court_count=?,price_yuan=?,enabled=?,
-                       operating_status=?,maintenance_note=?,updated_at=? WHERE id=?""",
+                       operating_status=?,maintenance_note=?,expected_restore_at=?,
+                       updated_at=? WHERE id=?""",
                     (
                         name,
                         count,
@@ -963,9 +1711,21 @@ class ApiHandler(BaseHTTPRequestHandler):
                         enabled,
                         operating_status,
                         maintenance_note,
+                        expected_restore_at,
                         now_ms(),
                         venue["id"],
                     ),
+                )
+                write_audit(
+                    db,
+                    admin["id"],
+                    "VENUE_UPDATED",
+                    "VENUE",
+                    venue["id"],
+                    {
+                        "enabled": bool(enabled),
+                        "operatingStatus": operating_status,
+                    },
                 )
                 return row_dict(
                     db.execute("SELECT * FROM venues WHERE id=?", (venue["id"],)).fetchone()
@@ -993,6 +1753,14 @@ class ApiHandler(BaseHTTPRequestHandler):
                        DO UPDATE SET enabled=1""",
                     (slot_id, venue_id, start, end),
                 )
+                write_audit(
+                    db,
+                    admin["id"],
+                    "TIME_SLOT_CREATED",
+                    "TIME_SLOT",
+                    slot_id,
+                    {"venueId": venue_id, "startTime": start, "endTime": end},
+                )
                 return {
                     "id": slot_id,
                     "venueId": venue_id,
@@ -1009,6 +1777,14 @@ class ApiHandler(BaseHTTPRequestHandler):
                 ).rowcount
                 if not changed:
                     raise ApiError(404, "TIME_SLOT_NOT_FOUND", "时间段不存在")
+                write_audit(
+                    db,
+                    admin["id"],
+                    "TIME_SLOT_UPDATED",
+                    "TIME_SLOT",
+                    match.group(1),
+                    {"enabled": bool(data.get("enabled"))},
+                )
                 return {"id": match.group(1), "enabled": bool(data.get("enabled"))}, 200
 
             if method == "GET" and path == "/api/v1/admin/reservations":
@@ -1023,14 +1799,19 @@ class ApiHandler(BaseHTTPRequestHandler):
                     clauses.append("r.status=?")
                     values.append(query["status"].upper())
                 if query.get("user"):
-                    clauses.append("(u.username LIKE ? OR u.id LIKE ?)")
+                    clauses.append(
+                        """(u.nickname LIKE ? OR u.phone_masked LIKE ? OR
+                            u.student_id LIKE ? OR u.real_name LIKE ? OR u.id LIKE ?)"""
+                    )
                     token = f"%{query['user'][:80]}%"
-                    values.extend([token, token])
+                    values.extend([token, token, token, token, token])
                 where = " WHERE " + " AND ".join(clauses) if clauses else ""
                 return [
                     row_dict(row)
                     for row in db.execute(
-                        """SELECT r.*,v.name AS venue_name,v.unit_label,u.username
+                        """SELECT r.*,v.name AS venue_name,v.unit_label,u.nickname,
+                                  u.phone_masked,u.student_id,u.real_name,u.campus_verified,
+                                  u.account_type
                            FROM reservations r
                            JOIN venues v ON v.id=r.venue_id
                            JOIN users u ON u.id=r.user_id"""
@@ -1042,13 +1823,43 @@ class ApiHandler(BaseHTTPRequestHandler):
 
             match = re.fullmatch(r"/api/v1/admin/reservations/([^/]+)/cancel", path)
             if method == "POST" and match:
+                data = self.body_json()
+                reservation = db.execute(
+                    "SELECT * FROM reservations WHERE id=? AND status='ACTIVE'",
+                    (match.group(1),),
+                ).fetchone()
+                if not reservation:
+                    raise ApiError(409, "CANNOT_CANCEL", "预约不存在或已取消")
+                timestamp = now_ms()
                 changed = db.execute(
-                    """UPDATE reservations SET status='CANCELLED',updated_at=?
+                    """UPDATE reservations SET status='CANCELLED',cancelled_at=?,
+                       cancelled_by='ADMIN',cancel_reason=?,updated_at=?
                        WHERE id=? AND status='ACTIVE'""",
-                    (now_ms(), match.group(1)),
+                    (
+                        timestamp,
+                        str(data.get("reason", "管理员取消")).strip()[:200] or "管理员取消",
+                        timestamp,
+                        match.group(1),
+                    ),
                 ).rowcount
                 if not changed:
                     raise ApiError(409, "CANNOT_CANCEL", "预约不存在或已取消")
+                write_reservation_event(
+                    db,
+                    reservation["id"],
+                    reservation["user_id"],
+                    admin["id"],
+                    "ADMIN_CANCELLED",
+                    str(data.get("reason", "管理员取消")).strip()[:200],
+                )
+                write_audit(
+                    db,
+                    admin["id"],
+                    "RESERVATION_CANCELLED",
+                    "RESERVATION",
+                    reservation["id"],
+                    {"userId": reservation["user_id"]},
+                )
                 return {"id": match.group(1), "status": "CANCELLED"}, 200
 
             if method == "GET" and path == "/api/v1/admin/lost-found":
@@ -1069,7 +1880,7 @@ class ApiHandler(BaseHTTPRequestHandler):
                 return [
                     row_dict(row)
                     for row in db.execute(
-                        """SELECT p.*,u.username,
+                        """SELECT p.*,u.nickname,u.phone_masked,u.student_id,u.real_name,
                            (SELECT COUNT(*) FROM lost_found_reports rr
                             WHERE rr.post_id=p.id AND rr.status='OPEN') AS open_reports
                            FROM lost_found_posts p
@@ -1095,6 +1906,14 @@ class ApiHandler(BaseHTTPRequestHandler):
                     "UPDATE lost_found_posts SET status=?,updated_at=? WHERE id=?",
                     (status, now_ms(), post["id"]),
                 )
+                write_audit(
+                    db,
+                    admin["id"],
+                    "LOST_FOUND_STATUS_UPDATED",
+                    "LOST_FOUND",
+                    post["id"],
+                    {"status": status},
+                )
                 return {"id": post["id"], "status": status}, 200
 
             if method == "DELETE" and match:
@@ -1106,13 +1925,16 @@ class ApiHandler(BaseHTTPRequestHandler):
                 db.execute("DELETE FROM lost_found_posts WHERE id=?", (match.group(1),))
                 if post["image_name"]:
                     run_safely_delete_upload(post["image_name"])
+                write_audit(
+                    db, admin["id"], "LOST_FOUND_DELETED", "LOST_FOUND", match.group(1)
+                )
                 return {"id": match.group(1), "deleted": True}, 200
 
             if method == "GET" and path == "/api/v1/admin/lost-found-reports":
                 return [
                     row_dict(row)
                     for row in db.execute(
-                        """SELECT r.*,p.item_name,p.type,u.username
+                        """SELECT r.*,p.item_name,p.type,u.nickname,u.phone_masked
                            FROM lost_found_reports r
                            JOIN lost_found_posts p ON p.id=r.post_id
                            JOIN users u ON u.id=r.user_id
@@ -1132,6 +1954,14 @@ class ApiHandler(BaseHTTPRequestHandler):
                 ).rowcount
                 if not changed:
                     raise ApiError(404, "REPORT_NOT_FOUND", "举报不存在")
+                write_audit(
+                    db,
+                    admin["id"],
+                    "LOST_FOUND_REPORT_UPDATED",
+                    "LOST_FOUND_REPORT",
+                    match.group(1),
+                    {"status": status},
+                )
                 return {"id": match.group(1), "status": status}, 200
 
             if method == "GET" and path == "/api/v1/admin/announcements":
@@ -1157,6 +1987,14 @@ class ApiHandler(BaseHTTPRequestHandler):
                         timestamp,
                     ),
                 )
+                write_audit(
+                    db,
+                    admin["id"],
+                    "ANNOUNCEMENT_CREATED",
+                    "ANNOUNCEMENT",
+                    announcement_id,
+                    {"enabled": bool(data.get("enabled", True))},
+                )
                 return {"id": announcement_id}, 201
 
             match = re.fullmatch(r"/api/v1/admin/announcements/([^/]+)", path)
@@ -1177,7 +2015,30 @@ class ApiHandler(BaseHTTPRequestHandler):
                        WHERE id=?""",
                     (title, content, enabled, now_ms(), current["id"]),
                 )
+                write_audit(
+                    db,
+                    admin["id"],
+                    "ANNOUNCEMENT_UPDATED",
+                    "ANNOUNCEMENT",
+                    current["id"],
+                    {"enabled": bool(enabled)},
+                )
                 return {"id": current["id"], "enabled": bool(enabled)}, 200
+
+            if method == "DELETE" and match:
+                changed = db.execute(
+                    "DELETE FROM announcements WHERE id=?", (match.group(1),)
+                ).rowcount
+                if not changed:
+                    raise ApiError(404, "ANNOUNCEMENT_NOT_FOUND", "公告不存在")
+                write_audit(
+                    db,
+                    admin["id"],
+                    "ANNOUNCEMENT_DELETED",
+                    "ANNOUNCEMENT",
+                    match.group(1),
+                )
+                return {"id": match.group(1), "deleted": True}, 200
 
             if method == "GET" and path == "/api/v1/admin/config":
                 flags = []
@@ -1205,6 +2066,15 @@ class ApiHandler(BaseHTTPRequestHandler):
                 payload = data.get("payload", {})
                 if not isinstance(payload, dict):
                     raise ApiError(400, "VALIDATION_ERROR", "功能开关配置必须是对象")
+                status = str(payload.get("status", "OPEN")).upper()
+                if status not in {"OPEN", "CLOSED", "MAINTENANCE"}:
+                    raise ApiError(400, "VALIDATION_ERROR", "功能运行状态无效")
+                payload = {
+                    **payload,
+                    "status": status,
+                    "maintenanceNote": str(payload.get("maintenanceNote", "")).strip()[:300],
+                    "expectedRestoreAt": payload.get("expectedRestoreAt") or None,
+                }
                 db.execute(
                     """INSERT INTO remote_flags(key,enabled,payload_json,updated_at)
                        VALUES(?,?,?,?) ON CONFLICT(key) DO UPDATE SET
@@ -1216,6 +2086,17 @@ class ApiHandler(BaseHTTPRequestHandler):
                         json.dumps(payload, ensure_ascii=False),
                         now_ms(),
                     ),
+                )
+                write_audit(
+                    db,
+                    admin["id"],
+                    "FEATURE_FLAG_UPDATED",
+                    "REMOTE_FLAG",
+                    match.group(1),
+                    {
+                        "enabled": bool(data.get("enabled")),
+                        "status": str(payload.get("status", "")),
+                    },
                 )
                 return {
                     "key": match.group(1),
@@ -1250,6 +2131,14 @@ class ApiHandler(BaseHTTPRequestHandler):
                         now_ms(),
                     ),
                 )
+                write_audit(
+                    db,
+                    admin["id"],
+                    "APP_VERSION_UPDATED",
+                    "APP_VERSION",
+                    "android",
+                    {"latestVersionCode": latest, "minimumVersionCode": minimum},
+                )
                 return {
                     "platform": "android",
                     "latestVersionCode": latest,
@@ -1258,14 +2147,20 @@ class ApiHandler(BaseHTTPRequestHandler):
 
             if method == "GET" and path == "/api/v1/admin/feedback":
                 clauses, values = [], []
-                if query.get("status", "").upper() in {"OPEN", "PROCESSING", "CLOSED"}:
-                    clauses.append("f.status=?")
+                if query.get("status", "").upper() in {
+                    "OPEN",
+                    "PROCESSING",
+                    "RESOLVED",
+                    "CLOSED",
+                }:
+                    clauses.append("f.workflow_status=?")
                     values.append(query["status"].upper())
                 where = " WHERE " + " AND ".join(clauses) if clauses else ""
                 return [
                     row_dict(row)
                     for row in db.execute(
-                        """SELECT f.*,u.username FROM feedback f
+                        """SELECT f.*,u.nickname,u.phone_masked,u.student_id,u.real_name
+                           FROM feedback f
                            LEFT JOIN users u ON u.id=f.user_id"""
                         + where
                         + " ORDER BY f.created_at DESC LIMIT 500",
@@ -1277,14 +2172,23 @@ class ApiHandler(BaseHTTPRequestHandler):
             if method == "PATCH" and match:
                 data = self.body_json()
                 status = str(data.get("status", "")).upper()
-                if status not in {"OPEN", "PROCESSING", "CLOSED"}:
+                if status not in {"OPEN", "PROCESSING", "RESOLVED", "CLOSED"}:
                     raise ApiError(400, "VALIDATION_ERROR", "反馈状态无效")
                 changed = db.execute(
-                    "UPDATE feedback SET status=?,updated_at=? WHERE id=?",
-                    (status, now_ms(), match.group(1)),
+                    """UPDATE feedback SET status=?,workflow_status=?,updated_at=?
+                       WHERE id=?""",
+                    ("CLOSED" if status == "RESOLVED" else status, status, now_ms(), match.group(1)),
                 ).rowcount
                 if not changed:
                     raise ApiError(404, "FEEDBACK_NOT_FOUND", "反馈不存在")
+                write_audit(
+                    db,
+                    admin["id"],
+                    "FEEDBACK_STATUS_UPDATED",
+                    "FEEDBACK",
+                    match.group(1),
+                    {"status": status},
+                )
                 return {"id": match.group(1), "status": status}, 200
 
         raise ApiError(404, "NOT_FOUND", "管理员接口不存在")

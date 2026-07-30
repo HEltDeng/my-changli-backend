@@ -6,6 +6,7 @@ const state = {
 
 const titles = {
   overview: "概览",
+  users: "用户与预约规则",
   venues: "场地与库存",
   reservations: "预约记录",
   lost: "失物招领",
@@ -34,6 +35,17 @@ function formatTime(value) {
   }).format(new Date(Number(value)));
 }
 
+function datetimeLocal(value) {
+  if (!value) return "";
+  const date = new Date(Number(value));
+  const offset = date.getTimezoneOffset() * 60_000;
+  return new Date(date.getTime() - offset).toISOString().slice(0, 16);
+}
+
+function userLabel(row) {
+  return row.real_name || row.nickname || row.phone_masked || "测试用户";
+}
+
 function statusText(value) {
   return {
     OPEN: "开放",
@@ -50,6 +62,10 @@ function statusText(value) {
     RETURNED: "已归还",
     REVIEWED: "已查看",
     PROCESSING: "处理中",
+    RESOLVED: "已解决",
+    SUSPENDED: "已停用",
+    PHONE: "手机号账号",
+    DEVICE: "测试设备",
   }[value] || value || "—";
 }
 
@@ -62,6 +78,20 @@ function badge(value) {
         ? "bad"
         : "";
   return `<span class="badge ${kind}">${escapeHtml(statusText(value))}</span>`;
+}
+
+function accountBadge(value) {
+  const label = value === "ACTIVE" ? "正常" : value === "DELETED" ? "已注销" : "已停用";
+  return `<span class="badge ${value === "ACTIVE" ? "ok" : "bad"}">${label}</span>`;
+}
+
+function accountStatusOptions(selected, allowBlank = false, includeDeleted = false) {
+  const values = [
+    ["ACTIVE", "正常"],
+    ["SUSPENDED", "已停用"],
+  ];
+  if (includeDeleted) values.push(["DELETED", "已注销"]);
+  return `${allowBlank ? '<option value="">全部</option>' : ""}${values.map(([value, label]) => `<option value="${value}" ${value === selected ? "selected" : ""}>${label}</option>`).join("")}`;
 }
 
 function toast(message, isError = false) {
@@ -128,6 +158,7 @@ const renderers = {
       ["待处理举报", data.openReports],
       ["待处理反馈", data.openFeedback],
       ["已发布公告", data.enabledAnnouncements],
+      ["有效用户", data.users],
     ];
     content.innerHTML = `
       <div class="grid metric-grid">
@@ -137,6 +168,48 @@ const renderers = {
         <h3>本地运行说明</h3>
         <p class="muted">这里的修改会直接写入当前电脑上的数据库。平板 App 刷新对应页面后即可看到变化。本阶段没有真实支付、预约码或公网服务。</p>
       </article>`;
+  },
+
+  async users(filters = {}) {
+    const params = new URLSearchParams(filters);
+    const [rows, rules, audits] = await Promise.all([
+      api(`/api/v1/admin/users?${params}`),
+      api("/api/v1/admin/reservation-rules"),
+      api("/api/v1/admin/audit-logs"),
+    ]);
+    content.innerHTML = `
+      <article class="card">
+        <h3>体育预约规则</h3>
+        <p class="muted">所有限制均由服务端执行，修改后立即影响新预约与用户主动取消。管理员取消不计入次数。</p>
+        <form id="rules-form" class="rule-grid">
+          <label>每人每天最多有效预约<input type="number" min="1" max="20" name="maxActivePerDay" value="${rules.max_active_per_day}" required></label>
+          <label>每天最多主动取消<input type="number" min="1" max="20" name="maxUserCancellationsPerDay" value="${rules.max_user_cancellations_per_day}" required></label>
+          <label>开场前不可取消（分钟）<input type="number" min="0" max="1440" name="cancelCutoffMinutes" value="${rules.cancel_cutoff_minutes}" required></label>
+          <label>超限后限制时长（小时）<input type="number" min="1" max="720" name="restrictionHoursAfterExcessCancel" value="${rules.restriction_hours_after_excess_cancel}" required></label>
+          <button class="primary">保存预约规则</button>
+        </form>
+      </article>
+      <h3 class="section-title">用户</h3>
+      <form id="user-filter" class="toolbar">
+        <label>搜索<input name="q" value="${escapeHtml(filters.q || "")}" placeholder="昵称、脱敏手机号、学号或姓名"></label>
+        <label class="compact">账号类型<select name="accountType"><option value="">全部</option>${options(["PHONE","DEVICE"], filters.accountType)}</select></label>
+        <label class="compact">状态<select name="status">${accountStatusOptions(filters.status, true, true)}</select></label>
+        <button class="primary">筛选</button>
+      </form>
+      ${rows.length ? `<div class="table-wrap"><table><thead><tr><th>用户</th><th>校内身份</th><th>账号</th><th>预约 / 取消</th><th>限制</th><th>操作</th></tr></thead><tbody>
+        ${rows.map((row) => `<tr>
+          <td><strong>${escapeHtml(row.nickname || "长理同学")}</strong><br><span class="subtle">${escapeHtml(row.phone_masked || "本地测试设备")}</span></td>
+          <td>${row.campus_verified ? badge("OPEN") : '<span class="subtle">未认证</span>'}<br><span class="subtle">${escapeHtml(row.student_id || "—")} ${escapeHtml(row.real_name || "")}</span></td>
+          <td>${badge(row.account_type)}<br>${accountBadge(row.account_status)}</td>
+          <td>${row.reservation_count} / ${row.cancellation_count}</td>
+          <td><span class="subtle">${escapeHtml(row.restriction_reason || "无限制")}</span></td>
+          <td>${row.account_status === "DELETED" ? "—" : `<div class="actions"><button class="ghost" data-action="edit-user" data-user="${escapeHtml(JSON.stringify(row))}">编辑</button>${row.restriction_reason ? `<button class="danger" data-action="clear-restriction" data-id="${escapeHtml(row.id)}">解除限制</button>` : ""}</div>`}</td>
+        </tr>`).join("")}
+      </tbody></table></div>` : '<div class="empty">没有符合条件的用户</div>'}
+      <h3 class="section-title">最近管理操作</h3>
+      ${audits.length ? `<div class="table-wrap"><table><thead><tr><th>时间</th><th>管理员</th><th>操作</th><th>对象</th></tr></thead><tbody>
+        ${audits.slice(0, 80).map((row) => `<tr><td>${formatTime(row.created_at)}</td><td>${escapeHtml(row.actor_name || "系统")}</td><td>${escapeHtml(row.action)}</td><td>${escapeHtml(row.entity_type)} · ${escapeHtml(row.entity_id || "—")}</td></tr>`).join("")}
+      </tbody></table></div>` : '<div class="empty">暂无管理操作记录</div>'}`;
   },
 
   async venues() {
@@ -177,12 +250,12 @@ const renderers = {
         <label class="compact">场馆<select name="venueId"><option value="">全部场馆</option>${venues.map((v) => `<option value="${escapeHtml(v.id)}" ${filters.venueId === v.id ? "selected" : ""}>${escapeHtml(v.name)}</option>`).join("")}</select></label>
         <label class="compact">日期<input type="date" name="date" value="${escapeHtml(filters.date || "")}"></label>
         <label class="compact">状态<select name="status"><option value="">全部状态</option><option value="ACTIVE" ${filters.status === "ACTIVE" ? "selected" : ""}>已预约</option><option value="CANCELLED" ${filters.status === "CANCELLED" ? "selected" : ""}>已取消</option></select></label>
-        <label>用户<input name="user" value="${escapeHtml(filters.user || "")}" placeholder="输入用户标识"></label>
+        <label>用户<input name="user" value="${escapeHtml(filters.user || "")}" placeholder="昵称、脱敏手机号、学号或姓名"></label>
         <button class="primary">筛选</button>
         <button type="button" class="ghost" data-action="clear-reservation-filter">清空</button>
       </form>
       ${rows.length ? `<div class="table-wrap"><table><thead><tr><th>场馆</th><th>日期 / 时段</th><th>场地</th><th>用户</th><th>金额</th><th>状态</th><th>操作</th></tr></thead><tbody>
-        ${rows.map((row) => `<tr><td>${escapeHtml(row.venue_name)}</td><td>${escapeHtml(row.booking_date)}<br><span class="subtle">${escapeHtml(row.time_slot)}</span></td><td>${row.court_number} ${escapeHtml(row.unit_label)}</td><td><span class="subtle">${escapeHtml(row.username)}</span></td><td>${row.price_yuan} 元</td><td>${badge(row.status)}</td><td>${row.status === "ACTIVE" ? `<button class="danger" data-action="cancel-reservation" data-id="${escapeHtml(row.id)}">取消预约</button>` : "—"}</td></tr>`).join("")}
+        ${rows.map((row) => `<tr><td>${escapeHtml(row.venue_name)}</td><td>${escapeHtml(row.booking_date)}<br><span class="subtle">${escapeHtml(row.time_slot)}</span></td><td>${row.court_number} ${escapeHtml(row.unit_label)}</td><td><strong>${escapeHtml(userLabel(row))}</strong><br><span class="subtle">${escapeHtml(row.student_id || row.phone_masked || "测试设备")}</span></td><td>${row.price_yuan} 元</td><td>${badge(row.status)}</td><td>${row.status === "ACTIVE" ? `<button class="danger" data-action="cancel-reservation" data-id="${escapeHtml(row.id)}">取消预约</button>` : "—"}</td></tr>`).join("")}
       </tbody></table></div>` : '<div class="empty">没有符合条件的预约</div>'}`;
   },
 
@@ -200,11 +273,11 @@ const renderers = {
         <button class="primary">筛选</button>
       </form>
       ${posts.length ? `<div class="table-wrap"><table><thead><tr><th>物品</th><th>类型</th><th>地点 / 日期</th><th>发布者</th><th>状态</th><th>举报</th><th>操作</th></tr></thead><tbody>
-        ${posts.map((post) => `<tr><td><strong>${escapeHtml(post.item_name)}</strong><br><span class="subtle">${escapeHtml(post.category)}</span></td><td>${badge(post.type)}</td><td>${escapeHtml(post.location)}<br><span class="subtle">${escapeHtml(post.event_date)}</span></td><td><span class="subtle">${escapeHtml(post.username)}</span></td><td><select data-action="lost-status" data-id="${escapeHtml(post.id)}" data-type="${post.type}">${lostStatusOptions(post.type, post.status)}</select></td><td>${post.open_reports || 0}</td><td><button class="danger" data-action="delete-lost" data-id="${escapeHtml(post.id)}">删除</button></td></tr>`).join("")}
+        ${posts.map((post) => `<tr><td><strong>${escapeHtml(post.item_name)}</strong><br><span class="subtle">${escapeHtml(post.category)}</span></td><td>${badge(post.type)}</td><td>${escapeHtml(post.location)}<br><span class="subtle">${escapeHtml(post.event_date)}</span></td><td><strong>${escapeHtml(userLabel(post))}</strong><br><span class="subtle">${escapeHtml(post.student_id || post.phone_masked || "测试设备")}</span></td><td><select data-action="lost-status" data-id="${escapeHtml(post.id)}" data-type="${post.type}">${lostStatusOptions(post.type, post.status)}</select></td><td>${post.open_reports || 0}</td><td><button class="danger" data-action="delete-lost" data-id="${escapeHtml(post.id)}">删除</button></td></tr>`).join("")}
       </tbody></table></div>` : '<div class="empty">没有符合条件的失物信息</div>'}
       <h3 class="section-title">举报处理</h3>
       ${reports.length ? `<div class="table-wrap"><table><thead><tr><th>物品</th><th>原因</th><th>提交者</th><th>时间</th><th>状态</th></tr></thead><tbody>
-        ${reports.map((report) => `<tr><td>${escapeHtml(report.item_name)}</td><td>${escapeHtml(report.reason)}</td><td><span class="subtle">${escapeHtml(report.username)}</span></td><td>${formatTime(report.created_at)}</td><td><select data-action="report-status" data-id="${escapeHtml(report.id)}">${options(["OPEN","REVIEWED","CLOSED"], report.status)}</select></td></tr>`).join("")}
+        ${reports.map((report) => `<tr><td>${escapeHtml(report.item_name)}</td><td>${escapeHtml(report.reason)}</td><td><span class="subtle">${escapeHtml(userLabel(report))}</span></td><td>${formatTime(report.created_at)}</td><td><select data-action="report-status" data-id="${escapeHtml(report.id)}">${options(["OPEN","REVIEWED","CLOSED"], report.status)}</select></td></tr>`).join("")}
       </tbody></table></div>` : '<div class="empty">暂无举报</div>'}`;
   },
 
@@ -222,7 +295,7 @@ const renderers = {
       </article>
       <h3 class="section-title">公告记录</h3>
       <div class="grid">
-        ${rows.length ? rows.map((row) => `<article class="card"><div class="card-header"><div><h3>${escapeHtml(row.title)}</h3><span class="subtle">${formatTime(row.published_at)}</span></div>${row.enabled ? badge("OPEN") : badge("CLOSED")}</div><p>${escapeHtml(row.content).replaceAll("\n", "<br>")}</p><div class="actions"><button class="ghost" data-action="edit-announcement" data-id="${escapeHtml(row.id)}" data-title="${escapeHtml(row.title)}" data-content="${escapeHtml(row.content)}" data-enabled="${row.enabled}">编辑</button><button class="${row.enabled ? "danger" : "primary"}" data-action="toggle-announcement" data-id="${escapeHtml(row.id)}" data-enabled="${row.enabled}">${row.enabled ? "撤回" : "重新发布"}</button></div></article>`).join("") : '<div class="empty">还没有公告</div>'}
+        ${rows.length ? rows.map((row) => `<article class="card"><div class="card-header"><div><h3>${escapeHtml(row.title)}</h3><span class="subtle">${formatTime(row.published_at)}</span></div>${row.enabled ? badge("OPEN") : badge("CLOSED")}</div><p>${escapeHtml(row.content).replaceAll("\n", "<br>")}</p><div class="actions"><button class="ghost" data-action="edit-announcement" data-id="${escapeHtml(row.id)}" data-title="${escapeHtml(row.title)}" data-content="${escapeHtml(row.content)}" data-enabled="${row.enabled}">编辑</button><button class="${row.enabled ? "danger" : "primary"}" data-action="toggle-announcement" data-id="${escapeHtml(row.id)}" data-enabled="${row.enabled}">${row.enabled ? "撤回" : "重新发布"}</button><button class="danger" data-action="delete-announcement" data-id="${escapeHtml(row.id)}">删除</button></div></article>`).join("") : '<div class="empty">还没有公告</div>'}
       </div>`;
   },
 
@@ -243,10 +316,17 @@ const renderers = {
           </form>
         </article>
         <article class="card">
-          <h3>远程功能开关</h3>
-          <p class="muted">关闭后，客户端可根据公开配置停止相应入口或操作。</p>
+          <h3>功能开放与维护</h3>
+          <p class="muted">关闭或维护时，App 仍保留入口，并向用户显示这里填写的说明。</p>
           <div class="stack">
-            ${data.flags.map((flag) => `<label class="checkbox-row"><input type="checkbox" data-action="toggle-flag" data-key="${escapeHtml(flag.key)}" ${flag.enabled ? "checked" : ""}> ${escapeHtml(flag.key)}</label>`).join("")}
+            ${data.flags.filter((flag) => ["sports_reservation","lost_found"].includes(flag.key)).map((flag) => `
+              <form class="feature-form sub-card" data-key="${escapeHtml(flag.key)}">
+                <div class="card-header"><strong>${flag.key === "sports_reservation" ? "体育预约" : "失物招领"}</strong>${badge(flag.payload?.status || (flag.enabled ? "OPEN" : "CLOSED"))}</div>
+                <label>运行状态<select name="status">${options(["OPEN","CLOSED","MAINTENANCE"], flag.payload?.status || (flag.enabled ? "OPEN" : "CLOSED"))}</select></label>
+                <label>用户提示<textarea name="maintenanceNote" placeholder="例如：场馆规则调整中，预计今晚恢复">${escapeHtml(flag.payload?.maintenanceNote || "")}</textarea></label>
+                <label>预计恢复时间（可留空）<input type="datetime-local" name="expectedRestoreAt" value="${datetimeLocal(flag.payload?.expectedRestoreAt)}"></label>
+                <button class="primary">保存状态</button>
+              </form>`).join("")}
           </div>
         </article>
       </div>`;
@@ -257,11 +337,11 @@ const renderers = {
     const rows = await api(`/api/v1/admin/feedback?${params}`);
     content.innerHTML = `
       <form id="feedback-filter" class="toolbar">
-        <label class="compact">状态<select name="status"><option value="">全部</option>${options(["OPEN","PROCESSING","CLOSED"], filters.status, true)}</select></label>
+        <label class="compact">状态<select name="status">${options(["OPEN","PROCESSING","RESOLVED","CLOSED"], filters.status, true)}</select></label>
         <button class="primary">筛选</button>
       </form>
       ${rows.length ? `<div class="table-wrap"><table><thead><tr><th>分类</th><th>内容</th><th>用户</th><th>App 版本</th><th>时间</th><th>状态</th></tr></thead><tbody>
-        ${rows.map((row) => `<tr><td>${escapeHtml(row.category)}</td><td>${escapeHtml(row.content)}</td><td><span class="subtle">${escapeHtml(row.username || "匿名设备")}</span></td><td>${escapeHtml(row.app_version || "—")}</td><td>${formatTime(row.created_at)}</td><td><select data-action="feedback-status" data-id="${escapeHtml(row.id)}">${options(["OPEN","PROCESSING","CLOSED"], row.status)}</select></td></tr>`).join("")}
+        ${rows.map((row) => `<tr><td>${escapeHtml(row.category)}</td><td>${escapeHtml(row.content)}</td><td><strong>${escapeHtml(userLabel(row))}</strong><br><span class="subtle">${escapeHtml(row.student_id || row.phone_masked || "测试设备")}</span></td><td>${escapeHtml(row.app_version || "—")}</td><td>${formatTime(row.created_at)}</td><td><select data-action="feedback-status" data-id="${escapeHtml(row.id)}">${options(["OPEN","PROCESSING","RESOLVED","CLOSED"], row.workflow_status || row.status)}</select></td></tr>`).join("")}
       </tbody></table></div>` : '<div class="empty">暂无用户反馈</div>'}`;
   },
 };
@@ -360,8 +440,37 @@ content.addEventListener("submit", async (event) => {
   const values = Object.fromEntries(new FormData(form));
   try {
     if (form.id === "reservation-filter") return renderers.reservations(values);
+    if (form.id === "user-filter") return renderers.users(values);
     if (form.id === "lost-filter") return renderers.lost(values);
     if (form.id === "feedback-filter") return renderers.feedback(values);
+    if (form.id === "rules-form") {
+      await api("/api/v1/admin/reservation-rules", {
+        method: "PUT",
+        body: Object.fromEntries(
+          Object.entries(values).map(([key, value]) => [key, Number(value)])
+        ),
+      });
+      toast("预约规则已保存");
+      return renderers.users();
+    }
+    if (form.classList.contains("feature-form")) {
+      const status = values.status;
+      await api(`/api/v1/admin/flags/${encodeURIComponent(form.dataset.key)}`, {
+        method: "PUT",
+        body: {
+          enabled: status === "OPEN",
+          payload: {
+            status,
+            maintenanceNote: values.maintenanceNote,
+            expectedRestoreAt: values.expectedRestoreAt
+              ? new Date(values.expectedRestoreAt).getTime()
+              : null,
+          },
+        },
+      });
+      toast("功能状态已保存");
+      return renderers.config();
+    }
     if (form.id === "announcement-form") {
       await api("/api/v1/admin/announcements", {
         method: "POST",
@@ -411,13 +520,6 @@ content.addEventListener("change", async (event) => {
       });
       toast("反馈状态已更新");
     }
-    if (target.dataset.action === "toggle-flag") {
-      await api(`/api/v1/admin/flags/${encodeURIComponent(target.dataset.key)}`, {
-        method: "PUT",
-        body: { enabled: target.checked, payload: {} },
-      });
-      toast("功能开关已更新");
-    }
   } catch (error) {
     toast(error.message, true);
     navigate(state.page);
@@ -431,6 +533,40 @@ content.addEventListener("click", async (event) => {
   try {
     if (action === "reload") return navigate(state.page);
     if (action === "clear-reservation-filter") return renderers.reservations();
+    if (action === "edit-user") {
+      const user = JSON.parse(button.dataset.user);
+      return openDialog("编辑用户", `
+        <div class="stack">
+          <label>昵称<input name="nickname" maxlength="40" value="${escapeHtml(user.nickname || "长理同学")}" required></label>
+          <label>账号状态<select name="accountStatus">${accountStatusOptions(user.account_status)}</select></label>
+          <label>学号（仅在合法校内认证后维护）<input name="studentId" maxlength="32" value="${escapeHtml(user.student_id || "")}"></label>
+          <label>姓名（仅保存预约业务必要信息）<input name="realName" maxlength="40" value="${escapeHtml(user.real_name || "")}"></label>
+          <label class="checkbox-row"><input type="checkbox" name="campusVerified" ${user.campus_verified ? "checked" : ""}> 已完成校内身份认证</label>
+        </div>`,
+        async (form) => {
+          await api(`/api/v1/admin/users/${encodeURIComponent(user.id)}`, {
+            method: "PATCH",
+            body: {
+              nickname: form.get("nickname"),
+              accountStatus: form.get("accountStatus"),
+              studentId: form.get("studentId"),
+              realName: form.get("realName"),
+              campusVerified: form.has("campusVerified"),
+            },
+          });
+          toast("用户资料已保存");
+          renderers.users();
+        });
+    }
+    if (action === "clear-restriction") {
+      if (!confirm("确认解除该用户的预约与取消限制？")) return;
+      await api(`/api/v1/admin/users/${encodeURIComponent(button.dataset.id)}/clear-restrictions`, {
+        method: "POST",
+        body: {},
+      });
+      toast("用户限制已解除");
+      return renderers.users();
+    }
     if (action === "inventory") return openInventory(button.dataset.id);
     if (action === "toggle-slot") {
       await api(`/api/v1/admin/time-slots/${encodeURIComponent(button.dataset.id)}`, {
@@ -449,6 +585,7 @@ content.addEventListener("click", async (event) => {
           <label>每小时价格（元）<input name="priceYuan" type="number" min="0" value="${venue.price_yuan}" required></label>
           <label>运行状态<select name="operatingStatus">${options(["OPEN","CLOSED","MAINTENANCE"], venue.operating_status)}</select></label>
           <label>维护说明<textarea name="maintenanceNote">${escapeHtml(venue.maintenance_note || "")}</textarea></label>
+          <label>预计恢复时间（可留空）<input type="datetime-local" name="expectedRestoreAt" value="${datetimeLocal(venue.expected_restore_at)}"></label>
           <label class="checkbox-row"><input name="enabled" type="checkbox" ${venue.enabled ? "checked" : ""}> 在服务端启用此场馆</label>
         </div>`,
         async (form) => {
@@ -460,6 +597,9 @@ content.addEventListener("click", async (event) => {
               priceYuan: Number(form.get("priceYuan")),
               operatingStatus: form.get("operatingStatus"),
               maintenanceNote: form.get("maintenanceNote"),
+              expectedRestoreAt: form.get("expectedRestoreAt")
+                ? new Date(form.get("expectedRestoreAt")).getTime()
+                : null,
               enabled: form.has("enabled"),
             },
           });
@@ -479,8 +619,11 @@ content.addEventListener("click", async (event) => {
         });
     }
     if (action === "cancel-reservation") {
-      if (!confirm("确认取消这条预约？取消后该场地将重新可预约。")) return;
-      await api(`/api/v1/admin/reservations/${encodeURIComponent(button.dataset.id)}/cancel`, { method: "POST", body: {} });
+      if (!confirm("确认取消这条预约？取消后该场地将重新可预约。管理员取消不会计入用户主动取消次数。")) return;
+      await api(`/api/v1/admin/reservations/${encodeURIComponent(button.dataset.id)}/cancel`, {
+        method: "POST",
+        body: { reason: "管理员后台取消" },
+      });
       toast("预约已取消");
       return renderers.reservations();
     }
@@ -498,6 +641,14 @@ content.addEventListener("click", async (event) => {
         body: { enabled: next },
       });
       toast(next ? "公告已重新发布" : "公告已撤回");
+      return renderers.announcements();
+    }
+    if (action === "delete-announcement") {
+      if (!confirm("确认永久删除这条公告？删除后 App 将不再显示，且无法从页面恢复。")) return;
+      await api(`/api/v1/admin/announcements/${encodeURIComponent(button.dataset.id)}`, {
+        method: "DELETE",
+      });
+      toast("公告已删除");
       return renderers.announcements();
     }
     if (action === "edit-announcement") {

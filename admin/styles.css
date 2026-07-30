@@ -58,7 +58,9 @@ nav button:hover, nav button.active { color: white; background: rgba(255,255,255
 .grid { display: grid; gap: 16px; }
 .metric-grid { grid-template-columns: repeat(auto-fit, minmax(180px, 1fr)); }
 .two-columns { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+.rule-grid { display: grid; grid-template-columns: repeat(4, minmax(150px, 1fr)) auto; gap: 12px; align-items: end; margin-top: 18px; }
 .card { background: var(--surface); border: 1px solid var(--line); border-radius: var(--radius); padding: 19px; box-shadow: 0 8px 28px rgba(39,58,92,.045); }
+.sub-card { margin-top: 0; padding: 16px; border: 1px solid var(--line); border-radius: 14px; background: var(--background); }
 .metric strong { display: block; margin-top: 10px; font-size: 32px; }
 .metric span { color: var(--muted); font-size: 13px; }
 .card-header { display: flex; align-items: start; justify-content: space-between; gap: 12px; margin-bottom: 14px; }
@@ -97,6 +99,7 @@ dialog::backdrop { background: rgba(13,21,35,.48); }
   nav { grid-template-columns: repeat(2, 1fr); }
   .logout { margin-top: 16px; }
   .two-columns { grid-template-columns: 1fr; }
+  .rule-grid { grid-template-columns: 1fr; }
   .topbar, .content { padding-left: 18px; padding-right: 18px; }
 }
 @media (prefers-color-scheme: dark) {

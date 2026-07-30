@@ -1,3 +1,4 @@
+# Local runtime data, uploads, caches, and secrets
 data/
 uploads/
 __pycache__/
@@ -5,4 +6,3 @@ __pycache__/
 .env
 .env.*
 !.env.example
-

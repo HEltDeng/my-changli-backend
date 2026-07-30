@@ -7,6 +7,15 @@ CREATE TABLE IF NOT EXISTS users (
     password_hash TEXT NOT NULL,
     password_salt TEXT NOT NULL,
     role TEXT NOT NULL DEFAULT 'USER' CHECK (role IN ('USER', 'ADMIN')),
+    account_type TEXT NOT NULL DEFAULT 'DEVICE',
+    nickname TEXT NOT NULL DEFAULT '长理同学',
+    phone_hash TEXT UNIQUE,
+    phone_masked TEXT,
+    student_id TEXT,
+    real_name TEXT,
+    campus_verified INTEGER NOT NULL DEFAULT 0,
+    campus_verified_at INTEGER,
+    account_status TEXT NOT NULL DEFAULT 'ACTIVE',
     created_at INTEGER NOT NULL
 );
 
@@ -28,6 +37,7 @@ CREATE TABLE IF NOT EXISTS venues (
     operating_status TEXT NOT NULL DEFAULT 'OPEN'
         CHECK (operating_status IN ('OPEN', 'CLOSED', 'MAINTENANCE')),
     maintenance_note TEXT NOT NULL DEFAULT '',
+    expected_restore_at INTEGER,
     updated_at INTEGER NOT NULL
 );
 
@@ -60,6 +70,12 @@ CREATE TABLE IF NOT EXISTS reservations (
     price_yuan INTEGER NOT NULL,
     status TEXT NOT NULL DEFAULT 'ACTIVE' CHECK (status IN ('ACTIVE', 'CANCELLED')),
     payment_status TEXT NOT NULL DEFAULT 'SIMULATED' CHECK (payment_status IN ('SIMULATED')),
+    refund_status TEXT NOT NULL DEFAULT 'NOT_APPLICABLE',
+    reservation_code TEXT,
+    verification_status TEXT NOT NULL DEFAULT 'NOT_REQUIRED',
+    cancelled_at INTEGER,
+    cancelled_by TEXT,
+    cancel_reason TEXT,
     created_at INTEGER NOT NULL,
     updated_at INTEGER NOT NULL
 );
@@ -150,6 +166,51 @@ CREATE TABLE IF NOT EXISTS feedback (
     content TEXT NOT NULL,
     app_version TEXT,
     status TEXT NOT NULL DEFAULT 'OPEN' CHECK (status IN ('OPEN', 'PROCESSING', 'CLOSED')),
+    workflow_status TEXT NOT NULL DEFAULT 'OPEN',
     created_at INTEGER NOT NULL,
     updated_at INTEGER NOT NULL
 );
+
+CREATE TABLE IF NOT EXISTS reservation_rules (
+    id TEXT PRIMARY KEY CHECK (id = 'default'),
+    max_active_per_day INTEGER NOT NULL DEFAULT 2,
+    max_user_cancellations_per_day INTEGER NOT NULL DEFAULT 2,
+    cancel_cutoff_minutes INTEGER NOT NULL DEFAULT 30,
+    restriction_hours_after_excess_cancel INTEGER NOT NULL DEFAULT 24,
+    updated_at INTEGER NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS user_restrictions (
+    user_id TEXT PRIMARY KEY REFERENCES users(id) ON DELETE CASCADE,
+    reservation_blocked_until INTEGER,
+    cancellation_blocked_until INTEGER,
+    reason TEXT NOT NULL DEFAULT '',
+    updated_at INTEGER NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS reservation_events (
+    id TEXT PRIMARY KEY,
+    reservation_id TEXT REFERENCES reservations(id) ON DELETE SET NULL,
+    user_id TEXT REFERENCES users(id) ON DELETE SET NULL,
+    actor_user_id TEXT REFERENCES users(id) ON DELETE SET NULL,
+    action TEXT NOT NULL,
+    reason TEXT NOT NULL DEFAULT '',
+    details_json TEXT NOT NULL DEFAULT '{}',
+    created_at INTEGER NOT NULL
+);
+
+CREATE INDEX IF NOT EXISTS reservation_events_reservation
+ON reservation_events(reservation_id, created_at DESC);
+
+CREATE TABLE IF NOT EXISTS admin_audit_logs (
+    id TEXT PRIMARY KEY,
+    actor_user_id TEXT REFERENCES users(id) ON DELETE SET NULL,
+    action TEXT NOT NULL,
+    entity_type TEXT NOT NULL,
+    entity_id TEXT,
+    details_json TEXT NOT NULL DEFAULT '{}',
+    created_at INTEGER NOT NULL
+);
+
+CREATE INDEX IF NOT EXISTS admin_audit_created
+ON admin_audit_logs(created_at DESC);
