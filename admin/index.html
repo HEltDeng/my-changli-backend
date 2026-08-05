@@ -1,0 +1,77 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>我的长理 · 本地管理后台</title>
+  <link rel="stylesheet" href="/admin/styles.css">
+</head>
+<body>
+  <div id="toast" class="toast" aria-live="polite"></div>
+
+  <main id="login-view" class="login-shell">
+    <section class="login-card">
+      <div class="brand-mark">长理</div>
+      <p class="eyebrow">MY CHANGLI</p>
+      <h1>本地管理后台</h1>
+      <p class="muted">数据只保存在当前电脑，不对公网开放。</p>
+      <form id="login-form" class="stack">
+        <label>管理员用户名<input id="login-username" autocomplete="username" required></label>
+        <label>密码<input id="login-password" type="password" autocomplete="current-password" required></label>
+        <button class="primary" type="submit">安全登录</button>
+        <p id="login-error" class="error" role="alert"></p>
+      </form>
+    </section>
+  </main>
+
+  <div id="app-view" class="app-shell hidden">
+    <aside class="sidebar">
+      <div class="brand-row"><div class="brand-mark small">长理</div><div><strong>我的长理</strong><span>本地管理后台</span></div></div>
+      <nav id="nav">
+        <span class="nav-group">概览</span>
+        <button data-page="overview" class="active" data-roles="SUPER_ADMIN SPORTS_OPERATOR LOST_FOUND_OPERATOR LIBRARY_OPERATOR CONTENT_OPERATOR">工作台概览</button>
+        <span class="nav-group">体育预约</span>
+        <button data-page="venues" data-roles="SUPER_ADMIN SPORTS_OPERATOR">场地与库存</button>
+        <button data-page="reservations" data-roles="SUPER_ADMIN SPORTS_OPERATOR">预约记录</button>
+        <button data-page="rules" data-roles="SUPER_ADMIN SPORTS_OPERATOR">预约规则</button>
+        <span class="nav-group">失物招领</span>
+        <button data-page="lost" data-roles="SUPER_ADMIN LOST_FOUND_OPERATOR">失物处理</button>
+        <button data-page="lostReports" data-roles="SUPER_ADMIN LOST_FOUND_OPERATOR">举报处理</button>
+        <span class="nav-group">资料库</span>
+        <button data-page="resources" data-roles="SUPER_ADMIN LIBRARY_OPERATOR">资料管理</button>
+        <button data-page="resourceComplaints" data-roles="SUPER_ADMIN LIBRARY_OPERATOR">资料投诉 / 举报处理</button>
+        <span class="nav-group">内容运营</span>
+        <button data-page="announcements" data-roles="SUPER_ADMIN CONTENT_OPERATOR">公告</button>
+        <button data-page="config" data-roles="SUPER_ADMIN">版本与功能开关</button>
+        <span class="nav-group">平台管理</span>
+        <button data-page="users" data-roles="SUPER_ADMIN">用户与权限</button>
+        <button data-page="admins" data-roles="SUPER_ADMIN">运营管理员</button>
+        <button data-page="riskCandidates" data-roles="SUPER_ADMIN">异常候选</button>
+        <button data-page="userEvents" data-roles="SUPER_ADMIN">用户行为记录</button>
+        <button data-page="feedback" data-roles="SUPER_ADMIN">用户反馈</button>
+        <button data-page="adminAudit" data-roles="SUPER_ADMIN">管理员操作记录</button>
+      </nav>
+      <button id="logout-button" class="ghost logout">退出登录</button>
+    </aside>
+
+    <section class="workspace">
+      <header class="topbar">
+        <div><p class="eyebrow">LOCAL ADMIN</p><h2 id="page-title">概览</h2></div>
+        <div><div id="admin-identity" class="muted"></div><div class="local-pill"><span></span>仅本机</div></div>
+      </header>
+      <div id="page-content" class="content" aria-live="polite"></div>
+    </section>
+  </div>
+
+  <dialog id="dialog">
+    <form id="dialog-form" method="dialog">
+      <div id="dialog-content"></div>
+      <div class="dialog-actions">
+        <button type="button" id="dialog-cancel" class="ghost">取消</button>
+        <button id="dialog-confirm" value="default" class="primary">确认</button>
+      </div>
+    </form>
+  </dialog>
+  <script src="/admin/app.js"></script>
+</body>
+</html>

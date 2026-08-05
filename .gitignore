@@ -1,0 +1,35 @@
+# Python
+__pycache__/
+*.pyc
+.pytest_cache/
+.venv/
+venv/
+
+# Local runtime data and secrets
+.env
+.env.*
+!.env.example
+data/
+uploads/
+logs/
+secrets/
+archives/
+
+# Databases and backups
+*.db
+*.sqlite
+*.sqlite3
+*.bak
+*.backup
+*.zip
+*.7z
+
+# Node / build output
+node_modules/
+dist/
+build/
+coverage/
+
+# OS
+.DS_Store
+Thumbs.db
