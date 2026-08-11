@@ -7,10 +7,12 @@ from __future__ import annotations
 
 import argparse
 import getpass
+import os
 import sys
 import uuid
 
 import server
+from runtime_config import PLACEHOLDER_MARKERS
 
 
 def read_password(confirm: bool = True) -> str:
@@ -63,6 +65,59 @@ def has_admin() -> int:
     return 0 if exists else 1
 
 
+def bootstrap_production() -> None:
+    if not server.RUNTIME.is_production:
+        raise ValueError("bootstrap-production 只允许在 MY_CHANGLI_ENV=production 下执行")
+    username = os.getenv("MY_CHANGLI_SUPER_ADMIN_USERNAME", "").strip()
+    password = os.getenv("MY_CHANGLI_SUPER_ADMIN_PASSWORD", "")
+    if (
+        not username
+        or len(username) > 48
+        or any(marker in username.upper() for marker in PLACEHOLDER_MARKERS)
+    ):
+        raise ValueError("必须从仓库外提供有效的 MY_CHANGLI_SUPER_ADMIN_USERNAME")
+    if len(password) < 16 or any(
+        marker in password.upper() for marker in PLACEHOLDER_MARKERS
+    ):
+        raise ValueError(
+            "MY_CHANGLI_SUPER_ADMIN_PASSWORD 必须是至少 16 位的非占位随机值"
+        )
+    tables_that_must_be_empty = (
+        "reservations",
+        "lost_found_posts",
+        "lost_found_claims",
+        "lost_found_reports",
+        "feedback",
+        "feedback_events",
+        "announcements",
+        "resource_favorites",
+        "resource_views",
+        "resource_complaints",
+    )
+    with server.connection() as db:
+        if db.execute("SELECT 1 FROM users LIMIT 1").fetchone():
+            raise ValueError("生产库已有用户；拒绝重复 bootstrap")
+        dirty = {
+            table: db.execute(f"SELECT COUNT(*) FROM {table}").fetchone()[0]
+            for table in tables_that_must_be_empty
+        }
+        dirty = {table: count for table, count in dirty.items() if count}
+        if dirty:
+            raise ValueError(f"生产库不是干净业务状态：{dirty}")
+        digest, salt = server.password_record(password)
+        db.execute(
+            """INSERT INTO users(
+                   id,username,password_hash,password_salt,role,account_type,nickname,
+                   admin_permissions_json,admin_role,admin_enabled,account_status,created_at
+               ) VALUES(?,?,?,?, 'ADMIN','ADMIN','超级管理员','["*"]',
+                        'SUPER_ADMIN',1,'ACTIVE',?)""",
+            (str(uuid.uuid4()), username, digest, salt, server.now_ms()),
+        )
+    os.environ.pop("MY_CHANGLI_SUPER_ADMIN_PASSWORD", None)
+    server.ensure_production_database_ready()
+    print("生产数据库已初始化，并创建唯一首个 SUPER_ADMIN。")
+
+
 def main() -> int:
     server.initialize_database()
     parser = argparse.ArgumentParser(description="我的长理本地后台账号管理")
@@ -72,12 +127,18 @@ def main() -> int:
     reset = commands.add_parser("reset-password", help="重置管理员密码")
     reset.add_argument("username")
     commands.add_parser("has-admin", help="检查是否已有管理员")
+    commands.add_parser(
+        "bootstrap-production",
+        help="在干净生产库中从仓库外环境变量创建首个 SUPER_ADMIN",
+    )
     args = parser.parse_args()
     try:
         if args.command == "create-admin":
             create_admin(args.username)
         elif args.command == "reset-password":
             reset_password(args.username)
+        elif args.command == "bootstrap-production":
+            bootstrap_production()
         else:
             return has_admin()
         return 0

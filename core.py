@@ -12,16 +12,17 @@ keep their existing contract while the codebase becomes easier to maintain.
 from __future__ import annotations
 
 import json
-import os
 import sqlite3
 import time
 from datetime import date, datetime
 from pathlib import Path
 from typing import Any
 
+from runtime_config import RUNTIME
+
 ROOT = Path(__file__).resolve().parent
-DB_PATH = Path(os.getenv("MY_CHANGLI_DB_PATH", ROOT / "data" / "my-changli.db"))
-MAX_BODY = 4 * 1024 * 1024
+DB_PATH = RUNTIME.database_path
+MAX_BODY = RUNTIME.max_body_bytes
 SESSION_SECONDS = 30 * 24 * 60 * 60
 MAX_PAGE_SIZE = 100
 MAX_PAGE_OFFSET = 10000
@@ -83,13 +84,14 @@ def connection(database_path: Path | None = None) -> sqlite3.Connection:
     path.parent.mkdir(parents=True, exist_ok=True)
     db = sqlite3.connect(
         path,
-        timeout=10,
+        timeout=RUNTIME.sqlite_busy_timeout_ms / 1000,
         isolation_level=None,
         factory=ClosingConnection,
     )
     db.row_factory = sqlite3.Row
     db.execute("PRAGMA foreign_keys = ON")
-    db.execute("PRAGMA busy_timeout = 10000")
+    db.execute(f"PRAGMA busy_timeout = {RUNTIME.sqlite_busy_timeout_ms}")
+    db.execute("PRAGMA synchronous = NORMAL")
     return db
 
 

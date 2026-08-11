@@ -695,6 +695,13 @@ class ApiTest(unittest.TestCase):
         status, newer = self.call("GET", "/api/v1/public/version/android?currentVersionCode=21")
         self.assertEqual(200, status)
         self.assertTrue(newer["data"]["updateAvailable"])
+        self.assertFalse(newer["data"]["minimumVersionViolated"])
+        self.assertFalse(newer["data"]["mandatoryUpdate"])
+        below_minimum = self.call(
+            "GET", "/api/v1/public/version/android?currentVersionCode=1"
+        )[1]
+        self.assertTrue(below_minimum["data"]["minimumVersionViolated"])
+        self.assertTrue(below_minimum["data"]["mandatoryUpdate"])
         self.assertEqual(42, newer["data"]["latestVersion"]["latest_version_code"])
         current = self.call("GET", "/api/v1/public/version/android?currentVersionCode=42")[1]
         self.assertFalse(current["data"]["updateAvailable"])

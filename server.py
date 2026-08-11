@@ -10,6 +10,7 @@ from __future__ import annotations
 import base64
 import hashlib
 import hmac
+import io
 import json
 import logging
 import os
@@ -18,6 +19,7 @@ import secrets
 import sqlite3
 import time
 import uuid
+import warnings
 from functools import lru_cache
 from datetime import date, datetime, timedelta
 from http import HTTPStatus
@@ -26,6 +28,7 @@ from pathlib import Path
 from typing import Any
 from urllib.parse import parse_qs, urlparse
 from cryptography.fernet import Fernet, InvalidToken
+from PIL import Image, UnidentifiedImageError
 from core import (
     ApiError,
     ClosingConnection,
@@ -40,12 +43,15 @@ from core import (
     required_text,
     row_dict,
 )
+from runtime_config import RUNTIME
+from security import RateLimiter
 
 ROOT = Path(__file__).resolve().parent
-UPLOADS = ROOT / "uploads"
+UPLOADS = RUNTIME.upload_path
 ADMIN_WEB = ROOT / "admin"
-HOST = os.getenv("MY_CHANGLI_HOST", "127.0.0.1")
-PORT = int(os.getenv("MY_CHANGLI_PORT", "8787"))
+HOST = RUNTIME.host
+PORT = RUNTIME.port
+RATE_LIMITER = RateLimiter()
 SPORTS = {"BADMINTON", "TABLE_TENNIS"}
 LOST_TYPES = {"LOST", "FOUND"}
 LOST_STATUSES = {
@@ -96,7 +102,11 @@ def ensure_column(
 
 def initialize_database() -> None:
     UPLOADS.mkdir(parents=True, exist_ok=True)
+    _safe_chmod(UPLOADS, 0o750)
     with connection() as db:
+        journal_mode = db.execute("PRAGMA journal_mode = WAL").fetchone()[0]
+        if str(journal_mode).lower() != "wal":
+            raise RuntimeError("SQLite WAL mode could not be enabled")
         db.executescript((ROOT / "schema.sql").read_text(encoding="utf-8"))
         ensure_column(db, "venues", "operating_status", "TEXT NOT NULL DEFAULT 'OPEN'")
         ensure_column(db, "venues", "maintenance_note", "TEXT NOT NULL DEFAULT ''")
@@ -252,10 +262,10 @@ def initialize_database() -> None:
                 )
         db.execute(
             """INSERT INTO app_versions(platform,latest_version_code,minimum_version_code,
-                       latest_version_name,update_message,updated_at)
-               VALUES('android',31,24,'2.0.9','',?)
+                       latest_version_name,update_message,created_at,updated_at)
+               VALUES('android',31,24,'2.0.9','',?,?)
                ON CONFLICT(platform) DO NOTHING""",
-            (timestamp,),
+            (timestamp, timestamp),
         )
         for key, enabled in (
             ("sports_reservation", 1),
@@ -301,7 +311,45 @@ def initialize_database() -> None:
                     (json.dumps(payload, ensure_ascii=False), timestamp, feature_key),
                 )
         seed_resources(db, timestamp)
-    bootstrap_admin()
+        integrity = db.execute("PRAGMA integrity_check").fetchone()[0]
+        if integrity != "ok":
+            raise RuntimeError(f"SQLite integrity check failed: {integrity}")
+    _safe_chmod(DB_PATH, 0o600)
+    if not RUNTIME.is_production:
+        bootstrap_admin()
+
+
+def _safe_chmod(path: Path, mode: int) -> None:
+    try:
+        path.chmod(mode)
+    except OSError:
+        # Windows ACLs are managed outside Python; Linux deployment applies
+        # the documented owner/mode before startup.
+        pass
+
+
+def database_integrity_check(database_path: Path | None = None) -> bool:
+    try:
+        with connection(database_path) as db:
+            return db.execute("PRAGMA integrity_check").fetchone()[0] == "ok"
+    except sqlite3.Error:
+        return False
+
+
+def ensure_production_database_ready() -> None:
+    if not database_integrity_check():
+        raise RuntimeError("Production database integrity check failed")
+    with connection() as db:
+        admin = db.execute(
+            """SELECT 1 FROM users
+               WHERE role='ADMIN' AND admin_role='SUPER_ADMIN'
+                 AND admin_enabled=1 AND account_status='ACTIVE'
+               LIMIT 1"""
+        ).fetchone()
+    if not admin:
+        raise RuntimeError(
+            "Production database has no enabled SUPER_ADMIN; run manage.py bootstrap-production"
+        )
 
 
 def password_record(password: str, salt: bytes | None = None) -> tuple[str, str]:
@@ -327,8 +375,9 @@ def bootstrap_admin() -> None:
         db.execute(
             """INSERT INTO users(
                    id,username,password_hash,password_salt,role,account_type,nickname,
-                   admin_permissions_json,created_at
-               ) VALUES(?,?,?,?, 'ADMIN','ADMIN','本地管理员','["*"]',?)
+                   admin_permissions_json,admin_role,admin_enabled,account_status,created_at
+               ) VALUES(?,?,?,?, 'ADMIN','ADMIN','本地管理员','["*"]',
+                        'SUPER_ADMIN',1,'ACTIVE',?)
                ON CONFLICT(username) DO NOTHING""",
             (str(uuid.uuid4()), username, digest, salt, now_ms()),
         )
@@ -365,6 +414,8 @@ def phone_hash_secret() -> bytes:
     configured = os.getenv("MY_CHANGLI_PHONE_HASH_SECRET", "").encode()
     if len(configured) >= 32:
         return configured
+    if RUNTIME.is_production:
+        raise RuntimeError("MY_CHANGLI_PHONE_HASH_SECRET is required in production")
     secret_path = DB_PATH.parent / ".phone-hash-secret"
     secret_path.parent.mkdir(parents=True, exist_ok=True)
     if secret_path.is_file():
@@ -398,6 +449,8 @@ def pii_cipher() -> Fernet:
     key_path = DB_PATH.parent / ".pii-encryption-key"
     if configured:
         key = configured
+    elif RUNTIME.is_production:
+        raise RuntimeError("MY_CHANGLI_PII_ENCRYPTION_KEY is required in production")
     elif key_path.is_file():
         key = key_path.read_bytes().strip()
     else:
@@ -1155,19 +1208,61 @@ def upsert_restriction(
 
 
 class ApiHandler(BaseHTTPRequestHandler):
-    server_version = "MyChangliMVP/1.0"
+    server_version = "MyChangliBackend"
 
     def log_message(self, fmt: str, *args: Any) -> None:
-        # Never log authorization headers or request bodies.
-        print(f"{self.log_date_time_string()} {self.client_address[0]} {fmt % args}")
+        # Request logging is emitted once in dispatch() with a route-only path.
+        return
+
+    def log_request(self, code: int | str = "-", size: int | str = "-") -> None:
+        # BaseHTTPRequestHandler calls this from send_response(); suppress it so
+        # query strings and request lines cannot leak into production logs.
+        return
+
+    def request_identity(self) -> str:
+        address = self.client_address[0] if self.client_address else "unknown"
+        return str(address or "unknown")
+
+    def enforce_rate_limit(
+        self, bucket: str, identity: str, limit: int, window_seconds: int
+    ) -> None:
+        key_digest = hashlib.sha256(identity.encode("utf-8", errors="ignore")).hexdigest()
+        retry_after = RATE_LIMITER.check(
+            f"{bucket}:{key_digest}", limit, window_seconds
+        )
+        if retry_after is not None:
+            raise ApiError(
+                429,
+                "RATE_LIMITED",
+                f"请求过于频繁，请在约 {retry_after} 秒后重试",
+            )
+
+    def enforce_route_rate_limit(self, method: str, path: str) -> None:
+        client = self.request_identity()
+        if method == "POST" and path == "/api/v1/auth/login":
+            self.enforce_rate_limit("login-ip", client, 120, 3600)
+        elif method == "POST" and path == "/api/v1/auth/register":
+            self.enforce_rate_limit("register-ip", client, 30, 3600)
+        elif method == "POST" and path == "/api/v1/auth/device":
+            self.enforce_rate_limit("device-ip", client, 120, 3600)
+        elif method == "POST" and path == "/api/v1/feedback":
+            token = self.headers.get("Authorization", "")
+            self.enforce_rate_limit("feedback", f"{client}:{token}", 10, 3600)
+        elif method == "POST" and path.startswith("/api/v1/lost-found"):
+            token = self.headers.get("Authorization", "")
+            self.enforce_rate_limit("lost-found-write", f"{client}:{token}", 30, 3600)
 
     def send_json(self, status: int, payload: Any) -> None:
+        self._response_status = status
         encoded, content_type = json_response(status, payload)
         self.send_response(status)
         self.send_header("Content-Type", content_type)
         self.send_header("Content-Length", str(len(encoded)))
         self.send_header("Cache-Control", "no-store")
         self.send_header("X-Content-Type-Options", "nosniff")
+        self.send_header("X-Frame-Options", "DENY")
+        self.send_header("Referrer-Policy", "no-referrer")
+        self.send_header("X-Request-ID", getattr(self, "request_id", ""))
         self.end_headers()
         self.wfile.write(encoded)
 
@@ -1247,9 +1342,15 @@ class ApiHandler(BaseHTTPRequestHandler):
         self.dispatch("DELETE")
 
     def dispatch(self, method: str) -> None:
+        started = time.perf_counter()
+        self.request_id = uuid.uuid4().hex
+        self._response_status = 500
+        route_path = "/"
         try:
             parsed = urlparse(self.path)
             path = parsed.path.rstrip("/") or "/"
+            route_path = path
+            self.enforce_route_rate_limit(method, path)
             if method == "GET" and (path == "/admin" or path.startswith("/admin/")):
                 self.send_admin_asset(path)
                 return
@@ -1262,8 +1363,23 @@ class ApiHandler(BaseHTTPRequestHandler):
         except ApiError as error:
             self.send_json(error.status, {"ok": False, "error": {"code": error.code, "message": error.message}})
         except Exception:
-            logging.getLogger("mychangli.server").exception("Unhandled API error")
+            logging.getLogger("mychangli.server").exception(
+                "Unhandled API error",
+                extra={"request_id": self.request_id, "route": route_path},
+            )
             self.send_json(500, {"ok": False, "error": {"code": "INTERNAL_ERROR", "message": "服务器内部错误"}})
+        finally:
+            logging.getLogger("mychangli.access").info(
+                "request completed",
+                extra={
+                    "request_id": self.request_id,
+                    "route": route_path,
+                    "method": method,
+                    "status": self._response_status,
+                    "latency_ms": round((time.perf_counter() - started) * 1000, 2),
+                    "event": "HTTP_REQUEST",
+                },
+            )
 
     def send_admin_asset(self, path: str) -> None:
         relative = "index.html" if path in {"/admin", "/admin/"} else path.removeprefix("/admin/")
@@ -1278,6 +1394,7 @@ class ApiHandler(BaseHTTPRequestHandler):
             ".js": "text/javascript; charset=utf-8",
             ".css": "text/css; charset=utf-8",
         }[target.suffix]
+        self._response_status = 200
         self.send_response(200)
         self.send_header("Content-Type", content_type)
         self.send_header("Content-Length", str(len(content)))
@@ -1289,6 +1406,8 @@ class ApiHandler(BaseHTTPRequestHandler):
             "script-src 'self'; connect-src 'self'; base-uri 'none'; frame-ancestors 'none'",
         )
         self.send_header("Referrer-Policy", "no-referrer")
+        self.send_header("X-Frame-Options", "DENY")
+        self.send_header("X-Request-ID", getattr(self, "request_id", ""))
         self.end_headers()
         self.wfile.write(content)
 
@@ -1304,17 +1423,24 @@ class ApiHandler(BaseHTTPRequestHandler):
             ".png": "image/png",
             ".webp": "image/webp",
         }[target.suffix]
+        self._response_status = 200
         self.send_response(200)
         self.send_header("Content-Type", media_type)
         self.send_header("Content-Length", str(len(content)))
         self.send_header("Cache-Control", "private, max-age=3600")
         self.send_header("X-Content-Type-Options", "nosniff")
+        self.send_header("Content-Security-Policy", "default-src 'none'; sandbox")
+        self.send_header("X-Request-ID", getattr(self, "request_id", ""))
         self.end_headers()
         self.wfile.write(content)
 
     def route(self, method: str, path: str, query: dict[str, str]) -> tuple[Any, int]:
         if method == "GET" and path == "/health":
-            return {"status": "ok", "time": now_ms()}, 200
+            return {"status": "ok"}, 200
+        if method == "GET" and path == "/ready":
+            if not database_integrity_check():
+                raise ApiError(503, "NOT_READY", "服务暂未就绪")
+            return {"status": "ready"}, 200
         if method == "POST" and path == "/api/v1/auth/device":
             return self.auth_device(), 200
         if method == "POST" and path == "/api/v1/auth/register":
@@ -1442,6 +1568,12 @@ class ApiHandler(BaseHTTPRequestHandler):
     def auth_register(self) -> dict[str, Any]:
         data = self.body_json()
         phone = normalize_phone(data.get("phone"))
+        self.enforce_rate_limit(
+            "register-identity",
+            f"{self.request_identity()}:{phone}",
+            3,
+            3600,
+        )
         password = required_text(data, "password", 200)
         if len(password) < 8:
             raise ApiError(400, "WEAK_PASSWORD", "密码至少 8 位")
@@ -1494,6 +1626,13 @@ class ApiHandler(BaseHTTPRequestHandler):
     def auth_login(self) -> dict[str, Any]:
         data = self.body_json()
         password = required_text(data, "password", 200)
+        login_identity = str(data.get("phone") or data.get("username") or "").strip().lower()
+        self.enforce_rate_limit(
+            "login-identity",
+            f"{self.request_identity()}:{login_identity}",
+            8,
+            300,
+        )
         with connection() as db:
             if str(data.get("phone", "")).strip():
                 phone = normalize_phone(data.get("phone"))
@@ -2117,36 +2256,75 @@ class ApiHandler(BaseHTTPRequestHandler):
             "status": status,
         }
 
-    def save_image(self, encoded: Any, post_id: str) -> str | None:
+    def save_image(self, encoded: Any, storage_id: str) -> str | None:
         if not encoded:
             return None
         try:
             raw = base64.b64decode(str(encoded), validate=True)
         except Exception as exc:
             raise ApiError(400, "INVALID_IMAGE", "图片数据无效") from exc
-        if len(raw) > 3 * 1024 * 1024:
+        if len(raw) > RUNTIME.upload_max_bytes:
             raise ApiError(413, "IMAGE_TOO_LARGE", "图片不能超过 3MB")
-        if raw.startswith(b"\xff\xd8\xff"):
-            suffix = ".jpg"
-        elif raw.startswith(b"\x89PNG\r\n\x1a\n"):
-            suffix = ".png"
-        elif raw.startswith(b"RIFF") and raw[8:12] == b"WEBP":
-            suffix = ".webp"
-        else:
-            raise ApiError(400, "INVALID_IMAGE", "仅支持 JPEG、PNG 或 WebP")
-        name = post_id + suffix
-        (UPLOADS / name).write_bytes(raw)
+        if not re.fullmatch(r"[0-9a-f-]{36}", storage_id):
+            raise ApiError(400, "INVALID_IMAGE", "图片标识无效")
+        try:
+            with warnings.catch_warnings():
+                warnings.simplefilter("error", Image.DecompressionBombWarning)
+                with Image.open(io.BytesIO(raw)) as source:
+                    image_format = (source.format or "").upper()
+                    if image_format not in {"JPEG", "PNG", "WEBP"}:
+                        raise ApiError(400, "INVALID_IMAGE", "仅支持 JPEG、PNG 或 WebP")
+                    if source.width * source.height > RUNTIME.upload_max_pixels:
+                        raise ApiError(413, "IMAGE_TOO_LARGE", "图片像素尺寸过大")
+                    source.load()
+                    output = io.BytesIO()
+                    if image_format == "JPEG":
+                        suffix = ".jpg"
+                        normalized = source.convert("RGB")
+                        normalized.save(output, "JPEG", quality=90, optimize=True)
+                    elif image_format == "PNG":
+                        suffix = ".png"
+                        normalized = source.convert("RGBA" if "A" in source.getbands() else "RGB")
+                        normalized.save(output, "PNG", optimize=True)
+                    else:
+                        suffix = ".webp"
+                        normalized = source.convert("RGBA" if "A" in source.getbands() else "RGB")
+                        normalized.save(output, "WEBP", quality=90, method=4)
+                    normalized_bytes = output.getvalue()
+        except ApiError:
+            raise
+        except (Image.DecompressionBombError, UnidentifiedImageError, OSError, ValueError) as exc:
+            raise ApiError(400, "INVALID_IMAGE", "图片内容无法安全解析") from exc
+        if len(normalized_bytes) > RUNTIME.upload_max_bytes:
+            raise ApiError(413, "IMAGE_TOO_LARGE", "规范化后的图片不能超过 3MB")
+        name = storage_id + suffix
+        target = (UPLOADS / name).resolve()
+        if target.parent != UPLOADS.resolve():
+            raise ApiError(400, "INVALID_IMAGE", "图片路径无效")
+        temporary = UPLOADS / f".{storage_id}.{secrets.token_hex(8)}.tmp"
+        try:
+            with temporary.open("xb") as handle:
+                handle.write(normalized_bytes)
+                handle.flush()
+                os.fsync(handle.fileno())
+            _safe_chmod(temporary, 0o640)
+            os.replace(temporary, target)
+        finally:
+            if temporary.exists():
+                temporary.unlink()
         return name
 
     def lost_create(self) -> dict[str, Any]:
         data = self.body_json()
         values = self.validated_lost(data)
         post_id = str(uuid.uuid4())
-        image_name = self.save_image(data.get("imageBase64"), post_id)
         timestamp = now_ms()
         with connection() as db:
             user = self.current_user(db)
             require_account_operation(user)
+            image_name = self.save_image(
+                data.get("imageBase64"), str(uuid.uuid4())
+            )
             try:
                 db.execute(
                     """INSERT INTO lost_found_posts(id,owner_user_id,client_local_id,type,item_name,
@@ -2163,7 +2341,15 @@ class ApiHandler(BaseHTTPRequestHandler):
                     (user["id"], data.get("clientLocalId")),
                 ).fetchone()
                 if existing:
+                    if image_name:
+                        run_safely_delete_upload(image_name)
                     return self.serialize_lost(db, existing, user["id"])
+                if image_name:
+                    run_safely_delete_upload(image_name)
+                raise
+            except Exception:
+                if image_name:
+                    run_safely_delete_upload(image_name)
                 raise
             row = db.execute("SELECT * FROM lost_found_posts WHERE id=?", (post_id,)).fetchone()
             write_user_event(db, user["id"], "LOST_FOUND", "LOST_FOUND_PUBLISHED", "SUCCESS", "LOST_FOUND_POST", post_id)
@@ -2182,15 +2368,24 @@ class ApiHandler(BaseHTTPRequestHandler):
             values = self.validated_lost(data, existing)
             image_name = existing["image_name"]
             if "imageBase64" in data:
-                image_name = self.save_image(data.get("imageBase64"), post_id)
-            db.execute(
-                """UPDATE lost_found_posts SET type=?,item_name=?,category=?,location=?,event_date=?,
-                   approximate_time=?,description=?,claim_note=?,image_name=?,status=?,updated_at=?
-                   WHERE id=?""",
-                (values["type"], values["item_name"], values["category"], values["location"],
-                 values["event_date"], values["approximate_time"], values["description"],
-                 values["claim_note"], image_name, values["status"], now_ms(), post_id),
-            )
+                image_name = self.save_image(
+                    data.get("imageBase64"), str(uuid.uuid4())
+                )
+            try:
+                db.execute(
+                    """UPDATE lost_found_posts SET type=?,item_name=?,category=?,location=?,event_date=?,
+                       approximate_time=?,description=?,claim_note=?,image_name=?,status=?,updated_at=?
+                       WHERE id=?""",
+                    (values["type"], values["item_name"], values["category"], values["location"],
+                     values["event_date"], values["approximate_time"], values["description"],
+                     values["claim_note"], image_name, values["status"], now_ms(), post_id),
+                )
+            except Exception:
+                if image_name and image_name != existing["image_name"]:
+                    run_safely_delete_upload(image_name)
+                raise
+            if existing["image_name"] and existing["image_name"] != image_name:
+                run_safely_delete_upload(existing["image_name"])
             updated = db.execute("SELECT * FROM lost_found_posts WHERE id=?", (post_id,)).fetchone()
             write_user_event(db, user["id"], "LOST_FOUND", "LOST_FOUND_EDITED", "SUCCESS", "LOST_FOUND_POST", post_id)
             return self.serialize_lost(db, updated, user["id"])
@@ -2496,6 +2691,9 @@ class ApiHandler(BaseHTTPRequestHandler):
             version["force_update"] = bool(version["force_update"])
             return {
                 "updateAvailable": version["latest_version_code"] > current,
+                "minimumVersionViolated": current < version["minimum_version_code"],
+                "mandatoryUpdate": bool(version["force_update"])
+                or current < version["minimum_version_code"],
                 "currentVersionCode": current,
                 "latestVersion": version,
             }
@@ -4595,6 +4793,10 @@ def run_safely_delete_upload(name: str) -> None:
 
 
 def main() -> None:
+    if RUNTIME.is_production:
+        raise RuntimeError(
+            "server.py uses the development HTTP server; run python production.py"
+        )
     initialize_database()
     print(f"My Changli backend listening on http://{HOST}:{PORT}")
     print(f"Database: {DB_PATH}")
