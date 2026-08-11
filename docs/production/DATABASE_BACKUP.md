@@ -14,6 +14,12 @@ overwriting prior backups, runs `PRAGMA integrity_check`, emits a SHA-256 manife
 and exits non-zero on failure. Its JSON output contains only status, filename, size,
 digest, integrity, and retention results.
 
+A verified backup is the database plus its adjacent manifest. Verification fails if
+the manifest is missing or invalid, its format is unsupported, or its filename,
+byte size, SHA-256 or integrity declaration differs from the actual database. A raw
+SQLite file may be inspected with the separate `integrity_check()` helper, but it is
+not a Production-restorable backup.
+
 Verify a selected copy independently:
 
 ```bash

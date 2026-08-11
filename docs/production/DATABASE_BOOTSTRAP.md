@@ -11,6 +11,8 @@
 5. 命令创建唯一首个 `SUPER_ADMIN`，密码只保存为 scrypt 摘要。
 6. 从 env 文件/终端删除一次性密码，启动 `production.py`。
 
+Production 禁止 `manage.py create-admin`；后续运营管理员只能由已认证的 SUPER_ADMIN 通过后台/API 创建。历史数据库中的空或非法 `admin_role` 不会在 Production 被静默升级，readiness 会拒绝并要求人工核对。Development 为旧本地库保留一次显式兼容迁移，但该分支不进入 Production。
+
 ## 干净状态定义
 
 - 0 普通用户，创建后只有 1 个首管；

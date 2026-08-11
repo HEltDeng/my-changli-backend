@@ -34,7 +34,7 @@ Android Debug / Browser Admin
 
 - Auth：手机号账号或旧安装标识账号；密码为带随机盐的 scrypt；客户端拿到的随机 session token 只以 SHA-256 摘要入库。
 - Account：资料更新、预约识别资料、退出、注销均在 `/api/v1/auth/*`。
-- RBAC：服务端区分普通用户、`SUPER_ADMIN`、体育、失物、资料库和内容运营角色；Admin API 不依赖前端隐藏按钮授权。
+- RBAC：服务端区分普通用户、`SUPER_ADMIN`、体育、失物、资料库和内容运营角色；只有数据库中的明确合法角色获得权限，空值/损坏值 fail closed；Admin API 不依赖前端隐藏按钮授权。
 - Admin：`admin/index.html`、`admin/app.js`、`admin/styles.css` 由后端同源提供；Bearer token 仅存浏览器 `sessionStorage`，不使用 Cookie session。
 - Audit：`admin_audit_logs` 记录管理操作；`user_behavior_events` 和 `risk_candidates` 记录最小业务风控事件。
 
@@ -77,7 +77,7 @@ Android Release / Admin Browser
 
 - Production App Server 采用 Waitress。现有 handler 通过薄 WSGI 适配层复用，避免为“换框架”重写 4,000 多行业务代码；Waitress 同时支持 Linux 与 Windows，线程模型适合 V1 单机 SQLite。
 - Production 只运行一个应用进程，初始使用有限线程并保持 SQLite WAL；不会为了形式引入 Redis、PostgreSQL、Docker 或 Kubernetes。
-- Nginx 是唯一公网入口，负责 TLS、HTTP 到 HTTPS 跳转、请求体限制和反向代理。Waitress 仅显式绑定回环地址，并只信任 Nginx 所在回环代理。
+- Nginx 是唯一公网入口，负责 TLS、HTTP 到 HTTPS 跳转、请求体限制和反向代理。Production 配置用标准库 `ipaddress` 强制 Waitress 只能绑定回环 IP，并只信任 Nginx 所在回环代理。
 - Production 配置必须显式声明环境、监听、数据库、上传、日志、备份、允许 Host、Admin origin 和秘密；缺失或占位值直接拒绝启动。
 - 持久数据、上传、日志、备份和 secret 与 Git checkout 分离；代码回滚不得覆盖这些目录。
 - `/health` 用作进程存活检查，`/ready` 用作数据库可用性检查；两者不泄露主机名、路径、环境变量或管理员信息。

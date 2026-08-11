@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import hashlib
+import hmac
 import json
 import os
 import sqlite3
@@ -10,6 +11,9 @@ from contextlib import closing
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
+
+
+BACKUP_FORMAT = "sqlite3-online-backup-v1"
 
 
 def _timestamp() -> str:
@@ -45,30 +49,55 @@ def integrity_check(path: Path) -> tuple[bool, str]:
 
 def verify_backup(path: Path, manifest_path: Path | None = None) -> dict[str, Any]:
     resolved = path.resolve()
-    valid, result = integrity_check(resolved)
+    database_valid, result = integrity_check(resolved)
     report: dict[str, Any] = {
-        "valid": valid,
+        "valid": False,
         "integrity": result,
         "filename": resolved.name,
         "bytes": resolved.stat().st_size if resolved.is_file() else 0,
         "sha256": sha256_file(resolved) if resolved.is_file() else None,
     }
     manifest = manifest_path or resolved.with_suffix(".json")
-    if manifest.is_file():
+    errors: list[str] = []
+    if not manifest.is_file():
+        report["manifestPresent"] = False
+        report["manifestMatches"] = False
+        errors.append("MANIFEST_MISSING")
+    else:
+        report["manifestPresent"] = True
         try:
             expected = json.loads(manifest.read_text(encoding="utf-8"))
-            report["manifestPresent"] = True
-            report["manifestMatches"] = (
-                expected.get("sha256") == report["sha256"]
-                and expected.get("bytes") == report["bytes"]
-            )
-            report["valid"] = report["valid"] and report["manifestMatches"]
-        except (OSError, json.JSONDecodeError):
-            report["manifestPresent"] = True
-            report["manifestMatches"] = False
-            report["valid"] = False
-    else:
-        report["manifestPresent"] = False
+        except (OSError, UnicodeDecodeError, json.JSONDecodeError):
+            expected = None
+            errors.append("MANIFEST_INVALID_JSON")
+        if not isinstance(expected, dict):
+            if expected is not None:
+                errors.append("MANIFEST_NOT_OBJECT")
+        else:
+            if expected.get("format") != BACKUP_FORMAT:
+                errors.append("MANIFEST_UNSUPPORTED_FORMAT")
+            if expected.get("filename") != report["filename"]:
+                errors.append("MANIFEST_FILENAME_MISMATCH")
+            expected_bytes = expected.get("bytes")
+            if (
+                not isinstance(expected_bytes, int)
+                or isinstance(expected_bytes, bool)
+                or expected_bytes != report["bytes"]
+            ):
+                errors.append("MANIFEST_SIZE_MISMATCH")
+            expected_sha = expected.get("sha256")
+            actual_sha = report["sha256"]
+            if (
+                not isinstance(expected_sha, str)
+                or not isinstance(actual_sha, str)
+                or not hmac.compare_digest(expected_sha, actual_sha)
+            ):
+                errors.append("MANIFEST_SHA256_MISMATCH")
+            if expected.get("integrity") != "ok":
+                errors.append("MANIFEST_INTEGRITY_MISMATCH")
+        report["manifestMatches"] = not errors
+    report["manifestErrors"] = errors
+    report["valid"] = database_valid and report["manifestMatches"]
     return report
 
 
@@ -127,7 +156,7 @@ def backup_database(
             temporary.unlink()
 
     manifest = {
-        "format": "sqlite3-online-backup-v1",
+        "format": BACKUP_FORMAT,
         "filename": target.name,
         "createdAt": datetime.now(timezone.utc).isoformat(),
         "bytes": target.stat().st_size,
@@ -164,7 +193,10 @@ def restore_database(
     target = target.resolve()
     verification = verify_backup(backup)
     if not verification["valid"]:
-        raise RuntimeError(f"Refusing invalid backup: {verification['integrity']}")
+        reasons = verification.get("manifestErrors") or [verification["integrity"]]
+        raise RuntimeError(
+            "Refusing backup that is not a verified backup: " + ",".join(reasons)
+        )
 
     safety_backup = None
     if target.is_file():

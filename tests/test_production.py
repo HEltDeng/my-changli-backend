@@ -1,8 +1,11 @@
 import base64
+import hashlib
 import io
 import json
 import os
+import re
 import secrets
+import shutil
 import socket
 import sqlite3
 import subprocess
@@ -14,11 +17,14 @@ import urllib.error
 import urllib.request
 from contextlib import closing
 from pathlib import Path
+from types import SimpleNamespace
+from unittest import mock
 
 from cryptography.fernet import Fernet
 from PIL import Image
 
 import core
+import manage
 import server
 from logging_config import JsonLogFormatter, redact
 from runtime_config import ConfigurationError, load_runtime_config
@@ -131,6 +137,42 @@ class ProductionUnitTest(unittest.TestCase):
         with self.assertRaises(ConfigurationError):
             load_runtime_config(dict(environment, MY_CHANGLI_ADMIN_ORIGIN="https://admin.example.test"))
 
+        ipv6_environment = dict(
+            environment,
+            MY_CHANGLI_HOST="::1",
+            MY_CHANGLI_ALLOWED_HOSTS="::1",
+            MY_CHANGLI_ADMIN_ORIGIN="https://[::1]",
+        )
+        self.assertEqual("::1", load_runtime_config(ipv6_environment).host)
+        for rejected_host in (
+            "0.0.0.0",
+            "::",
+            "10.0.0.2",
+            "192.168.1.10",
+            "8.8.8.8",
+            "localhost",
+        ):
+            with self.subTest(rejected_host=rejected_host):
+                with self.assertRaises(ConfigurationError):
+                    load_runtime_config(
+                        dict(environment, MY_CHANGLI_HOST=rejected_host)
+                    )
+        self.assertEqual(28800, config.admin_session_seconds)
+        self.assertEqual(
+            3600,
+            load_runtime_config(
+                dict(environment, MY_CHANGLI_ADMIN_SESSION_SECONDS="3600")
+            ).admin_session_seconds,
+        )
+        with self.assertRaises(ConfigurationError):
+            load_runtime_config(
+                dict(environment, MY_CHANGLI_ADMIN_SESSION_SECONDS="1799")
+            )
+        with self.assertRaises(ConfigurationError):
+            load_runtime_config(
+                dict(environment, MY_CHANGLI_ADMIN_SESSION_SECONDS="86401")
+            )
+
     def test_clean_database_wal_integrity_and_default_state(self):
         server.initialize_database()
         with server.connection() as database:
@@ -170,6 +212,360 @@ class ProductionUnitTest(unittest.TestCase):
         with closing(sqlite3.connect(self.database)) as database:
             ids = {row[0] for row in database.execute("SELECT id FROM announcements")}
         self.assertEqual({"before"}, ids)
+
+    def test_restore_requires_complete_matching_manifest(self):
+        result = backup_database(
+            self.database, self.root / "strict-backups", retention_days=14
+        )
+        self.assertTrue(verify_backup(result["backup"])["valid"])
+
+        original_manifest = json.loads(
+            result["manifest"].read_text(encoding="utf-8")
+        )
+
+        def variant(name, *, manifest_change=None, invalid_json=False, tamper=False):
+            directory = self.root / "adversarial" / name
+            directory.mkdir(parents=True)
+            backup = directory / f"{name}.db"
+            shutil.copy2(result["backup"], backup)
+            if manifest_change != "missing":
+                manifest = dict(original_manifest)
+                manifest["filename"] = backup.name
+                if callable(manifest_change):
+                    manifest_change(manifest)
+                manifest_path = backup.with_suffix(".json")
+                manifest_path.write_text(
+                    "{" if invalid_json else json.dumps(manifest),
+                    encoding="utf-8",
+                )
+            if tamper:
+                with closing(sqlite3.connect(backup)) as database:
+                    database.execute(
+                        "INSERT INTO announcements(id,title,content,published_at,updated_at) "
+                        "VALUES('tampered','tampered','tampered',1,1)"
+                    )
+                    database.commit()
+            return backup
+
+        cases = {
+            "missing": variant("missing", manifest_change="missing"),
+            "wrong-sha": variant(
+                "wrong-sha",
+                manifest_change=lambda value: value.update(sha256="0" * 64),
+            ),
+            "wrong-size": variant(
+                "wrong-size",
+                manifest_change=lambda value: value.update(bytes=value["bytes"] + 1),
+            ),
+            "wrong-filename": variant(
+                "wrong-filename",
+                manifest_change=lambda value: value.update(filename="other.db"),
+            ),
+            "wrong-format": variant(
+                "wrong-format",
+                manifest_change=lambda value: value.update(format="unsupported-v0"),
+            ),
+            "invalid-json": variant("invalid-json", invalid_json=True),
+            "tampered": variant("tampered", tamper=True),
+        }
+        for name, backup in cases.items():
+            with self.subTest(name=name):
+                verification = verify_backup(backup)
+                self.assertFalse(verification["valid"])
+                self.assertTrue(verification["manifestErrors"])
+                with self.assertRaises(RuntimeError):
+                    restore_database(
+                        backup,
+                        self.root / "restore-targets" / f"{name}.db",
+                        self.root / "restore-safety" / name,
+                    )
+
+    def test_rbac_invalid_admin_roles_fail_closed(self):
+        valid_password = secrets.token_urlsafe(24)
+        valid_digest, valid_salt = server.password_record(valid_password)
+        with server.connection() as database:
+            database.execute(
+                """INSERT INTO users(
+                       id,username,password_hash,password_salt,role,account_type,nickname,
+                       admin_permissions_json,admin_role,admin_enabled,account_status,created_at
+                   ) VALUES('valid-super','valid-super',?,?, 'ADMIN','ADMIN','Valid',
+                            '["*"]','SUPER_ADMIN',1,'ACTIVE',?)""",
+                (valid_digest, valid_salt, server.now_ms()),
+            )
+
+        invalid_tokens = []
+        for suffix, role_value in (
+            ("null", None),
+            ("invalid", "INVALID"),
+            ("wrong-case", "super_admin"),
+        ):
+            password = secrets.token_urlsafe(24)
+            digest, salt = server.password_record(password)
+            admin_id = f"invalid-admin-{suffix}"
+            username = f"invalid-admin-{suffix}"
+            with server.connection() as database:
+                database.execute(
+                    """INSERT INTO users(
+                           id,username,password_hash,password_salt,role,account_type,nickname,
+                           admin_permissions_json,admin_role,admin_enabled,account_status,created_at
+                       ) VALUES(?,?,?,?, 'ADMIN','ADMIN','Invalid','["*"]',?,1,'ACTIVE',?)""",
+                    (admin_id, username, digest, salt, role_value, server.now_ms()),
+                )
+                row = database.execute(
+                    "SELECT * FROM users WHERE id=?", (admin_id,)
+                ).fetchone()
+                self.assertEqual("", server.admin_role(row))
+                self.assertEqual(set(), server.admin_permissions(row))
+                invalid_tokens.append(server.issue_token(database, admin_id))
+
+            status, body, _ = self.wsgi_call(
+                "POST",
+                "/api/v1/auth/login",
+                {"username": username, "password": password},
+            )
+            self.assertEqual(403, status)
+            self.assertEqual("ADMIN_ROLE_INVALID", body["error"]["code"])
+
+        with mock.patch.object(
+            server,
+            "RUNTIME",
+            SimpleNamespace(is_production=True),
+        ):
+            server.initialize_database()
+        with server.connection() as database:
+            roles = {
+                row["id"]: row["admin_role"]
+                for row in database.execute(
+                    "SELECT id,admin_role FROM users WHERE id LIKE 'invalid-admin-%'"
+                )
+            }
+        self.assertIsNone(roles["invalid-admin-null"])
+        self.assertEqual("INVALID", roles["invalid-admin-invalid"])
+        self.assertEqual("super_admin", roles["invalid-admin-wrong-case"])
+        with self.assertRaisesRegex(RuntimeError, "invalid role"):
+            server.ensure_production_database_ready()
+        for token in invalid_tokens:
+            status, body, _ = self.wsgi_call(
+                "GET", "/api/v1/admin/overview", token=token
+            )
+            self.assertEqual(403, status)
+            self.assertEqual("ADMIN_ROLE_INVALID", body["error"]["code"])
+
+        with server.connection() as database:
+            database.execute("DELETE FROM users WHERE id LIKE 'invalid-admin-%'")
+        server.ensure_production_database_ready()
+        status, login, _ = self.wsgi_call(
+            "POST",
+            "/api/v1/auth/login",
+            {"username": "valid-super", "password": valid_password},
+        )
+        self.assertEqual(200, status)
+        self.assertEqual(
+            200,
+            self.wsgi_call(
+                "GET", "/api/v1/admin/overview", token=login["data"]["token"]
+            )[0],
+        )
+
+    def test_admin_cli_boundaries_and_session_revocation(self):
+        with mock.patch.object(
+            server,
+            "RUNTIME",
+            SimpleNamespace(is_production=True),
+        ), mock.patch.object(
+            manage, "read_password", side_effect=AssertionError("must not prompt")
+        ):
+            with self.assertRaises(ValueError):
+                manage.create_admin("forbidden-production-admin")
+
+        username = "development-cli-admin"
+        old_password = secrets.token_urlsafe(24)
+        with mock.patch.object(
+            manage, "read_password", return_value=old_password
+        ), mock.patch("builtins.print"):
+            manage.create_admin(username)
+        with server.connection() as database:
+            admin = database.execute(
+                "SELECT * FROM users WHERE username=?", (username,)
+            ).fetchone()
+            self.assertEqual("SUPER_ADMIN", server.admin_role(admin))
+            old_token = server.issue_token(database, admin["id"])
+            self.assertTrue(
+                database.execute(
+                    "SELECT 1 FROM sessions WHERE token_hash=?",
+                    (hashlib.sha256(old_token.encode()).hexdigest(),),
+                ).fetchone()
+            )
+
+        new_password = secrets.token_urlsafe(24)
+        with mock.patch.object(
+            manage, "read_password", return_value=new_password
+        ), mock.patch("builtins.print"):
+            manage.reset_password(username)
+        with server.connection() as database:
+            updated = database.execute(
+                "SELECT * FROM users WHERE username=?", (username,)
+            ).fetchone()
+            self.assertFalse(
+                server.verify_password(
+                    old_password, updated["password_hash"], updated["password_salt"]
+                )
+            )
+            self.assertTrue(
+                server.verify_password(
+                    new_password, updated["password_hash"], updated["password_salt"]
+                )
+            )
+            self.assertEqual(
+                0,
+                database.execute(
+                    "SELECT COUNT(*) FROM sessions WHERE user_id=?", (updated["id"],)
+                ).fetchone()[0],
+            )
+
+    def test_user_and_admin_session_ttl_and_runtime_enforcement(self):
+        user_password = secrets.token_urlsafe(24)
+        admin_password = secrets.token_urlsafe(24)
+        user_digest, user_salt = server.password_record(user_password)
+        admin_digest, admin_salt = server.password_record(admin_password)
+        with server.connection() as database:
+            database.execute(
+                """INSERT INTO users(id,username,password_hash,password_salt,role,
+                       account_type,nickname,account_status,created_at)
+                   VALUES('ttl-user','ttl-user',?,?,'USER','PHONE','User','ACTIVE',?)""",
+                (user_digest, user_salt, server.now_ms()),
+            )
+            database.execute(
+                """INSERT INTO users(id,username,password_hash,password_salt,role,
+                       account_type,nickname,admin_role,admin_enabled,account_status,created_at)
+                   VALUES('ttl-admin','ttl-admin',?,?,'ADMIN','ADMIN','Admin',
+                          'SUPER_ADMIN',1,'ACTIVE',?)""",
+                (admin_digest, admin_salt, server.now_ms()),
+            )
+            user_token = server.issue_token(database, "ttl-user")
+            admin_token = server.issue_token(database, "ttl-admin")
+            user_session = database.execute(
+                "SELECT created_at,expires_at FROM sessions WHERE token_hash=?",
+                (hashlib.sha256(user_token.encode()).hexdigest(),),
+            ).fetchone()
+            admin_session = database.execute(
+                "SELECT created_at,expires_at FROM sessions WHERE token_hash=?",
+                (hashlib.sha256(admin_token.encode()).hexdigest(),),
+            ).fetchone()
+            self.assertEqual(
+                core.SESSION_SECONDS * 1000,
+                user_session["expires_at"] - user_session["created_at"],
+            )
+            self.assertEqual(
+                server.RUNTIME.admin_session_seconds * 1000,
+                admin_session["expires_at"] - admin_session["created_at"],
+            )
+            database.execute(
+                "UPDATE sessions SET expires_at=? WHERE token_hash=?",
+                (
+                    server.now_ms() - 1,
+                    hashlib.sha256(admin_token.encode()).hexdigest(),
+                ),
+            )
+        self.assertEqual(
+            401,
+            self.wsgi_call(
+                "GET", "/api/v1/admin/overview", token=admin_token
+            )[0],
+        )
+
+        with server.connection() as database:
+            disabled_token = server.issue_token(database, "ttl-admin")
+            database.execute(
+                "UPDATE users SET admin_enabled=0 WHERE id='ttl-admin'"
+            )
+        status, body, _ = self.wsgi_call(
+            "GET", "/api/v1/admin/overview", token=disabled_token
+        )
+        self.assertEqual(403, status)
+        self.assertEqual("ADMIN_DISABLED", body["error"]["code"])
+
+    def test_admin_api_password_reset_revokes_existing_sessions(self):
+        super_password = secrets.token_urlsafe(24)
+        target_password = secrets.token_urlsafe(24)
+        super_digest, super_salt = server.password_record(super_password)
+        target_digest, target_salt = server.password_record(target_password)
+        with server.connection() as database:
+            for values in (
+                (
+                    "api-reset-super",
+                    "api-reset-super",
+                    super_digest,
+                    super_salt,
+                    "SUPER_ADMIN",
+                ),
+                (
+                    "api-reset-target",
+                    "api-reset-target",
+                    target_digest,
+                    target_salt,
+                    "SPORTS_OPERATOR",
+                ),
+            ):
+                database.execute(
+                    """INSERT INTO users(
+                           id,username,password_hash,password_salt,role,account_type,
+                           nickname,admin_role,admin_enabled,account_status,created_at
+                       ) VALUES(?,?,?,?, 'ADMIN','ADMIN','Admin',?,1,'ACTIVE',?)""",
+                    (*values, server.now_ms()),
+                )
+            super_token = server.issue_token(database, "api-reset-super")
+            target_token = server.issue_token(database, "api-reset-target")
+
+        new_password = secrets.token_urlsafe(24)
+        status, _, _ = self.wsgi_call(
+            "POST",
+            "/api/v1/admin/admins/api-reset-target/reset-password",
+            {"password": new_password},
+            super_token,
+        )
+        self.assertEqual(200, status)
+        self.assertEqual(
+            401,
+            self.wsgi_call(
+                "GET", "/api/v1/admin/overview/sports", token=target_token
+            )[0],
+        )
+        self.assertEqual(
+            401,
+            self.wsgi_call(
+                "POST",
+                "/api/v1/auth/login",
+                {"username": "api-reset-target", "password": target_password},
+            )[0],
+        )
+        login_status, _, _ = self.wsgi_call(
+            "POST",
+            "/api/v1/auth/login",
+            {"username": "api-reset-target", "password": new_password},
+        )
+        self.assertEqual(200, login_status)
+
+    def test_production_dependency_lock_uses_exact_validated_versions(self):
+        lock_path = ROOT / "requirements.lock.txt"
+        lines = [
+            line.strip()
+            for line in lock_path.read_text(encoding="utf-8").splitlines()
+            if line.strip() and not line.lstrip().startswith("#")
+        ]
+        self.assertTrue(lines)
+        self.assertTrue(all(re.fullmatch(r"[A-Za-z0-9_.-]+==[^=<>!~]+", line) for line in lines))
+        locked = {
+            name.lower(): version
+            for name, version in (line.split("==", 1) for line in lines)
+        }
+        self.assertEqual("46.0.7", locked["cryptography"])
+        self.assertEqual("12.3.0", locked["pillow"])
+        self.assertEqual("3.0.2", locked["waitress"])
+        self.assertEqual(
+            {"cffi", "cryptography", "pillow", "pycparser", "waitress"},
+            set(locked),
+        )
 
     def test_wsgi_health_readiness_and_security_headers(self):
         for path, expected in (("/health", "ok"), ("/ready", "ready")):
@@ -299,6 +695,7 @@ class ProductionRuntimeSmokeTest(unittest.TestCase):
                 "MY_CHANGLI_ALLOWED_HOSTS": "127.0.0.1",
                 "MY_CHANGLI_ADMIN_ORIGIN": "https://127.0.0.1",
                 "MY_CHANGLI_TRUSTED_PROXY": "127.0.0.1",
+                "MY_CHANGLI_ADMIN_SESSION_SECONDS": "28800",
                 "MY_CHANGLI_SUPER_ADMIN_USERNAME": "TEST_ONLY_SUPER_ADMIN",
                 "MY_CHANGLI_SUPER_ADMIN_PASSWORD": bootstrap_password,
             })
@@ -331,6 +728,19 @@ class ProductionRuntimeSmokeTest(unittest.TestCase):
                 timeout=30,
             )
             self.assertEqual(0, bootstrap.returncode, bootstrap.stderr)
+            rejected_create = subprocess.run(
+                [sys.executable, "manage.py", "create-admin", "TEST_ONLY_FORBIDDEN"],
+                cwd=ROOT,
+                env=environment,
+                capture_output=True,
+                text=True,
+                encoding="utf-8",
+                errors="replace",
+                timeout=30,
+            )
+            self.assertNotEqual(0, rejected_create.returncode)
+            self.assertNotIn(bootstrap_password, rejected_create.stdout)
+            self.assertNotIn(bootstrap_password, rejected_create.stderr)
             environment.pop("MY_CHANGLI_SUPER_ADMIN_PASSWORD")
             process = subprocess.Popen(
                 [sys.executable, "production.py"],

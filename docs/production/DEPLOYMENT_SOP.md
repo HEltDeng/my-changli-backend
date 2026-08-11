@@ -11,7 +11,7 @@
 ## 2. Application
 
 1. 将已验收 commit checkout 到 `<APP_DIR>`，记录 SHA；不要在生产目录直接开发。
-2. 创建 `<APP_DIR>/.venv`，执行 `.venv/bin/pip install -r requirements.txt`。
+2. 创建 `<APP_DIR>/.venv`，执行 `.venv/bin/python -m pip install -r requirements.lock.txt`；`requirements.txt` 只用于维护支持范围。
 3. 按 `FILESYSTEM_LAYOUT.md` 建目录、owner、group 和 mode。
 4. 从 `.env.example` 复制变量名到仓库外 `<ENV_FILE>`，填入真实值；先执行只读配置导入验证，不能保留占位符。
 

@@ -22,11 +22,14 @@ set +a
 - 进程：1。SQLite V1 不启动多个应用进程。
 - Waitress threads：8，环境变量 `MY_CHANGLI_WAITRESS_THREADS` 可在 2–64 调整。
 - 连接上限：200；请求体同时受 Waitress、应用和 Nginx 限制。
-- App server 显式绑定 `127.0.0.1:<BACKEND_PORT>`，Nginx 是唯一公网入口。
+- App server 的 Production 配置只接受 loopback IP（`127.0.0.1`，或完整 IPv6 部署中的 `::1`）；通配、私网、公网和普通 hostname 均 fail fast。Nginx 是唯一公网入口。
+- 普通 App session 保持 30 天；Admin/SUPER_ADMIN absolute session 默认 8 小时，可在 30 分钟至 24 小时内由服务端配置。
 
 V1 的短事务、单机规模和有限写并发适合此模型。若线程长期耗尽、P95 延迟持续升高或 SQLite 锁等待明显增加，先定位慢请求和写竞争；需要多个进程/实例时，应先迁移 PostgreSQL，而不是盲目增加 workers。
 
 Waitress 官方项 `expose_tracebacks` 固定为 false。受信代理只配置回环 Nginx，清除所有不受信的 `X-Forwarded-*` 值。
+
+Production 安装依赖必须使用 `requirements.lock.txt`；`requirements.txt` 只表达支持范围，不是部署锁。当前锁基于 Python 3.11 的干净 venv 解析并保留跨平台版本 pin，不附加 Windows wheel 专用 hash。
 
 ## Upstream references
 

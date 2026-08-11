@@ -4,7 +4,7 @@
 
 ## 特性
 
-- Python 3.11+；Production App Server 为 Waitress，依赖清单见 `requirements.txt`。
+- Python 3.11+；Production App Server 为 Waitress，支持范围见 `requirements.txt`，正式部署使用精确版本的 `requirements.lock.txt`。
 - SQLite WAL 数据库与外键约束。
 - 密码使用 `scrypt` 加盐散列；会话令牌仅以 SHA-256 摘要保存。
 - 体育预约通过数据库事务和“有效预约唯一索引”防止重复占用。
@@ -76,7 +76,7 @@ App 使用手机号注册/登录“我的长理”独立账号；客户端会话
 - `docs/production/DATABASE_RESTORE.md`
 - `docs/contracts/ANDROID_BACKEND_CONTRACT.md`
 
-正式启动命令为 `python production.py`，且必须由 systemd 使用仓库外 EnvironmentFile。`deploy/` 提供 Nginx 和 systemd 占位模板。
+正式依赖使用 `python -m pip install -r requirements.lock.txt` 安装；启动命令为 `python production.py`，且必须由 systemd 使用仓库外 EnvironmentFile。`deploy/` 提供 Nginx 和 systemd 占位模板。
 
 ## 当前边界
 
