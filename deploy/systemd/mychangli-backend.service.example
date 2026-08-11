@@ -1,0 +1,33 @@
+[Unit]
+Description=My Changli Production Backend
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=<APP_USER>
+Group=<APP_USER>
+WorkingDirectory=<APP_DIR>
+EnvironmentFile=<ENV_FILE>
+Environment=PYTHONUNBUFFERED=1
+ExecStart=<APP_DIR>/.venv/bin/python <APP_DIR>/production.py
+Restart=on-failure
+RestartSec=5s
+TimeoutStartSec=60s
+TimeoutStopSec=30s
+KillSignal=SIGTERM
+UMask=0027
+
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=true
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectControlGroups=true
+RestrictSUIDSGID=true
+LockPersonality=true
+ReadWritePaths=<DATA_DIR> <UPLOAD_DIR> <LOG_DIR> <BACKUP_DIR>
+
+[Install]
+WantedBy=multi-user.target
