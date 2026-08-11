@@ -25,6 +25,10 @@ def read_password(confirm: bool = True) -> str:
 
 
 def create_admin(username: str) -> None:
+    if server.RUNTIME.is_production:
+        raise ValueError(
+            "Production 禁止使用 create-admin；请由现有 SUPER_ADMIN 通过后台/API 创建运营管理员"
+        )
     username = username.strip()
     if not username or len(username) > 48:
         raise ValueError("管理员用户名长度应为 1 至 48 个字符")
@@ -47,14 +51,20 @@ def reset_password(username: str) -> None:
     password = read_password()
     digest, salt = server.password_record(password)
     with server.connection() as db:
-        changed = db.execute(
+        db.execute("BEGIN IMMEDIATE")
+        target = db.execute(
+            "SELECT id FROM users WHERE username=? AND role='ADMIN'",
+            (username.strip(),),
+        ).fetchone()
+        if not target:
+            raise ValueError("未找到该管理员账号")
+        db.execute(
             """UPDATE users SET password_hash=?,password_salt=?
-               WHERE username=? AND role='ADMIN'""",
-            (digest, salt, username.strip()),
-        ).rowcount
-    if not changed:
-        raise ValueError("未找到该管理员账号")
-    print("管理员密码已更新，旧登录会话仍可在后台退出。")
+               WHERE id=?""",
+            (digest, salt, target["id"]),
+        )
+        db.execute("DELETE FROM sessions WHERE user_id=?", (target["id"],))
+    print("管理员密码已更新，全部旧登录会话已撤销。")
 
 
 def has_admin() -> int:

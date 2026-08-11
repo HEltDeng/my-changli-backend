@@ -1040,8 +1040,11 @@ class ApiTest(unittest.TestCase):
         admin_id = "test-admin-id"
         with server.connection() as db:
             db.execute(
-                """INSERT OR REPLACE INTO users(id,username,password_hash,password_salt,role,created_at)
-                   VALUES(?,?,?,?, 'ADMIN', ?)""",
+                """INSERT OR REPLACE INTO users(
+                       id,username,password_hash,password_salt,role,account_type,nickname,
+                       admin_permissions_json,admin_role,admin_enabled,account_status,created_at
+                   ) VALUES(?,?,?,?, 'ADMIN','ADMIN','测试管理员','["*"]',
+                            'SUPER_ADMIN',1,'ACTIVE',?)""",
                 (admin_id, "test-admin", digest, salt, server.now_ms()),
             )
         status, login = self.call(

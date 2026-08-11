@@ -182,16 +182,20 @@ def initialize_database() -> None:
                WHEN username LIKE 'device_%' THEN 'DEVICE'
                ELSE account_type END"""
         )
-        db.execute(
-            """UPDATE users SET admin_permissions_json='["*"]'
-               WHERE role='ADMIN' AND
-               (admin_permissions_json IS NULL OR admin_permissions_json='[]'
-                OR admin_permissions_json='["PII_VIEW"]')"""
-        )
-        db.execute(
-            """UPDATE users SET admin_role='SUPER_ADMIN',admin_enabled=1
-               WHERE role='ADMIN' AND (admin_role IS NULL OR admin_role='')"""
-        )
+        if not RUNTIME.is_production:
+            # Explicit development-only compatibility for local databases created
+            # before role-scoped administrators existed. Production must preserve
+            # invalid legacy rows so readiness can fail closed for operator review.
+            db.execute(
+                """UPDATE users SET admin_permissions_json='["*"]'
+                   WHERE role='ADMIN' AND
+                   (admin_permissions_json IS NULL OR admin_permissions_json='[]'
+                    OR admin_permissions_json='["PII_VIEW"]')"""
+            )
+            db.execute(
+                """UPDATE users SET admin_role='SUPER_ADMIN',admin_enabled=1
+                   WHERE role='ADMIN' AND (admin_role IS NULL OR TRIM(admin_role)='')"""
+            )
         db.execute(
             """UPDATE app_versions SET status='PUBLISHED',created_at=updated_at,
                published_at=COALESCE(published_at,updated_at)
@@ -340,6 +344,20 @@ def ensure_production_database_ready() -> None:
     if not database_integrity_check():
         raise RuntimeError("Production database integrity check failed")
     with connection() as db:
+        valid_roles = tuple(sorted(ADMIN_ROLES))
+        placeholders = ",".join("?" for _ in valid_roles)
+        invalid_admin = db.execute(
+            f"""SELECT COUNT(*) AS count FROM users
+                WHERE role='ADMIN' AND (
+                    admin_role IS NULL OR TRIM(admin_role)=''
+                    OR admin_role NOT IN ({placeholders})
+                )""",
+            valid_roles,
+        ).fetchone()["count"]
+        if invalid_admin:
+            raise RuntimeError(
+                "Production database contains administrator records with an invalid role"
+            )
         admin = db.execute(
             """SELECT 1 FROM users
                WHERE role='ADMIN' AND admin_role='SUPER_ADMIN'
@@ -384,10 +402,24 @@ def bootstrap_admin() -> None:
 
 
 def issue_token(db: sqlite3.Connection, user_id: str) -> str:
+    user = db.execute("SELECT role FROM users WHERE id=?", (user_id,)).fetchone()
+    if not user:
+        raise RuntimeError("Cannot issue a session for an unknown user")
+    ttl_seconds = (
+        RUNTIME.admin_session_seconds
+        if user["role"] == "ADMIN"
+        else SESSION_SECONDS
+    )
+    timestamp = now_ms()
     token = secrets.token_urlsafe(32)
     db.execute(
         "INSERT INTO sessions(token_hash,user_id,expires_at,created_at) VALUES(?,?,?,?)",
-        (hashlib.sha256(token.encode()).hexdigest(), user_id, now_ms() + SESSION_SECONDS * 1000, now_ms()),
+        (
+            hashlib.sha256(token.encode()).hexdigest(),
+            user_id,
+            timestamp + ttl_seconds * 1000,
+            timestamp,
+        ),
     )
     return token
 
@@ -580,22 +612,15 @@ def normalize_feedback_category(value: Any) -> str:
 
 def admin_permissions(user: sqlite3.Row) -> set[str]:
     role = admin_role(user)
-    mapped = ROLE_PERMISSIONS.get(role, set())
-    if mapped:
-        return set(mapped)
-    try:
-        values = json.loads(user["admin_permissions_json"] or "[]")
-    except (json.JSONDecodeError, IndexError):
-        values = []
-    return {str(value) for value in values if isinstance(value, str)}
+    return set(ROLE_PERMISSIONS.get(role, set()))
 
 
 def admin_role(user: sqlite3.Row | dict[str, Any]) -> str:
     data = dict(user)
-    value = str(data.get("admin_role") or "").upper()
+    value = data.get("admin_role")
     if value in ADMIN_ROLES:
-        return value
-    return "SUPER_ADMIN" if data.get("role") == "ADMIN" else ""
+        return str(value)
+    return ""
 
 
 def is_super_admin(user: sqlite3.Row | dict[str, Any]) -> bool:
@@ -1297,6 +1322,8 @@ class ApiHandler(BaseHTTPRequestHandler):
             raise ApiError(403, "ACCOUNT_UNAVAILABLE", "账号当前不可用，请联系管理员")
         if user["role"] == "ADMIN" and not bool(user["admin_enabled"]):
             raise ApiError(403, "ADMIN_DISABLED", "管理员账号已停用")
+        if user["role"] == "ADMIN" and not admin_role(user):
+            raise ApiError(403, "ADMIN_ROLE_INVALID", "管理员角色配置无效")
         if role and user["role"] != role:
             raise ApiError(403, "FORBIDDEN", "权限不足")
         timestamp = now_ms()
@@ -1672,6 +1699,16 @@ class ApiHandler(BaseHTTPRequestHandler):
                     {"result": "DENIED", "reason": "ADMIN_DISABLED"},
                 )
                 raise ApiError(403, "ADMIN_DISABLED", "管理员账号已停用")
+            if user["role"] == "ADMIN" and not admin_role(user):
+                write_audit(
+                    db,
+                    user["id"],
+                    "ADMIN_LOGIN_DENIED",
+                    "ADMIN",
+                    user["id"],
+                    {"result": "DENIED", "reason": "ADMIN_ROLE_INVALID"},
+                )
+                raise ApiError(403, "ADMIN_ROLE_INVALID", "管理员角色配置无效")
             migrated = migrate_device_data(
                 db,
                 str(data.get("installationId", "")).strip() or None,

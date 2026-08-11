@@ -40,6 +40,7 @@ class RuntimeConfig:
     allowed_hosts: tuple[str, ...]
     admin_origin: str
     trusted_proxy: str
+    admin_session_seconds: int
     waitress_threads: int
     sqlite_busy_timeout_ms: int
     max_body_bytes: int
@@ -111,9 +112,15 @@ def load_runtime_config(environment: Mapping[str, str] | None = None) -> Runtime
 
     if mode == "production":
         host = _required(env, "MY_CHANGLI_HOST")
-        if host in {"0.0.0.0", "::"}:
+        try:
+            production_host_address = ipaddress.ip_address(host)
+        except ValueError as exc:
             raise ConfigurationError(
-                "Production app server must bind a private address, normally 127.0.0.1"
+                "MY_CHANGLI_HOST must be one loopback IP address in production"
+            ) from exc
+        if not production_host_address.is_loopback:
+            raise ConfigurationError(
+                "MY_CHANGLI_HOST must be a loopback address in production"
             )
         port_text = _required(env, "MY_CHANGLI_PORT")
         database_path = _production_path(env, "MY_CHANGLI_DB_PATH")
@@ -220,6 +227,12 @@ def load_runtime_config(environment: Mapping[str, str] | None = None) -> Runtime
         allowed_hosts=allowed_hosts,
         admin_origin=admin_origin.rstrip("/"),
         trusted_proxy=trusted_proxy,
+        admin_session_seconds=_integer(
+            env.get("MY_CHANGLI_ADMIN_SESSION_SECONDS", "28800"),
+            "MY_CHANGLI_ADMIN_SESSION_SECONDS",
+            30 * 60,
+            24 * 60 * 60,
+        ),
         waitress_threads=_integer(
             env.get("MY_CHANGLI_WAITRESS_THREADS", "8"),
             "MY_CHANGLI_WAITRESS_THREADS",
