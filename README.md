@@ -1,10 +1,10 @@
-# 我的长理后端 MVP
+# 我的长理后端
 
-这是体育预约、独立失物招领、资料库及管理后台的本地开发后端。当前仅供本机和 USB 调试设备联调，不应直接暴露到公网。
+这是体育预约、独立失物招领、资料库及管理后台后端。`server.py` 继续服务本机/USB 开发；Production 候选使用 Nginx、Waitress、显式安全配置和独立持久目录，当前仍未实际部署真实云资源。
 
 ## 特性
 
-- Python 3.11 运行；依赖清单见 `requirements.txt`。
+- Python 3.11+；Production App Server 为 Waitress，依赖清单见 `requirements.txt`。
 - SQLite WAL 数据库与外键约束。
 - 密码使用 `scrypt` 加盐散列；会话令牌仅以 SHA-256 摘要保存。
 - 体育预约通过数据库事务和“有效预约唯一索引”防止重复占用。
@@ -15,6 +15,8 @@
 - 资料库支持管理员发布外部链接、学生收藏/最近浏览/投诉，以及后台下架和审计；普通用户不能上传资料。
 - 管理员接口支持用户、预约规则、场馆库存、失物、资料、公告、反馈和审计记录。
 - 公共启动接口提供公告、Android 版本和远程功能开关。
+- Production 配置缺失/占位会 fail fast；提供在线一致性备份、校验和离线恢复工具。
+- 图片在鉴权后由 Pillow 完整解码、限制像素并重新编码，不接受客户端文件路径。
 
 ## 本地启动
 
@@ -62,10 +64,24 @@ App 使用手机号注册/登录“我的长理”独立账号；客户端会话
 
 如需本机管理接口测试，只在当前终端设置 `MY_CHANGLI_ADMIN_USERNAME` 和 `MY_CHANGLI_ADMIN_PASSWORD` 后启动服务。密码至少 12 位。不要把真实值写入源码、文档或 Git。
 
+## Production
+
+完整入口：
+
+- `docs/production/BACKEND_ARCHITECTURE.md`
+- `docs/production/DEPLOYMENT_SOP.md`
+- `docs/production/ENVIRONMENT_VARIABLES.md`
+- `docs/production/DATABASE_BOOTSTRAP.md`
+- `docs/production/DATABASE_BACKUP.md`
+- `docs/production/DATABASE_RESTORE.md`
+- `docs/contracts/ANDROID_BACKEND_CONTRACT.md`
+
+正式启动命令为 `python production.py`，且必须由 systemd 使用仓库外 EnvironmentFile。`deploy/` 提供 Nginx 和 systemd 占位模板。
+
 ## 当前边界
 
 - 模拟支付仍只表示流程确认，不连接任何支付平台。
 - 没有预约码、扫码核验、退款或校方真实场馆规则。
-- 公网前必须接入短信验证码、防滥用限流、HTTPS、集中密钥托管和更完整的审计告警。
-- SQLite 适合本地开发与单机部署；正式多人生产环境建议迁移至 PostgreSQL，并保留同等唯一约束与事务语义。
-- 公网部署前还必须配置 HTTPS、反向代理、备份、监控、内容审核和数据合规策略。
+- V1 已有轻量账号/IP 限流，但尚未接入短信验证；是否需要短信必须在账号风险与成本评审后决定。
+- V1 Production 候选确定为单机 SQLite WAL；出现持续锁竞争、多实例或水平扩展需求时再迁移 PostgreSQL。
+- 真实域名、服务器、备案、DNS、TLS、正式 secrets、异地备份与告警渠道仍属于未来云部署步骤。
