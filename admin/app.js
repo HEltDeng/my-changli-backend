@@ -319,8 +319,8 @@ const renderers = {
         ${metrics.map(([label, value, page, filter]) => `<button class="card metric metric-link" data-action="metric-nav" data-page="${page}" data-filter="${escapeHtml(JSON.stringify(filter))}"><span>${label}</span><strong>${value}</strong></button>`).join("")}
       </div>`).join("")}
       <article class="card section-title">
-        <h3>本地运行说明</h3>
-        <p class="muted">这里的修改会直接写入当前电脑上的数据库。平板 App 刷新对应页面后即可看到变化。本阶段没有真实支付、预约码或公网服务。</p>
+        <h3>生产运行说明</h3>
+        <p class="muted">这里的修改会通过生产 API 写入生产数据库。App 刷新对应页面后即可看到最新状态。</p>
       </article>`;
   },
 

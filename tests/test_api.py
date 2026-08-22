@@ -1276,13 +1276,23 @@ class ApiTest(unittest.TestCase):
 
     def test_admin_web_assets_are_served_locally(self):
         for path, expected in (
-            ("/admin/", "本地管理后台"),
+            ("/admin/", "生产管理后台"),
             ("/admin/styles.css", "--blue"),
             ("/admin/app.js", "sessionStorage"),
         ):
             with urllib.request.urlopen(self.base + path, timeout=5) as response:
                 self.assertEqual(200, response.status)
                 self.assertIn(expected, response.read().decode("utf-8"))
+
+        with urllib.request.urlopen(self.base + "/admin/", timeout=5) as response:
+            html = response.read().decode("utf-8")
+            self.assertIn("PRODUCTION ADMIN", html)
+            self.assertNotIn("LOCAL ADMIN", html)
+            self.assertNotIn("仅本机", html)
+        with urllib.request.urlopen(self.base + "/admin/app.js", timeout=5) as response:
+            javascript = response.read().decode("utf-8")
+            self.assertIn("生产运行说明", javascript)
+            self.assertNotIn("本地运行说明", javascript)
 
     def test_platform_metrics_user_events_status_and_risk_are_separated(self):
         phone, password, user_token, user = self.phone_account()

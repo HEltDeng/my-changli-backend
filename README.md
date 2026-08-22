@@ -1,6 +1,6 @@
 # 我的长理后端
 
-这是体育预约、独立失物招领、资料库及管理后台后端。`server.py` 继续服务本机/USB 开发；Production 候选使用 Nginx、Waitress、显式安全配置和独立持久目录，当前仍未实际部署真实云资源。
+这是体育预约、独立失物招领、资料库及管理后台后端。`server.py` 继续服务本机/USB 开发；Production 使用 Nginx、Waitress、显式安全配置和独立持久目录。
 
 ## 特性
 
@@ -44,7 +44,7 @@ campusTools.apiBaseUrl.debug=http://127.0.0.1:8787/api/v1/
 - `server.py`：路由与业务实现（认证、体育预约、失物招领、资料库、反馈、运营管理、功能开关、版本管理）。
 - `core.py`：无路由依赖的基础能力，包括错误模型 `ApiError`、时间戳、SQLite 连接与事务、参数校验、统一分页、JSON 响应序列化，以及测试数据库隔离入口 `configure_test_runtime()`。
 - `schema.sql`：初始表结构与索引；增量列通过 `initialize_database()` 幂等补齐。
-- `admin/`：本地管理后台静态页面（`index.html`、`app.js`、`styles.css`）。
+- `admin/`：同源管理后台静态页面（`index.html`、`app.js`、`styles.css`）；Production 入口为 `https://api.mychangliapp.cn/admin/`。
 - `tests/test_api.py`：端到端 API 测试；每个测试进程使用独立临时数据库，绝不触碰本地运营库。
 - `manage.py`：数据库维护辅助脚本；`start-admin.ps1`：一键启动本地后端、后台与 ADB 端口映射检查。
 
