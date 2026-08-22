@@ -626,6 +626,30 @@ class ProductionUnitTest(unittest.TestCase):
         self.assertEqual(429, status)
         self.assertEqual("RATE_LIMITED", body["error"]["code"])
 
+    def test_registration_and_login_rate_limits_use_five_minute_windows(self):
+        observed = []
+
+        def record_window(key, limit, window_seconds):
+            observed.append((key.split(":", 1)[0], limit, window_seconds))
+            return None
+
+        with mock.patch.object(server.RATE_LIMITER, "check", side_effect=record_window):
+            self.wsgi_call(
+                "POST",
+                "/api/v1/auth/register",
+                {"phone": "19100000000", "password": "short"},
+            )
+            self.wsgi_call(
+                "POST",
+                "/api/v1/auth/login",
+                {"phone": "19100000000", "password": "wrong-password"},
+            )
+
+        self.assertIn(("register-ip", 30, 300), observed)
+        self.assertIn(("register-identity", 3, 300), observed)
+        self.assertIn(("login-ip", 120, 300), observed)
+        self.assertIn(("login-identity", 8, 300), observed)
+
     def test_upload_requires_authentication_and_normalizes_image(self):
         image = Image.new("RGB", (20, 20), "red")
         encoded = io.BytesIO()

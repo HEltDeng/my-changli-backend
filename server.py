@@ -1265,9 +1265,9 @@ class ApiHandler(BaseHTTPRequestHandler):
     def enforce_route_rate_limit(self, method: str, path: str) -> None:
         client = self.request_identity()
         if method == "POST" and path == "/api/v1/auth/login":
-            self.enforce_rate_limit("login-ip", client, 120, 3600)
+            self.enforce_rate_limit("login-ip", client, 120, 300)
         elif method == "POST" and path == "/api/v1/auth/register":
-            self.enforce_rate_limit("register-ip", client, 30, 3600)
+            self.enforce_rate_limit("register-ip", client, 30, 300)
         elif method == "POST" and path == "/api/v1/auth/device":
             self.enforce_rate_limit("device-ip", client, 120, 3600)
         elif method == "POST" and path == "/api/v1/feedback":
@@ -1599,7 +1599,7 @@ class ApiHandler(BaseHTTPRequestHandler):
             "register-identity",
             f"{self.request_identity()}:{phone}",
             3,
-            3600,
+            300,
         )
         password = required_text(data, "password", 200)
         if len(password) < 8:
