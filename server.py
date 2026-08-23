@@ -1052,6 +1052,101 @@ def write_reservation_event(
     )
 
 
+def delete_user_account_data(
+    db: sqlite3.Connection,
+    user: sqlite3.Row,
+    *,
+    reason: str,
+) -> dict[str, Any]:
+    """Delete a USER account's personal data while preserving platform records.
+
+    The users row remains as an anonymous tombstone so audit rows with a foreign
+    key stay valid.  Its login identifier and phone digest are released, which
+    allows the former phone number to register a new account later.  Admin
+    accounts, announcements, library catalog entries, flags and version records
+    are deliberately outside this operation.
+    """
+    if user["role"] != "USER":
+        raise ApiError(409, "ADMIN_ACCOUNT_PROTECTED", "管理员账号不能通过用户删除流程处理")
+
+    user_id = user["id"]
+    timestamp = now_ms()
+    normalized_reason = reason.strip()[:300] or "账号删除"
+    image_names = [
+        row["image_name"]
+        for row in db.execute(
+            "SELECT image_name FROM lost_found_posts WHERE owner_user_id=? AND image_name IS NOT NULL",
+            (user_id,),
+        ).fetchall()
+    ]
+    reservation_ids = [
+        row["id"]
+        for row in db.execute(
+            "SELECT id FROM reservations WHERE user_id=?", (user_id,)
+        ).fetchall()
+    ]
+
+    # Remove user-authored content and user-specific interaction records.
+    db.execute("DELETE FROM feedback WHERE user_id=?", (user_id,))
+    db.execute("DELETE FROM lost_found_posts WHERE owner_user_id=?", (user_id,))
+    db.execute("DELETE FROM lost_found_favorites WHERE user_id=?", (user_id,))
+    db.execute("DELETE FROM lost_found_claims WHERE user_id=?", (user_id,))
+    db.execute("DELETE FROM lost_found_reports WHERE user_id=?", (user_id,))
+    db.execute("DELETE FROM lost_found_deletion_tombstones WHERE owner_user_id=?", (user_id,))
+    db.execute("DELETE FROM resource_favorites WHERE user_id=?", (user_id,))
+    db.execute("DELETE FROM resource_views WHERE user_id=?", (user_id,))
+    db.execute("DELETE FROM resource_complaints WHERE user_id=?", (user_id,))
+    db.execute("DELETE FROM resource_unlocks WHERE user_id=?", (user_id,))
+    db.execute("DELETE FROM risk_candidates WHERE user_id=?", (user_id,))
+    db.execute("DELETE FROM user_restrictions WHERE user_id=?", (user_id,))
+    db.execute("DELETE FROM user_behavior_events WHERE user_id=?", (user_id,))
+
+    if reservation_ids:
+        placeholders = ",".join("?" for _ in reservation_ids)
+        db.execute(
+            f"DELETE FROM reservation_events WHERE reservation_id IN ({placeholders})",
+            reservation_ids,
+        )
+    db.execute(
+        "DELETE FROM reservation_events WHERE user_id=? OR actor_user_id=?",
+        (user_id, user_id),
+    )
+    db.execute("DELETE FROM reservations WHERE user_id=?", (user_id,))
+    db.execute("DELETE FROM sessions WHERE user_id=?", (user_id,))
+
+    random_digest, random_salt = password_record(secrets.token_urlsafe(40))
+    anonymous_username = f"deleted_{uuid.uuid4().hex}"
+    db.execute(
+        """UPDATE users SET username=?,password_hash=?,password_salt=?,
+           account_status='DELETED',account_status_reason=?,
+           account_status_changed_at=?,account_status_expires_at=NULL,
+           nickname='已注销用户',phone_hash=NULL,phone_masked=NULL,phone_encrypted=NULL,
+           student_id=NULL,real_name=NULL,campus_verified=0,campus_verified_at=NULL,
+           reservation_student_id=NULL,reservation_name=NULL,
+           reservation_profile_consented_at=NULL,reservation_student_id_hash=NULL,
+           reservation_name_hash=NULL,reservation_profile_version=0,
+           reservation_profile_updated_at=?,last_active_at=NULL,first_login_at=NULL
+           WHERE id=? AND role='USER'""",
+        (
+            anonymous_username,
+            random_digest,
+            random_salt,
+            normalized_reason,
+            timestamp,
+            timestamp,
+            user_id,
+        ),
+    )
+    for image_name in image_names:
+        run_safely_delete_upload(image_name)
+    return {
+        "deleted": True,
+        "id": user_id,
+        "removedImages": len(image_names),
+        "removedReservations": len(reservation_ids),
+    }
+
+
 def feature_state(db: sqlite3.Connection, key: str) -> dict[str, Any]:
     row = db.execute("SELECT * FROM remote_flags WHERE key=?", (key,)).fetchone()
     if not row:
@@ -1384,6 +1479,7 @@ class ApiHandler(BaseHTTPRequestHandler):
     def library_reader(self, db: sqlite3.Connection) -> sqlite3.Row | None:
         user = self.optional_user(db)
         if user:
+            require_account_operation(user)
             return user
         row = db.execute(
             "SELECT payload_json FROM remote_flags WHERE key='resource_library'"
@@ -1880,44 +1976,11 @@ class ApiHandler(BaseHTTPRequestHandler):
                 raise ApiError(400, "ACCOUNT_DELETE_UNAVAILABLE", "该账号不能在 App 内注销")
             if not verify_password(password, user["password_hash"], user["password_salt"]):
                 raise ApiError(401, "INVALID_CREDENTIALS", "密码错误")
-            timestamp = now_ms()
-            active_ids = [
-                row["id"]
-                for row in db.execute(
-                    "SELECT id FROM reservations WHERE user_id=? AND status='ACTIVE'",
-                    (user["id"],),
-                )
-            ]
-            db.execute(
-                """UPDATE reservations SET status='CANCELLED',cancelled_at=?,
-                   cancelled_by='ACCOUNT_DELETION',cancel_reason='账号注销',
-                   updated_at=? WHERE user_id=? AND status='ACTIVE'""",
-                (timestamp, timestamp, user["id"]),
-            )
-            for reservation_id in active_ids:
-                write_reservation_event(
-                    db,
-                    reservation_id,
-                    user["id"],
-                    user["id"],
-                    "ACCOUNT_DELETION_CANCEL",
-                    "账号注销",
-                )
-            random_digest, random_salt = password_record(secrets.token_urlsafe(40))
-            db.execute(
-                """UPDATE users SET account_status='DELETED',nickname='已注销用户',
-                   phone_hash=NULL,phone_masked=NULL,phone_encrypted=NULL,
-                   student_id=NULL,real_name=NULL,reservation_student_id=NULL,
-                   reservation_name=NULL,reservation_profile_consented_at=NULL,
-                   campus_verified=0,campus_verified_at=NULL,
-                   password_hash=?,password_salt=? WHERE id=?""",
-                (random_digest, random_salt, user["id"]),
-            )
-            db.execute("DELETE FROM sessions WHERE user_id=?", (user["id"],))
+            result = delete_user_account_data(db, user, reason="用户主动注销账号")
             write_audit(
                 db, user["id"], "USER_ACCOUNT_DELETED", "USER", user["id"]
             )
-            return {"deleted": True}
+            return result
 
     def sports_venues(self) -> list[dict[str, Any]]:
         with connection() as db:
@@ -2315,6 +2378,7 @@ class ApiHandler(BaseHTTPRequestHandler):
     def lost_list(self, query: dict[str, str]) -> list[dict[str, Any]]:
         with connection() as db:
             user = self.current_user(db)
+            require_account_operation(user)
             clauses, values = [], []
             lost_type = query.get("type", "").upper()
             if lost_type in LOST_TYPES:
@@ -2338,6 +2402,7 @@ class ApiHandler(BaseHTTPRequestHandler):
     def lost_get(self, post_id: str) -> dict[str, Any]:
         with connection() as db:
             user = self.current_user(db)
+            require_account_operation(user)
             row = db.execute("SELECT * FROM lost_found_posts WHERE id=?", (post_id,)).fetchone()
             if not row:
                 raise ApiError(404, "POST_NOT_FOUND", "失物信息不存在")
@@ -2545,6 +2610,7 @@ class ApiHandler(BaseHTTPRequestHandler):
     def lost_favorites(self) -> list[dict[str, Any]]:
         with connection() as db:
             user = self.current_user(db)
+            require_account_operation(user)
             rows = db.execute(
                 """SELECT p.* FROM lost_found_favorites f JOIN lost_found_posts p ON p.id=f.post_id
                    WHERE f.user_id=? ORDER BY f.created_at DESC""",
@@ -3465,7 +3531,11 @@ class ApiHandler(BaseHTTPRequestHandler):
                     raise ApiError(400, "VALIDATION_ERROR", "批量账号状态无效")
                 reason = required_text(data, "reason", 300)
                 confirmation = str(data.get("confirmation", "")).strip()
-                expected_confirmation = f"UPDATE {len(user_ids)} USERS"
+                expected_confirmation = (
+                    f"DELETE {len(user_ids)} USERS"
+                    if account_status == "DELETED"
+                    else f"UPDATE {len(user_ids)} USERS"
+                )
                 if confirmation != expected_confirmation:
                     raise ApiError(400, "CONFIRMATION_REQUIRED", "批量账号确认文本不匹配")
                 placeholders = ",".join("?" for _ in user_ids)
@@ -3488,29 +3558,32 @@ class ApiHandler(BaseHTTPRequestHandler):
                         expires_at = now_ms() + 30 * 24 * 60 * 60 * 1000
                     elif duration != "PERMANENT":
                         raise ApiError(400, "VALIDATION_ERROR", "暂停时长无效")
-                changed_at = now_ms()
-                db.execute(
-                    f"""UPDATE users SET account_status=?,account_status_reason=?,
-                        account_status_changed_at=?,account_status_expires_at=?
-                        WHERE role='USER' AND id IN ({placeholders})""",
-                    [account_status, "" if account_status == "ACTIVE" else reason,
-                     changed_at, expires_at, *user_ids],
-                )
                 if account_status == "DELETED":
+                    for user_id in user_ids:
+                        target = db.execute(
+                            "SELECT * FROM users WHERE id=? AND role='USER'",
+                            (user_id,),
+                        ).fetchone()
+                        delete_user_account_data(db, target, reason=reason)
+                else:
+                    changed_at = now_ms()
                     db.execute(
-                        f"DELETE FROM sessions WHERE user_id IN ({placeholders})",
-                        user_ids,
+                        f"""UPDATE users SET account_status=?,account_status_reason=?,
+                            account_status_changed_at=?,account_status_expires_at=?
+                            WHERE role='USER' AND id IN ({placeholders})""",
+                        [account_status, "" if account_status == "ACTIVE" else reason,
+                         changed_at, expires_at, *user_ids],
                     )
-                for user_id in user_ids:
-                    write_user_event(
-                        db,
-                        user_id,
-                        "ACCOUNT",
-                        "ACCOUNT_STATUS_CHANGED",
-                        "SUCCESS",
-                        "USER",
-                        user_id,
-                    )
+                    for user_id in user_ids:
+                        write_user_event(
+                            db,
+                            user_id,
+                            "ACCOUNT",
+                            "ACCOUNT_STATUS_CHANGED",
+                            "SUCCESS",
+                            "USER",
+                            user_id,
+                        )
                 write_audit(
                     db,
                     admin["id"],
@@ -3533,6 +3606,30 @@ class ApiHandler(BaseHTTPRequestHandler):
                 }, 200
 
             match = re.fullmatch(r"/api/v1/admin/users/([^/]+)", path)
+            if method == "DELETE" and match:
+                require_admin_permission(admin, "ACCOUNT_MANAGE")
+                data = self.body_json()
+                user = db.execute(
+                    "SELECT * FROM users WHERE id=? AND role='USER'", (match.group(1),)
+                ).fetchone()
+                if not user:
+                    raise ApiError(404, "USER_NOT_FOUND", "用户不存在或账号受保护")
+                reason = required_text(data, "reason", 300)
+                confirmation = str(data.get("confirmation", "")).strip()
+                expected_confirmation = f"DELETE USER {user['id']}"
+                if confirmation != expected_confirmation:
+                    raise ApiError(400, "CONFIRMATION_REQUIRED", "删除账号确认文本不匹配")
+                result = delete_user_account_data(db, user, reason=reason)
+                write_audit(
+                    db,
+                    admin["id"],
+                    "USER_ACCOUNT_ADMIN_DELETED",
+                    "USER",
+                    user["id"],
+                    {"reason": reason[:120]},
+                )
+                return result, 200
+
             if method == "PATCH" and match:
                 require_admin_permission(admin, "ACCOUNT_MANAGE")
                 data = self.body_json()

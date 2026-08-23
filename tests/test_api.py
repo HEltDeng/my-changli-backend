@@ -1135,6 +1135,9 @@ class ApiTest(unittest.TestCase):
         )
         self.assertEqual(200, status)
         self.assertGreater(limited["data"]["account_status_expires_at"], server.now_ms())
+        self.assertEqual(200, self.call("GET", "/api/v1/auth/me", token=token)[0])
+        self.assertEqual(403, self.call("GET", "/api/v1/lost-found", token=token)[0])
+        self.assertEqual(403, self.call("GET", "/api/v1/library", token=token)[0])
         self.assertEqual(403, self.call(
             "POST",
             "/api/v1/lost-found",
@@ -1193,7 +1196,7 @@ class ApiTest(unittest.TestCase):
                 "ids": ids,
                 "accountStatus": "DELETED",
                 "reason": "自动化测试账号清理",
-                "confirmation": "UPDATE 2 USERS",
+                "confirmation": "DELETE 2 USERS",
             },
             admin,
         )
@@ -1203,10 +1206,99 @@ class ApiTest(unittest.TestCase):
         self.assertEqual(401, self.call("GET", "/api/v1/auth/me", token=token_b)[0])
         self.assertEqual(200, self.call("GET", "/api/v1/admin/overview", token=admin)[0])
         with server.connection() as db:
+            for user_id in ids:
+                deleted_user = db.execute(
+                    "SELECT * FROM users WHERE id=?", (user_id,)
+                ).fetchone()
+                self.assertEqual("DELETED", deleted_user["account_status"])
+                self.assertTrue(deleted_user["username"].startswith("deleted_"))
+                self.assertIsNone(deleted_user["phone_hash"])
             self.assertGreaterEqual(
                 db.execute("SELECT COUNT(*) FROM users WHERE role='ADMIN'").fetchone()[0],
                 1,
             )
+
+    def test_admin_delete_user_scrubs_personal_data_and_allows_phone_reregistration(self):
+        phone, _, token, user = self.phone_account()
+        admin = self.admin_token()
+        image_buffer = io.BytesIO()
+        Image.new("RGB", (32, 24), (40, 120, 220)).save(image_buffer, "PNG")
+        status, post = self.call(
+            "POST",
+            "/api/v1/lost-found",
+            {
+                "clientLocalId": "admin-account-delete-" + secrets.token_hex(6),
+                "type": "FOUND",
+                "itemName": "待随账号清理的内容",
+                "category": "OTHER",
+                "location": "测试地点",
+                "eventDate": date.today().isoformat(),
+                "imageBase64": base64.b64encode(image_buffer.getvalue()).decode(),
+            },
+            token,
+        )
+        self.assertEqual(201, status)
+        image_name = post["data"]["imageUrl"].rsplit("/", 1)[-1]
+        self.assertTrue((server.UPLOADS / image_name).is_file())
+        self.assertEqual(201, self.call(
+            "POST",
+            "/api/v1/feedback",
+            {"category": "OTHER", "title": "待清理反馈", "content": "用户个人反馈内容"},
+            token,
+        )[0])
+        with server.connection() as db:
+            announcement_count = db.execute("SELECT COUNT(*) FROM announcements").fetchone()[0]
+            resource_count = db.execute("SELECT COUNT(*) FROM resource_items").fetchone()[0]
+
+        endpoint = f"/api/v1/admin/users/{user['id']}"
+        self.assertEqual(400, self.call(
+            "DELETE",
+            endpoint,
+            {"reason": "发布前测试账号清理", "confirmation": "DELETE USER"},
+            admin,
+        )[0])
+        status, deleted = self.call(
+            "DELETE",
+            endpoint,
+            {
+                "reason": "发布前测试账号清理",
+                "confirmation": f"DELETE USER {user['id']}",
+            },
+            admin,
+        )
+        self.assertEqual(200, status)
+        self.assertTrue(deleted["data"]["deleted"])
+        self.assertEqual(401, self.call("GET", "/api/v1/auth/me", token=token)[0])
+        self.assertFalse((server.UPLOADS / image_name).exists())
+        with server.connection() as db:
+            deleted_user = db.execute(
+                "SELECT * FROM users WHERE id=?", (user["id"],)
+            ).fetchone()
+            self.assertEqual("DELETED", deleted_user["account_status"])
+            self.assertTrue(deleted_user["username"].startswith("deleted_"))
+            self.assertIsNone(deleted_user["phone_hash"])
+            self.assertIsNone(deleted_user["phone_encrypted"])
+            self.assertEqual(0, db.execute(
+                "SELECT COUNT(*) FROM lost_found_posts WHERE owner_user_id=?", (user["id"],)
+            ).fetchone()[0])
+            self.assertEqual(0, db.execute(
+                "SELECT COUNT(*) FROM feedback WHERE user_id=?", (user["id"],)
+            ).fetchone()[0])
+            self.assertEqual(announcement_count, db.execute(
+                "SELECT COUNT(*) FROM announcements"
+            ).fetchone()[0])
+            self.assertEqual(resource_count, db.execute(
+                "SELECT COUNT(*) FROM resource_items"
+            ).fetchone()[0])
+
+        new_password = secrets.token_urlsafe(18)
+        status, registered = self.call(
+            "POST",
+            "/api/v1/auth/register",
+            {"phone": phone, "password": new_password, "nickname": "重新注册用户"},
+        )
+        self.assertEqual(201, status)
+        self.assertNotEqual(user["id"], registered["data"]["user"]["id"])
 
     def test_client_local_id_is_idempotent(self):
         token = self.device_token("migration-device")
@@ -1485,6 +1577,10 @@ class ApiTest(unittest.TestCase):
             self.assertIn("lost-details", javascript)
             self.assertIn("bulk-delete-lost", javascript)
             self.assertIn("suspensionDuration", javascript)
+            self.assertIn("bulk-delete-users", javascript)
+            self.assertIn("批量限制访问", javascript)
+            self.assertIn("批量恢复权限", javascript)
+            self.assertIn("delete-user-account", javascript)
             self.assertNotIn("本地运行说明", javascript)
 
     def test_platform_metrics_user_events_status_and_risk_are_separated(self):

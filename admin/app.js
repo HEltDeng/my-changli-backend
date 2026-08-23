@@ -166,6 +166,79 @@ function accountStatusOptions(selected, allowBlank = false, includeDeleted = fal
   return `${allowBlank ? '<option value="">全部</option>' : ""}${values.map(([value, label]) => `<option value="${value}" ${value === selected ? "selected" : ""}>${label}</option>`).join("")}`;
 }
 
+function selectedUserIds() {
+  return Array.from(document.querySelectorAll(".user-select:checked"), (item) => item.value);
+}
+
+function refreshUserBulkActions() {
+  const toolbar = document.querySelector("#user-bulk-actions");
+  if (!toolbar) return;
+  const ids = selectedUserIds();
+  toolbar.hidden = ids.length === 0;
+  const count = toolbar.querySelector("[data-selected-user-count]");
+  if (count) count.textContent = `已选择 ${ids.length} 个普通用户`;
+}
+
+function openBulkUserAction(action) {
+  const ids = selectedUserIds();
+  if (!ids.length) throw new Error("请先选择需要处理的普通用户");
+  const definitions = {
+    limit: {
+      title: "批量限制访问",
+      accountStatus: "LIMITED",
+      confirmation: `UPDATE ${ids.length} USERS`,
+      fields: '<label>暂停时长<select name="suspensionDuration"><option value="7_DAYS">7 天</option><option value="30_DAYS">30 天</option><option value="PERMANENT">永久</option></select></label>',
+      note: "受限期间用户仍可登录和使用本地功能，但不能访问失物招领、资料库及其他需服务端授权的功能。",
+      success: `已限制 ${ids.length} 个普通用户`,
+    },
+    restore: {
+      title: "批量恢复权限",
+      accountStatus: "ACTIVE",
+      confirmation: `UPDATE ${ids.length} USERS`,
+      fields: "",
+      note: "恢复后用户可重新访问服务端业务功能。",
+      success: `已恢复 ${ids.length} 个普通用户`,
+    },
+    delete: {
+      title: "批量删除账号",
+      accountStatus: "DELETED",
+      confirmation: `DELETE ${ids.length} USERS`,
+      fields: "",
+      note: "删除后账号无法恢复，手机号可重新注册。用户个人资料、会话和用户内容会清理；管理员、公告、资料库条目和系统配置不受影响。",
+      success: `已删除 ${ids.length} 个普通用户账号`,
+    },
+  };
+  const definition = definitions[action];
+  if (!definition) throw new Error("批量操作无效");
+  if (action === "delete" && !confirm(`将删除 ${ids.length} 个普通用户账号。确认进入第二次核验？`)) return;
+  return openDialog(definition.title, `<div class="stack"><p>${escapeHtml(definition.note)}</p>${definition.fields}<label>处理原因<textarea name="reason" maxlength="300" required></textarea></label><label>再次输入确认文本 <strong>${definition.confirmation}</strong><input name="confirmation" autocomplete="off" required></label></div>`, async (form) => {
+    await api("/api/v1/admin/users/bulk-status", {
+      method: "POST",
+      body: {
+        ids,
+        accountStatus: definition.accountStatus,
+        suspensionDuration: form.get("suspensionDuration") || undefined,
+        reason: form.get("reason"),
+        confirmation: form.get("confirmation"),
+      },
+    });
+    toast(definition.success);
+    renderers.users();
+  }, definition.title);
+}
+
+function openDeleteUserAccountDialog(user) {
+  const confirmation = `DELETE USER ${user.id}`;
+  return openDialog("删除用户账号", `<div class="stack"><p><strong>${escapeHtml(user.nickname || "长理同学")}</strong> · ${escapeHtml(user.phone || "无手机号")}</p><p class="muted">删除后账号无法恢复，用户需要重新注册。用户个人资料、会话和用户内容会清理；管理员、公告、资料库条目和系统配置不受影响。</p><label>删除原因<textarea name="reason" maxlength="300" required></textarea></label><label>再次输入确认文本 <strong>${escapeHtml(confirmation)}</strong><input name="confirmation" autocomplete="off" required></label></div>`, async (form) => {
+    await api(`/api/v1/admin/users/${encodeURIComponent(user.id)}`, {
+      method: "DELETE",
+      body: { reason: form.get("reason"), confirmation: form.get("confirmation") },
+    });
+    toast("用户账号已删除");
+    renderers.users();
+  }, "确认删除账号");
+}
+
 function toast(message, isError = false) {
   const node = $("#toast");
   node.textContent = message;
@@ -344,9 +417,9 @@ const renderers = {
         <label class="compact">状态<select name="status">${accountStatusOptions(filters.status, true, true)}</select></label>
         <button class="primary">筛选</button>
       </form>
-      ${rows.length ? `<div class="toolbar"><button type="button" class="danger" data-action="bulk-manage-users">批量处理已选用户</button><span class="muted">仅能处理普通用户账号；管理员账号不属于此列表，也不会被该操作修改。</span></div><div class="table-wrap"><table><thead><tr><th><input type="checkbox" data-action="toggle-user-all" aria-label="全选当前用户"></th><th>用户完整资料</th><th>预约资料</th><th>账号状态</th><th>业务统计</th><th>时间 / 限制</th><th>操作</th></tr></thead><tbody>
+      ${rows.length ? `<div id="user-bulk-actions" class="toolbar" hidden><strong data-selected-user-count>已选择 0 个普通用户</strong><button type="button" class="danger" data-action="bulk-delete-users">删除账号</button><button type="button" class="primary" data-action="bulk-limit-users">批量限制访问</button><button type="button" class="ghost" data-action="bulk-restore-users">批量恢复权限</button><span class="muted">管理员账号不属于此列表，也不会被批量操作修改。</span></div><div class="table-wrap"><table><thead><tr><th><input type="checkbox" data-action="toggle-user-all" aria-label="全选当前普通用户"></th><th>用户完整资料</th><th>预约资料</th><th>账号状态</th><th>业务统计</th><th>时间 / 限制</th><th>操作</th></tr></thead><tbody>
         ${rows.map((row) => `<tr>
-          <td><input type="checkbox" class="user-select" value="${escapeHtml(row.id)}" aria-label="选择 ${escapeHtml(row.nickname || "用户")}"></td><td><strong>${escapeHtml(row.nickname || "长理同学")}</strong><br>${escapeHtml(row.phone || "无手机号")}<br><span class="subtle">${escapeHtml(row.id)}</span></td>
+          <td><input type="checkbox" class="user-select" value="${escapeHtml(row.id)}" aria-label="选择 ${escapeHtml(row.nickname || "用户")}" ${row.account_status === "DELETED" ? "disabled" : ""}></td><td><strong>${escapeHtml(row.nickname || "长理同学")}</strong><br>${escapeHtml(row.phone || "无手机号")}<br><span class="subtle">${escapeHtml(row.id)}</span></td>
           <td><strong>${escapeHtml(row.reservation_student_id || "未填写")}</strong><br><span class="subtle">${escapeHtml(row.reservation_name || "—")} · ${row.reservation_profile_consented_at ? "用户已同意" : "未记录同意"}</span></td>
           <td>${badge(row.account_type)}<br>${accountBadge(row.account_status)}</td>
           <td><span class="subtle">预约 ${row.reservation_count} · 失物 ${row.lost_found_count}<br>资料浏览 ${row.resource_view_count} · 收藏 ${row.resource_favorite_count}<br>投诉 ${row.resource_complaint_count} · 反馈 ${row.feedback_count}</span></td>
@@ -857,6 +930,10 @@ content.addEventListener("submit", async (event) => {
 content.addEventListener("change", async (event) => {
   const target = event.target;
   try {
+    if (target.classList.contains("user-select")) {
+      refreshUserBulkActions();
+      return;
+    }
     if (target.dataset.action === "lost-status") {
       await api(`/api/v1/admin/lost-found/${encodeURIComponent(target.dataset.id)}`, {
         method: "PATCH",
@@ -892,6 +969,13 @@ content.addEventListener("change", async (event) => {
 });
 
 $("#dialog-content").addEventListener("click", (event) => {
+  const deleteButton = event.target.closest('[data-action="delete-user-account"]');
+  if (deleteButton) {
+    const user = JSON.parse(deleteButton.dataset.user);
+    $("#dialog").close();
+    openDeleteUserAccountDialog(user);
+    return;
+  }
   const button = event.target.closest('[data-action="user-related"]');
   if (!button) return;
   $("#dialog").close();
@@ -923,31 +1007,15 @@ content.addEventListener("click", async (event) => {
       return;
     }
     if (action === "toggle-user-all") {
-      document.querySelectorAll(".user-select").forEach((checkbox) => {
+      document.querySelectorAll(".user-select:not(:disabled)").forEach((checkbox) => {
         checkbox.checked = button.checked;
       });
+      refreshUserBulkActions();
       return;
     }
-    if (action === "bulk-manage-users") {
-      const ids = Array.from(document.querySelectorAll(".user-select:checked"), (item) => item.value);
-      if (!ids.length) throw new Error("请先选择需要处理的普通用户");
-      if (!confirm(`将批量处理 ${ids.length} 个普通用户。确认进入第二次核验？`)) return;
-      const confirmation = `UPDATE ${ids.length} USERS`;
-      return openDialog("批量处理普通用户", `<div class="stack"><label>处理方式<select name="accountStatus"><option value="LIMITED">暂停用户</option><option value="ACTIVE">恢复用户</option><option value="DELETED">注销测试账号</option></select></label><label>暂停时长<select name="suspensionDuration"><option value="7_DAYS">7 天</option><option value="30_DAYS">30 天</option><option value="PERMANENT">永久</option></select></label><label>处理原因<textarea name="reason" maxlength="300" required></textarea></label><label>再次输入确认文本 <strong>${confirmation}</strong><input name="confirmation" autocomplete="off" required></label><p class="muted">注销采用账号状态治理并撤销会话，不会物理删除生产数据库记录。</p></div>`, async (form) => {
-        await api("/api/v1/admin/users/bulk-status", {
-          method: "POST",
-          body: {
-            ids,
-            accountStatus: form.get("accountStatus"),
-            suspensionDuration: form.get("suspensionDuration"),
-            reason: form.get("reason"),
-            confirmation: form.get("confirmation"),
-          },
-        });
-        toast(`已处理 ${ids.length} 个普通用户`);
-        renderers.users();
-      }, "确认批量处理");
-    }
+    if (action === "bulk-limit-users") return openBulkUserAction("limit");
+    if (action === "bulk-restore-users") return openBulkUserAction("restore");
+    if (action === "bulk-delete-users") return openBulkUserAction("delete");
     if (action === "reservations-page") {
       return renderers.reservations({...state.filters, page: button.dataset.page});
     }
@@ -1012,7 +1080,7 @@ content.addEventListener("click", async (event) => {
           <label>账号状态<select name="accountStatus">${accountStatusOptions(user.account_status)}</select></label>
           <label>处理原因<input name="reason" maxlength="300" placeholder="变更状态时必须填写"></label>
           <label>暂停时长<select name="suspensionDuration"><option value="7_DAYS">7 天</option><option value="30_DAYS">30 天</option><option value="PERMANENT">永久</option></select></label>
-          <p class="muted">账号状态选择“受限”时应用暂停时长；选择“正常”即可恢复。受限账号仍可使用本地功能，但服务端写操作会被拒绝。</p>
+          <p class="muted">账号状态选择“受限”时应用暂停时长；选择“正常”即可恢复。受限账号仍可登录并使用本地功能，但失物招领、资料库及其他需服务端授权的功能会被拒绝。</p>
           <p class="muted">预约姓名和学号只能由用户本人确认并保存。管理员可在详情页按权限受控查看，但不能代替用户填写或伪造同意记录。</p>
         </div>`,
         async (form) => {
@@ -1060,6 +1128,7 @@ content.addEventListener("click", async (event) => {
           <p class="muted">用户确认：${u.reservation_profile_consented_at ? formatTime(u.reservation_profile_consented_at) : "未确认"} · 最后更新：${formatTime(u.reservation_profile_updated_at)}</p>
           <p class="muted">限制状态：${escapeHtml(details.restriction?.reason || "无限制")}</p>
           <p class="muted">超级管理员可在本地工作台查看已收集的完整账号与预约资料；密码、哈希、Token、Session、Cookie 和教务数据永不展示。</p>
+          ${u.account_status === "DELETED" ? "" : `<button type="button" class="danger" data-action="delete-user-account" data-user="${escapeHtml(JSON.stringify(u))}">删除账号</button>`}
         </div>`, async () => {}, "关闭");
     }
     if (action === "clear-restriction") {
