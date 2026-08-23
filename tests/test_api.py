@@ -458,10 +458,13 @@ class ApiTest(unittest.TestCase):
     def test_registration_login_logout_and_account_status_enforcement(self):
         phone, password, token, user = self.phone_account()
         self.assertEqual(200, self.call("GET", "/api/v1/auth/me", token=token)[0])
-        self.assertEqual(409, self.call(
+        duplicate_status, duplicate = self.call(
             "POST", "/api/v1/auth/register",
             {"phone": phone, "password": password, "nickname": "重复用户"},
-        )[0])
+        )
+        self.assertEqual(409, duplicate_status)
+        self.assertEqual("PHONE_EXISTS", duplicate["error"]["code"])
+        self.assertEqual("该账号已存在，请直接登录", duplicate["error"]["message"])
         self.assertEqual(401, self.call(
             "POST", "/api/v1/auth/login",
             {"phone": phone, "password": "definitely-wrong-password"},
@@ -483,11 +486,17 @@ class ApiTest(unittest.TestCase):
         )
         self.assertEqual(403, disabled_status)
         self.assertNotIn(password, json.dumps(disabled, ensure_ascii=False))
-        self.assertEqual(200, self.call(
+        delete_status, delete_error = self.call(
             "PATCH", f"/api/v1/admin/users/{user['id']}",
             {"accountStatus": "DELETED", "reason": "自动化注销测试"}, admin,
+        )
+        self.assertEqual(409, delete_status)
+        self.assertEqual("USE_ACCOUNT_DELETE_API", delete_error["error"]["code"])
+        self.assertEqual(200, self.call(
+            "PATCH", f"/api/v1/admin/users/{user['id']}",
+            {"accountStatus": "ACTIVE", "reason": "恢复自动化权限测试"}, admin,
         )[0])
-        self.assertEqual(403, self.call(
+        self.assertEqual(200, self.call(
             "POST", "/api/v1/auth/login", {"phone": phone, "password": password},
         )[0])
 
@@ -1121,7 +1130,7 @@ class ApiTest(unittest.TestCase):
             )[0])
 
     def test_timed_account_limit_blocks_writes_and_automatically_restores(self):
-        _, _, token, user = self.phone_account()
+        phone, password, token, user = self.phone_account()
         admin = self.admin_token()
         status, limited = self.call(
             "PATCH",
@@ -1135,6 +1144,20 @@ class ApiTest(unittest.TestCase):
         )
         self.assertEqual(200, status)
         self.assertGreater(limited["data"]["account_status_expires_at"], server.now_ms())
+        login_status, limited_login = self.call(
+            "POST", "/api/v1/auth/login", {"phone": phone, "password": password},
+        )
+        self.assertEqual(200, login_status)
+        self.assertEqual("LIMITED", limited_login["data"]["user"]["accountStatus"])
+        self.assertGreater(
+            limited_login["data"]["user"]["accountStatusExpiresAt"], server.now_ms()
+        )
+        duplicate_status, duplicate = self.call(
+            "POST", "/api/v1/auth/register",
+            {"phone": phone, "password": password, "nickname": "绕过限制测试"},
+        )
+        self.assertEqual(409, duplicate_status)
+        self.assertEqual("该账号已存在，请直接登录", duplicate["error"]["message"])
         self.assertEqual(200, self.call("GET", "/api/v1/auth/me", token=token)[0])
         self.assertEqual(403, self.call("GET", "/api/v1/lost-found", token=token)[0])
         self.assertEqual(403, self.call("GET", "/api/v1/library", token=token)[0])
@@ -1172,6 +1195,23 @@ class ApiTest(unittest.TestCase):
             },
             token,
         )[0])
+        self.assertEqual(200, self.call(
+            "PATCH",
+            f"/api/v1/admin/users/{user['id']}",
+            {
+                "accountStatus": "LIMITED",
+                "suspensionDuration": "30_DAYS",
+                "reason": "自动化三十天暂停测试",
+            },
+            admin,
+        )[0])
+        self.assertEqual(200, self.call(
+            "PATCH",
+            f"/api/v1/admin/users/{user['id']}",
+            {"accountStatus": "ACTIVE", "reason": "管理员手动恢复账号"},
+            admin,
+        )[0])
+        self.assertEqual(200, self.call("GET", "/api/v1/lost-found", token=token)[0])
 
     def test_bulk_user_governance_is_user_only_and_requires_second_confirmation(self):
         _, _, token_a, user_a = self.phone_account()
@@ -1270,6 +1310,24 @@ class ApiTest(unittest.TestCase):
         self.assertTrue(deleted["data"]["deleted"])
         self.assertEqual(401, self.call("GET", "/api/v1/auth/me", token=token)[0])
         self.assertFalse((server.UPLOADS / image_name).exists())
+        default_status, default_users = self.call(
+            "GET", "/api/v1/admin/users", token=admin
+        )
+        self.assertEqual(200, default_status)
+        self.assertNotIn(user["id"], {row["id"] for row in default_users["data"]})
+        deleted_status, deleted_users = self.call(
+            "GET", "/api/v1/admin/users?status=DELETED", token=admin
+        )
+        self.assertEqual(200, deleted_status)
+        self.assertIn(user["id"], {row["id"] for row in deleted_users["data"]})
+        restore_status, restore_error = self.call(
+            "PATCH",
+            endpoint,
+            {"accountStatus": "ACTIVE", "reason": "不应恢复已清理账号"},
+            admin,
+        )
+        self.assertEqual(409, restore_status)
+        self.assertEqual("ACCOUNT_DELETION_FINAL", restore_error["error"]["code"])
         with server.connection() as db:
             deleted_user = db.execute(
                 "SELECT * FROM users WHERE id=?", (user["id"],)
@@ -1584,6 +1642,9 @@ class ApiTest(unittest.TestCase):
             self.assertIn("批量限制访问", javascript)
             self.assertIn("批量恢复权限", javascript)
             self.assertIn("delete-user-account", javascript)
+            self.assertIn("默认隐藏已注销用户", javascript)
+            self.assertIn("恢复账号", javascript)
+            self.assertIn("已注销，可重新注册", javascript)
             self.assertNotIn("本地运行说明", javascript)
 
     def test_platform_metrics_user_events_status_and_risk_are_separated(self):

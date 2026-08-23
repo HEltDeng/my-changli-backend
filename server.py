@@ -1766,7 +1766,7 @@ class ApiHandler(BaseHTTPRequestHandler):
                     ),
                 )
             except sqlite3.IntegrityError as exc:
-                raise ApiError(409, "PHONE_EXISTS", "该手机号已经注册") from exc
+                raise ApiError(409, "PHONE_EXISTS", "该账号已存在，请直接登录") from exc
             migrated = migrate_device_data(
                 db, str(data.get("installationId", "")).strip() or None, user_id
             )
@@ -3262,9 +3262,12 @@ class ApiHandler(BaseHTTPRequestHandler):
                 clauses = ["u.role='USER'"]
                 values: list[Any] = []
                 append_user_search(clauses, values, query.get("q"))
-                if query.get("status", "").upper() in ACCOUNT_STATUSES | {"SUSPENDED"}:
+                requested_status = query.get("status", "").upper()
+                if requested_status in ACCOUNT_STATUSES | {"SUSPENDED"}:
                     clauses.append("u.account_status=?")
-                    values.append(query["status"].upper())
+                    values.append(requested_status)
+                elif query.get("includeDeleted", "").lower() != "true":
+                    clauses.append("u.account_status!='DELETED'")
                 if query.get("accountType", "").upper() in {"PHONE", "DEVICE"}:
                     clauses.append("u.account_type=?")
                     values.append(query["accountType"].upper())
@@ -3638,11 +3641,23 @@ class ApiHandler(BaseHTTPRequestHandler):
                 ).fetchone()
                 if not user:
                     raise ApiError(404, "USER_NOT_FOUND", "用户不存在")
+                if user["account_status"] == "DELETED":
+                    raise ApiError(
+                        409,
+                        "ACCOUNT_DELETION_FINAL",
+                        "已注销账号的个人数据已清理，不能恢复；用户可使用原手机号重新注册",
+                    )
                 account_status = str(
                     data.get("accountStatus", user["account_status"])
                 ).upper()
                 if account_status not in ACCOUNT_STATUSES:
                     raise ApiError(400, "VALIDATION_ERROR", "账号状态无效")
+                if account_status == "DELETED":
+                    raise ApiError(
+                        409,
+                        "USE_ACCOUNT_DELETE_API",
+                        "注销账号必须使用受保护的账号删除操作",
+                    )
                 if account_status != user["account_status"]:
                     reason = required_text(data, "reason", 300)
                 else:
