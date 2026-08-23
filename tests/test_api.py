@@ -1571,6 +1571,9 @@ class ApiTest(unittest.TestCase):
             self.assertIn("PRODUCTION ADMIN", html)
             self.assertNotIn("LOCAL ADMIN", html)
             self.assertNotIn("仅本机", html)
+        with urllib.request.urlopen(self.base + "/admin/styles.css", timeout=5) as response:
+            stylesheet = response.read().decode("utf-8")
+            self.assertIn("#user-bulk-actions[hidden]", stylesheet)
         with urllib.request.urlopen(self.base + "/admin/app.js", timeout=5) as response:
             javascript = response.read().decode("utf-8")
             self.assertIn("生产运行说明", javascript)

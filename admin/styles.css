@@ -57,6 +57,7 @@ nav button:hover, nav button.active { color: white; background: rgba(255,255,255
 .local-pill span { width: 7px; height: 7px; border-radius: 50%; background: #22a265; }
 .content { padding: 28px 34px 60px; }
 .toolbar { display: flex; flex-wrap: wrap; gap: 10px; align-items: end; margin-bottom: 18px; }
+#user-bulk-actions[hidden] { display: none; }
 .toolbar label { min-width: 150px; flex: 1; }
 .toolbar .compact { flex: 0 1 180px; }
 .grid { display: grid; gap: 16px; }
