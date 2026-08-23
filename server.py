@@ -659,6 +659,34 @@ def require_account_operation(user: sqlite3.Row) -> None:
         raise ApiError(403, "ACCOUNT_OPERATION_RESTRICTED", reason)
 
 
+def restore_expired_account_limit(
+    db: sqlite3.Connection, user: sqlite3.Row
+) -> sqlite3.Row:
+    expires_at = user["account_status_expires_at"]
+    if (
+        user["account_status"] == "LIMITED"
+        and expires_at is not None
+        and int(expires_at) <= now_ms()
+    ):
+        timestamp = now_ms()
+        db.execute(
+            """UPDATE users SET account_status='ACTIVE',account_status_reason='',
+               account_status_changed_at=?,account_status_expires_at=NULL WHERE id=?""",
+            (timestamp, user["id"]),
+        )
+        write_user_event(
+            db,
+            user["id"],
+            "ACCOUNT",
+            "ACCOUNT_LIMIT_EXPIRED",
+            "SUCCESS",
+            "USER",
+            user["id"],
+        )
+        return db.execute("SELECT * FROM users WHERE id=?", (user["id"],)).fetchone()
+    return user
+
+
 def append_user_search(
     clauses: list[str],
     values: list[Any],
@@ -822,6 +850,17 @@ def migrate_device_data(
     db.execute(
         "UPDATE lost_found_posts SET owner_user_id=? WHERE owner_user_id=?",
         (target_user_id, source_id),
+    )
+    db.execute(
+        """INSERT OR IGNORE INTO lost_found_deletion_tombstones(
+               id,owner_user_id,client_local_id,deleted_by_user_id,reason,created_at)
+           SELECT id,?,client_local_id,deleted_by_user_id,reason,created_at
+           FROM lost_found_deletion_tombstones WHERE owner_user_id=?""",
+        (target_user_id, source_id),
+    )
+    db.execute(
+        "DELETE FROM lost_found_deletion_tombstones WHERE owner_user_id=?",
+        (source_id,),
     )
     db.execute("UPDATE feedback SET user_id=? WHERE user_id=?", (target_user_id, source_id))
     for table, key in (
@@ -1318,6 +1357,7 @@ class ApiHandler(BaseHTTPRequestHandler):
         ).fetchone()
         if not user:
             raise ApiError(401, "SESSION_EXPIRED", "登录状态已过期")
+        user = restore_expired_account_limit(db, user)
         if user["account_status"] in {"DISABLED", "PENDING_DELETION", "DELETED", "SUSPENDED"}:
             raise ApiError(403, "ACCOUNT_UNAVAILABLE", "账号当前不可用，请联系管理员")
         if user["role"] == "ADMIN" and not bool(user["admin_enabled"]):
@@ -1685,6 +1725,7 @@ class ApiHandler(BaseHTTPRequestHandler):
                 elif user and user["role"] == "ADMIN":
                     write_audit(db, user["id"], "ADMIN_LOGIN_FAILED", "ADMIN", user["id"], {"result": "FAILURE"})
                 raise ApiError(401, "INVALID_CREDENTIALS", "账号或密码错误")
+            user = restore_expired_account_limit(db, user)
             if user["account_status"] in {"DISABLED", "PENDING_DELETION", "DELETED", "SUSPENDED"}:
                 if user["role"] == "USER":
                     write_user_event(db, user["id"], "ACCOUNT", "LOGIN_DENIED", "DENIED", risk_flag="ACCOUNT_STATUS")
@@ -2243,6 +2284,34 @@ class ApiHandler(BaseHTTPRequestHandler):
             "isFavorite": favorite, "hasClaimRequest": claimed,
         }
 
+    def record_lost_deletion(
+        self,
+        db: sqlite3.Connection,
+        post: sqlite3.Row,
+        actor_user_id: str,
+        reason: str,
+    ) -> None:
+        client_local_id = str(post["client_local_id"] or "").strip()
+        if not client_local_id:
+            return
+        db.execute(
+            """INSERT INTO lost_found_deletion_tombstones(
+                   id,owner_user_id,client_local_id,deleted_by_user_id,reason,created_at)
+               VALUES(?,?,?,?,?,?)
+               ON CONFLICT(owner_user_id,client_local_id) DO UPDATE SET
+                   deleted_by_user_id=excluded.deleted_by_user_id,
+                   reason=excluded.reason,
+                   created_at=excluded.created_at""",
+            (
+                str(uuid.uuid4()),
+                post["owner_user_id"],
+                client_local_id,
+                actor_user_id,
+                reason[:300],
+                now_ms(),
+            ),
+        )
+
     def lost_list(self, query: dict[str, str]) -> list[dict[str, Any]]:
         with connection() as db:
             user = self.current_user(db)
@@ -2359,6 +2428,17 @@ class ApiHandler(BaseHTTPRequestHandler):
         with connection() as db:
             user = self.current_user(db)
             require_account_operation(user)
+            client_local_id = str(data.get("clientLocalId") or "")[:100] or None
+            if client_local_id and db.execute(
+                """SELECT 1 FROM lost_found_deletion_tombstones
+                   WHERE owner_user_id=? AND client_local_id=?""",
+                (user["id"], client_local_id),
+            ).fetchone():
+                raise ApiError(
+                    410,
+                    "POST_DELETED",
+                    "该失物信息已被删除，不能由旧缓存重新发布",
+                )
             image_name = self.save_image(
                 data.get("imageBase64"), str(uuid.uuid4())
             )
@@ -2367,7 +2447,7 @@ class ApiHandler(BaseHTTPRequestHandler):
                     """INSERT INTO lost_found_posts(id,owner_user_id,client_local_id,type,item_name,
                        category,location,event_date,approximate_time,description,claim_note,image_name,
                        status,created_at,updated_at) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
-                    (post_id, user["id"], str(data.get("clientLocalId") or "")[:100] or None,
+                    (post_id, user["id"], client_local_id,
                      values["type"], values["item_name"], values["category"], values["location"],
                      values["event_date"], values["approximate_time"], values["description"],
                      values["claim_note"], image_name, values["status"], timestamp, timestamp),
@@ -2436,6 +2516,9 @@ class ApiHandler(BaseHTTPRequestHandler):
                 raise ApiError(404, "POST_NOT_FOUND", "失物信息不存在")
             if post["owner_user_id"] != user["id"] and user["role"] != "ADMIN":
                 raise ApiError(403, "FORBIDDEN", "只能删除自己的发布")
+            self.record_lost_deletion(
+                db, post, user["id"], "用户删除自己的失物信息"
+            )
             db.execute("DELETE FROM lost_found_posts WHERE id=?", (post_id,))
             if post["image_name"]:
                 run_safely_delete_upload(post["image_name"])
@@ -3102,6 +3185,14 @@ class ApiHandler(BaseHTTPRequestHandler):
                 return {"id": target["id"], "reset": True}, 200
 
             if method == "GET" and path == "/api/v1/admin/users":
+                db.execute(
+                    """UPDATE users SET account_status='ACTIVE',account_status_reason='',
+                       account_status_changed_at=?,account_status_expires_at=NULL
+                       WHERE role='USER' AND account_status='LIMITED'
+                         AND account_status_expires_at IS NOT NULL
+                         AND account_status_expires_at<=?""",
+                    (now_ms(), now_ms()),
+                )
                 clauses = ["u.role='USER'"]
                 values: list[Any] = []
                 append_user_search(clauses, values, query.get("q"))
@@ -3357,6 +3448,90 @@ class ApiHandler(BaseHTTPRequestHandler):
                     "expiresInSeconds": 60,
                 }, 200
 
+            if method == "POST" and path == "/api/v1/admin/users/bulk-status":
+                require_admin_permission(admin, "ACCOUNT_MANAGE")
+                data = self.body_json()
+                raw_ids = data.get("ids")
+                if not isinstance(raw_ids, list):
+                    raise ApiError(400, "VALIDATION_ERROR", "ids 必须是数组")
+                user_ids = list(dict.fromkeys(str(value) for value in raw_ids))
+                if not user_ids or len(user_ids) > 100 or any(
+                    not re.fullmatch(r"[A-Za-z0-9-]{6,80}", value)
+                    for value in user_ids
+                ):
+                    raise ApiError(400, "VALIDATION_ERROR", "批量用户对象无效或超过 100 个")
+                account_status = str(data.get("accountStatus", "")).upper()
+                if account_status not in {"ACTIVE", "LIMITED", "DELETED"}:
+                    raise ApiError(400, "VALIDATION_ERROR", "批量账号状态无效")
+                reason = required_text(data, "reason", 300)
+                confirmation = str(data.get("confirmation", "")).strip()
+                expected_confirmation = f"UPDATE {len(user_ids)} USERS"
+                if confirmation != expected_confirmation:
+                    raise ApiError(400, "CONFIRMATION_REQUIRED", "批量账号确认文本不匹配")
+                placeholders = ",".join("?" for _ in user_ids)
+                users = db.execute(
+                    f"SELECT id FROM users WHERE role='USER' AND id IN ({placeholders})",
+                    user_ids,
+                ).fetchall()
+                if len(users) != len(user_ids):
+                    raise ApiError(
+                        409,
+                        "BULK_TARGET_CHANGED",
+                        "部分用户不存在或不是普通用户，请刷新后重试",
+                    )
+                duration = str(data.get("suspensionDuration", "PERMANENT")).upper()
+                expires_at = None
+                if account_status == "LIMITED":
+                    if duration == "7_DAYS":
+                        expires_at = now_ms() + 7 * 24 * 60 * 60 * 1000
+                    elif duration == "30_DAYS":
+                        expires_at = now_ms() + 30 * 24 * 60 * 60 * 1000
+                    elif duration != "PERMANENT":
+                        raise ApiError(400, "VALIDATION_ERROR", "暂停时长无效")
+                changed_at = now_ms()
+                db.execute(
+                    f"""UPDATE users SET account_status=?,account_status_reason=?,
+                        account_status_changed_at=?,account_status_expires_at=?
+                        WHERE role='USER' AND id IN ({placeholders})""",
+                    [account_status, "" if account_status == "ACTIVE" else reason,
+                     changed_at, expires_at, *user_ids],
+                )
+                if account_status == "DELETED":
+                    db.execute(
+                        f"DELETE FROM sessions WHERE user_id IN ({placeholders})",
+                        user_ids,
+                    )
+                for user_id in user_ids:
+                    write_user_event(
+                        db,
+                        user_id,
+                        "ACCOUNT",
+                        "ACCOUNT_STATUS_CHANGED",
+                        "SUCCESS",
+                        "USER",
+                        user_id,
+                    )
+                write_audit(
+                    db,
+                    admin["id"],
+                    "USER_STATUS_BULK_UPDATED",
+                    "USER",
+                    None,
+                    {
+                        "count": len(user_ids),
+                        "accountStatus": account_status,
+                        "reason": reason[:120],
+                        "suspensionDuration": duration
+                        if account_status == "LIMITED"
+                        else None,
+                    },
+                )
+                return {
+                    "updated": len(user_ids),
+                    "accountStatus": account_status,
+                    "expiresAt": expires_at,
+                }, 200
+
             match = re.fullmatch(r"/api/v1/admin/users/([^/]+)", path)
             if method == "PATCH" and match:
                 require_admin_permission(admin, "ACCOUNT_MANAGE")
@@ -3381,6 +3556,20 @@ class ApiHandler(BaseHTTPRequestHandler):
                         expires_at = int(expires_at)
                     except (TypeError, ValueError) as exc:
                         raise ApiError(400, "VALIDATION_ERROR", "状态到期时间无效") from exc
+                duration = str(data.get("suspensionDuration", "")).upper()
+                if account_status == "LIMITED" and duration:
+                    if duration == "7_DAYS":
+                        expires_at = now_ms() + 7 * 24 * 60 * 60 * 1000
+                    elif duration == "30_DAYS":
+                        expires_at = now_ms() + 30 * 24 * 60 * 60 * 1000
+                    elif duration == "PERMANENT":
+                        expires_at = None
+                    else:
+                        raise ApiError(400, "VALIDATION_ERROR", "暂停时长无效")
+                elif account_status != "LIMITED":
+                    expires_at = None
+                if expires_at is not None and expires_at <= now_ms():
+                    raise ApiError(400, "VALIDATION_ERROR", "状态到期时间必须晚于当前时间")
                 nickname = str(data.get("nickname", user["nickname"] or "长理同学")).strip()[:40]
                 db.execute(
                     """UPDATE users SET account_status=?,nickname=?,account_status_reason=?,
@@ -3406,6 +3595,8 @@ class ApiHandler(BaseHTTPRequestHandler):
                         "oldStatus": user["account_status"],
                         "accountStatus": account_status,
                         "reason": reason[:120],
+                        "suspensionDuration": duration or None,
+                        "expiresAt": expires_at,
                     },
                 )
                 write_user_event(db, user["id"], "ACCOUNT", "ACCOUNT_STATUS_CHANGED", "SUCCESS", "USER", user["id"])
@@ -3990,6 +4181,7 @@ class ApiHandler(BaseHTTPRequestHandler):
                 return {"id": match.group(1), "status": "CANCELLED"}, 200
 
             if method == "GET" and path == "/api/v1/admin/lost-found":
+                require_admin_permission(admin, "LOST_VIEW")
                 clauses, values = [], []
                 if query.get("type", "").upper() in LOST_TYPES:
                     clauses.append("p.type=?")
@@ -4020,8 +4212,69 @@ class ApiHandler(BaseHTTPRequestHandler):
                     ).fetchall()
                 return [full_admin_user_row(row) if is_super_admin(admin) else mask_admin_user_row(row) for row in rows], 200
 
+            if method == "POST" and path == "/api/v1/admin/lost-found/bulk-delete":
+                require_admin_permission(admin, "LOST_MANAGE")
+                data = self.body_json()
+                raw_ids = data.get("ids")
+                if not isinstance(raw_ids, list):
+                    raise ApiError(400, "VALIDATION_ERROR", "ids 必须是数组")
+                post_ids = list(dict.fromkeys(str(value) for value in raw_ids))
+                if not post_ids or len(post_ids) > 100 or any(
+                    not re.fullmatch(r"[0-9a-f-]{36}", value) for value in post_ids
+                ):
+                    raise ApiError(400, "VALIDATION_ERROR", "批量删除对象无效或超过 100 条")
+                reason = required_text(data, "reason", 300)
+                confirmation = str(data.get("confirmation", "")).strip()
+                expected_confirmation = f"DELETE {len(post_ids)} ITEMS"
+                if confirmation != expected_confirmation:
+                    raise ApiError(400, "CONFIRMATION_REQUIRED", "批量删除确认文本不匹配")
+                placeholders = ",".join("?" for _ in post_ids)
+                posts = db.execute(
+                    f"SELECT * FROM lost_found_posts WHERE id IN ({placeholders})",
+                    post_ids,
+                ).fetchall()
+                if len(posts) != len(post_ids):
+                    raise ApiError(409, "BULK_TARGET_CHANGED", "部分对象已不存在，请刷新后重试")
+                for post in posts:
+                    self.record_lost_deletion(db, post, admin["id"], reason)
+                db.execute(
+                    f"DELETE FROM lost_found_posts WHERE id IN ({placeholders})",
+                    post_ids,
+                )
+                for post in posts:
+                    if post["image_name"]:
+                        run_safely_delete_upload(post["image_name"])
+                write_audit(
+                    db,
+                    admin["id"],
+                    "LOST_FOUND_BULK_DELETED",
+                    "LOST_FOUND",
+                    None,
+                    {"count": len(post_ids), "reason": reason[:120]},
+                )
+                return {"deleted": len(post_ids), "ids": post_ids}, 200
+
             match = re.fullmatch(r"/api/v1/admin/lost-found/([^/]+)", path)
+            if method == "GET" and match:
+                require_admin_permission(admin, "LOST_VIEW")
+                row = db.execute(
+                    """SELECT p.*,u.id AS user_id,u.nickname,u.phone_masked,
+                              u.phone_encrypted,u.reservation_student_id,u.reservation_name,
+                              (SELECT COUNT(*) FROM lost_found_reports rr
+                               WHERE rr.post_id=p.id AND rr.status='OPEN') AS open_reports
+                       FROM lost_found_posts p JOIN users u ON u.id=p.owner_user_id
+                       WHERE p.id=?""",
+                    (match.group(1),),
+                ).fetchone()
+                if not row:
+                    raise ApiError(404, "POST_NOT_FOUND", "失物信息不存在")
+                return (
+                    full_admin_user_row(row)
+                    if is_super_admin(admin)
+                    else mask_admin_user_row(row)
+                ), 200
             if method == "PATCH" and match:
+                require_admin_permission(admin, "LOST_MANAGE")
                 data = self.body_json()
                 post = db.execute(
                     "SELECT * FROM lost_found_posts WHERE id=?", (match.group(1),)
@@ -4046,11 +4299,15 @@ class ApiHandler(BaseHTTPRequestHandler):
                 return {"id": post["id"], "status": status}, 200
 
             if method == "DELETE" and match:
+                require_admin_permission(admin, "LOST_MANAGE")
                 post = db.execute(
-                    "SELECT image_name FROM lost_found_posts WHERE id=?", (match.group(1),)
+                    "SELECT * FROM lost_found_posts WHERE id=?", (match.group(1),)
                 ).fetchone()
                 if not post:
                     raise ApiError(404, "POST_NOT_FOUND", "失物信息不存在")
+                self.record_lost_deletion(
+                    db, post, admin["id"], "管理员删除失物信息"
+                )
                 db.execute("DELETE FROM lost_found_posts WHERE id=?", (match.group(1),))
                 if post["image_name"]:
                     run_safely_delete_upload(post["image_name"])

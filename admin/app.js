@@ -344,9 +344,9 @@ const renderers = {
         <label class="compact">状态<select name="status">${accountStatusOptions(filters.status, true, true)}</select></label>
         <button class="primary">筛选</button>
       </form>
-      ${rows.length ? `<div class="table-wrap"><table><thead><tr><th>用户完整资料</th><th>预约资料</th><th>账号状态</th><th>业务统计</th><th>时间 / 限制</th><th>操作</th></tr></thead><tbody>
+      ${rows.length ? `<div class="toolbar"><button type="button" class="danger" data-action="bulk-manage-users">批量处理已选用户</button><span class="muted">仅能处理普通用户账号；管理员账号不属于此列表，也不会被该操作修改。</span></div><div class="table-wrap"><table><thead><tr><th><input type="checkbox" data-action="toggle-user-all" aria-label="全选当前用户"></th><th>用户完整资料</th><th>预约资料</th><th>账号状态</th><th>业务统计</th><th>时间 / 限制</th><th>操作</th></tr></thead><tbody>
         ${rows.map((row) => `<tr>
-          <td><strong>${escapeHtml(row.nickname || "长理同学")}</strong><br>${escapeHtml(row.phone || "无手机号")}<br><span class="subtle">${escapeHtml(row.id)}</span></td>
+          <td><input type="checkbox" class="user-select" value="${escapeHtml(row.id)}" aria-label="选择 ${escapeHtml(row.nickname || "用户")}"></td><td><strong>${escapeHtml(row.nickname || "长理同学")}</strong><br>${escapeHtml(row.phone || "无手机号")}<br><span class="subtle">${escapeHtml(row.id)}</span></td>
           <td><strong>${escapeHtml(row.reservation_student_id || "未填写")}</strong><br><span class="subtle">${escapeHtml(row.reservation_name || "—")} · ${row.reservation_profile_consented_at ? "用户已同意" : "未记录同意"}</span></td>
           <td>${badge(row.account_type)}<br>${accountBadge(row.account_status)}</td>
           <td><span class="subtle">预约 ${row.reservation_count} · 失物 ${row.lost_found_count}<br>资料浏览 ${row.resource_view_count} · 收藏 ${row.resource_favorite_count}<br>投诉 ${row.resource_complaint_count} · 反馈 ${row.feedback_count}</span></td>
@@ -455,8 +455,8 @@ const renderers = {
         <label>用户<input name="user" value="${escapeHtml(filters.user || "")}" placeholder="完整手机号、昵称、内部 ID 或预约学号"></label>
         <button class="primary">筛选</button>
       </form>
-      ${posts.length ? `<div class="table-wrap"><table><thead><tr><th>物品</th><th>类型</th><th>地点 / 日期</th><th>发布者</th><th>状态</th><th>举报</th><th>操作</th></tr></thead><tbody>
-        ${posts.map((post) => `<tr><td><strong>${escapeHtml(post.item_name)}</strong><br><span class="subtle">${escapeHtml(post.category)}</span></td><td>${badge(post.type)}</td><td>${escapeHtml(post.location)}<br><span class="subtle">${escapeHtml(post.event_date)}</span></td><td><strong>${escapeHtml(userLabel(post))}</strong><br><span class="subtle">${escapeHtml(post.phone || post.phone_masked || "测试设备")}</span></td><td><select data-action="lost-status" data-id="${escapeHtml(post.id)}" data-type="${post.type}">${lostStatusOptions(post.type, post.status)}</select></td><td>${post.open_reports || 0}</td><td><button class="danger" data-action="delete-lost" data-id="${escapeHtml(post.id)}">删除</button></td></tr>`).join("")}
+      ${posts.length ? `<div class="toolbar"><button type="button" class="danger" data-action="bulk-delete-lost">批量删除已选内容</button><span class="muted">仅作用于已选失物内容，不会删除公告、资料、管理员或系统配置。</span></div><div class="table-wrap"><table><thead><tr><th><input type="checkbox" data-action="toggle-lost-all" aria-label="全选当前失物"></th><th>物品</th><th>类型</th><th>地点 / 日期</th><th>发布者</th><th>状态</th><th>举报</th><th>操作</th></tr></thead><tbody>
+        ${posts.map((post) => `<tr><td><input type="checkbox" class="lost-select" value="${escapeHtml(post.id)}" aria-label="选择 ${escapeHtml(post.item_name)}"></td><td><strong>${escapeHtml(post.item_name)}</strong><br><span class="subtle">${escapeHtml(post.category)}</span></td><td>${badge(post.type)}</td><td>${escapeHtml(post.location)}<br><span class="subtle">${escapeHtml(post.event_date)}</span></td><td><strong>${escapeHtml(userLabel(post))}</strong><br><span class="subtle">内部用户 ID：${escapeHtml(post.owner_user_id || post.user_id || "—")}</span></td><td><select data-action="lost-status" data-id="${escapeHtml(post.id)}" data-type="${post.type}">${lostStatusOptions(post.type, post.status)}</select></td><td>${post.open_reports || 0}</td><td><div class="actions"><button class="ghost" data-action="lost-details" data-id="${escapeHtml(post.id)}">查看详情</button><button class="danger" data-action="delete-lost" data-id="${escapeHtml(post.id)}">删除</button></div></td></tr>`).join("")}
       </tbody></table></div>` : '<div class="empty">没有符合条件的失物信息</div>'}
       <h3 class="section-title">举报处理</h3>
       ${reports.length ? `<div class="table-wrap"><table><thead><tr><th>物品</th><th>原因</th><th>提交者</th><th>时间</th><th>状态</th></tr></thead><tbody>
@@ -916,6 +916,38 @@ content.addEventListener("click", async (event) => {
       return;
     }
     if (action === "clear-reservation-filter") return renderers.reservations();
+    if (action === "toggle-lost-all") {
+      document.querySelectorAll(".lost-select").forEach((checkbox) => {
+        checkbox.checked = button.checked;
+      });
+      return;
+    }
+    if (action === "toggle-user-all") {
+      document.querySelectorAll(".user-select").forEach((checkbox) => {
+        checkbox.checked = button.checked;
+      });
+      return;
+    }
+    if (action === "bulk-manage-users") {
+      const ids = Array.from(document.querySelectorAll(".user-select:checked"), (item) => item.value);
+      if (!ids.length) throw new Error("请先选择需要处理的普通用户");
+      if (!confirm(`将批量处理 ${ids.length} 个普通用户。确认进入第二次核验？`)) return;
+      const confirmation = `UPDATE ${ids.length} USERS`;
+      return openDialog("批量处理普通用户", `<div class="stack"><label>处理方式<select name="accountStatus"><option value="LIMITED">暂停用户</option><option value="ACTIVE">恢复用户</option><option value="DELETED">注销测试账号</option></select></label><label>暂停时长<select name="suspensionDuration"><option value="7_DAYS">7 天</option><option value="30_DAYS">30 天</option><option value="PERMANENT">永久</option></select></label><label>处理原因<textarea name="reason" maxlength="300" required></textarea></label><label>再次输入确认文本 <strong>${confirmation}</strong><input name="confirmation" autocomplete="off" required></label><p class="muted">注销采用账号状态治理并撤销会话，不会物理删除生产数据库记录。</p></div>`, async (form) => {
+        await api("/api/v1/admin/users/bulk-status", {
+          method: "POST",
+          body: {
+            ids,
+            accountStatus: form.get("accountStatus"),
+            suspensionDuration: form.get("suspensionDuration"),
+            reason: form.get("reason"),
+            confirmation: form.get("confirmation"),
+          },
+        });
+        toast(`已处理 ${ids.length} 个普通用户`);
+        renderers.users();
+      }, "确认批量处理");
+    }
     if (action === "reservations-page") {
       return renderers.reservations({...state.filters, page: button.dataset.page});
     }
@@ -979,7 +1011,8 @@ content.addEventListener("click", async (event) => {
           <label>昵称<input name="nickname" maxlength="40" value="${escapeHtml(user.nickname || "长理同学")}" required></label>
           <label>账号状态<select name="accountStatus">${accountStatusOptions(user.account_status)}</select></label>
           <label>处理原因<input name="reason" maxlength="300" placeholder="变更状态时必须填写"></label>
-          <label>状态到期时间（可选）<input type="datetime-local" name="expiresAt"></label>
+          <label>暂停时长<select name="suspensionDuration"><option value="7_DAYS">7 天</option><option value="30_DAYS">30 天</option><option value="PERMANENT">永久</option></select></label>
+          <p class="muted">账号状态选择“受限”时应用暂停时长；选择“正常”即可恢复。受限账号仍可使用本地功能，但服务端写操作会被拒绝。</p>
           <p class="muted">预约姓名和学号只能由用户本人确认并保存。管理员可在详情页按权限受控查看，但不能代替用户填写或伪造同意记录。</p>
         </div>`,
         async (form) => {
@@ -989,7 +1022,7 @@ content.addEventListener("click", async (event) => {
               nickname: form.get("nickname"),
               accountStatus: form.get("accountStatus"),
               reason: form.get("reason"),
-              expiresAt: form.get("expiresAt") ? new Date(form.get("expiresAt")).getTime() : null,
+              suspensionDuration: form.get("suspensionDuration"),
             },
           });
           toast("用户资料已保存");
@@ -1136,6 +1169,37 @@ content.addEventListener("click", async (event) => {
       await api(`/api/v1/admin/lost-found/${encodeURIComponent(button.dataset.id)}`, { method: "DELETE" });
       toast("失物信息已删除");
       return renderers.lost();
+    }
+    if (action === "lost-details") {
+      const item = await api(`/api/v1/admin/lost-found/${encodeURIComponent(button.dataset.id)}`);
+      const image = item.image_name
+        ? `<img class="lost-image-preview" src="/uploads/${encodeURIComponent(item.image_name)}" alt="${escapeHtml(item.item_name)}的失物图片">`
+        : '<div class="empty">该内容未上传图片</div>';
+      return openDialog("失物详情", `
+        <div class="stack">
+          ${image}
+          <div><strong>${escapeHtml(item.item_name)}</strong><p class="long-text">${escapeHtml(item.description || "无详细描述")}</p></div>
+          <div class="grid two-columns">
+            <p class="subtle">类型：${escapeHtml(item.type)}<br>分类：${escapeHtml(item.category)}<br>状态：${escapeHtml(statusText(item.status))}</p>
+            <p class="subtle">地点：${escapeHtml(item.location)}<br>日期：${escapeHtml(item.event_date)}<br>发布时间：${formatTime(item.created_at)}</p>
+          </div>
+          <p class="subtle">发布用户：${escapeHtml(userLabel(item))}<br>内部用户 ID：${escapeHtml(item.owner_user_id || item.user_id || "—")}</p>
+          <p class="subtle">认领说明：${escapeHtml(item.claim_note || "无")}</p>
+        </div>`, async () => {}, "关闭");
+    }
+    if (action === "bulk-delete-lost") {
+      const ids = Array.from(document.querySelectorAll(".lost-select:checked"), (item) => item.value);
+      if (!ids.length) throw new Error("请先选择需要删除的失物内容");
+      if (!confirm(`将删除 ${ids.length} 条失物内容。确认进入第二次核验？`)) return;
+      const confirmation = `DELETE ${ids.length} ITEMS`;
+      return openDialog("批量删除失物内容", `<div class="stack"><p>该操作仅删除已选失物内容，关联图片和业务记录会同步清理。</p><label>处理原因<textarea name="reason" maxlength="300" required></textarea></label><label>再次输入确认文本 <strong>${confirmation}</strong><input name="confirmation" autocomplete="off" required></label></div>`, async (form) => {
+        await api("/api/v1/admin/lost-found/bulk-delete", {
+          method: "POST",
+          body: {ids, reason: form.get("reason"), confirmation: form.get("confirmation")},
+        });
+        toast(`已删除 ${ids.length} 条失物内容`);
+        renderers.lost();
+      }, "确认批量删除");
     }
     if (action === "edit-resource") {
       const item = JSON.parse(button.dataset.resource);

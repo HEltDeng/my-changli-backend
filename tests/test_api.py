@@ -1,5 +1,7 @@
 import concurrent.futures
 import core
+import base64
+import io
 import importlib.util
 import json
 import secrets
@@ -11,6 +13,7 @@ import urllib.parse
 import urllib.request
 from datetime import date, timedelta
 from pathlib import Path
+from PIL import Image
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -1018,6 +1021,193 @@ class ApiTest(unittest.TestCase):
         self.assertEqual(200, self.call("DELETE", f"/api/v1/lost-found/{post_id}", token=owner)[0])
         self.assertEqual(404, self.call("GET", f"/api/v1/lost-found/{post_id}", token=owner)[0])
 
+    def test_lost_found_image_admin_detail_delete_tombstone_and_public_access(self):
+        _, _, owner, _ = self.phone_account()
+        _, _, viewer, _ = self.phone_account()
+        admin = self.admin_token()
+        image_buffer = io.BytesIO()
+        Image.new("RGB", (48, 32), (47, 111, 214)).save(image_buffer, "PNG")
+        client_local_id = "image-tombstone-" + secrets.token_hex(8)
+        payload = {
+            "clientLocalId": client_local_id,
+            "type": "FOUND",
+            "itemName": "图片闭环测试",
+            "category": "ELECTRONIC",
+            "location": "测试地点",
+            "eventDate": date.today().isoformat(),
+            "description": "管理员应能查看图片与详情",
+            "imageBase64": base64.b64encode(image_buffer.getvalue()).decode(),
+            "status": "WAITING",
+        }
+        status, created = self.call("POST", "/api/v1/lost-found", payload, owner)
+        self.assertEqual(201, status)
+        post_id = created["data"]["id"]
+        image_url = created["data"]["imageUrl"]
+        self.assertTrue(image_url.startswith("/uploads/"))
+        with urllib.request.urlopen(self.base + image_url, timeout=5) as response:
+            self.assertEqual(200, response.status)
+            self.assertEqual("image/png", response.headers.get_content_type())
+            self.assertGreater(len(response.read()), 0)
+        status, detail = self.call(
+            "GET", f"/api/v1/admin/lost-found/{post_id}", token=admin
+        )
+        self.assertEqual(200, status)
+        self.assertEqual("图片闭环测试", detail["data"]["item_name"])
+        self.assertTrue(detail["data"]["image_name"].endswith(".png"))
+        self.assertEqual(200, self.call(
+            "PATCH", f"/api/v1/admin/lost-found/{post_id}",
+            {"status": "CLAIMED"}, admin,
+        )[0])
+        self.assertEqual("CLAIMED", self.call(
+            "GET", f"/api/v1/lost-found/{post_id}", token=viewer
+        )[1]["data"]["status"])
+        self.assertEqual(200, self.call(
+            "DELETE", f"/api/v1/admin/lost-found/{post_id}", token=admin
+        )[0])
+        self.assertEqual(404, self.call(
+            "GET", f"/api/v1/lost-found/{post_id}", token=viewer
+        )[0])
+        retry_status, retry = self.call("POST", "/api/v1/lost-found", payload, owner)
+        self.assertEqual(410, retry_status)
+        self.assertEqual("POST_DELETED", retry["error"]["code"])
+        with server.connection() as db:
+            self.assertIsNotNone(db.execute(
+                """SELECT 1 FROM lost_found_deletion_tombstones
+                   WHERE client_local_id=?""",
+                (client_local_id,),
+            ).fetchone())
+
+    def test_admin_bulk_lost_found_delete_requires_exact_confirmation(self):
+        _, _, owner, _ = self.phone_account()
+        admin = self.admin_token()
+        ids = []
+        for index in range(2):
+            status, created = self.call(
+                "POST",
+                "/api/v1/lost-found",
+                {
+                    "clientLocalId": f"bulk-delete-{index}-{secrets.token_hex(5)}",
+                    "type": "FOUND",
+                    "itemName": f"批量治理测试 {index}",
+                    "category": "OTHER",
+                    "location": "测试地点",
+                    "eventDate": date.today().isoformat(),
+                },
+                owner,
+            )
+            self.assertEqual(201, status)
+            ids.append(created["data"]["id"])
+        self.assertEqual(400, self.call(
+            "POST",
+            "/api/v1/admin/lost-found/bulk-delete",
+            {"ids": ids, "reason": "自动化违规内容清理", "confirmation": "DELETE"},
+            admin,
+        )[0])
+        status, deleted = self.call(
+            "POST",
+            "/api/v1/admin/lost-found/bulk-delete",
+            {
+                "ids": ids,
+                "reason": "自动化违规内容清理",
+                "confirmation": "DELETE 2 ITEMS",
+            },
+            admin,
+        )
+        self.assertEqual(200, status)
+        self.assertEqual(2, deleted["data"]["deleted"])
+        for post_id in ids:
+            self.assertEqual(404, self.call(
+                "GET", f"/api/v1/lost-found/{post_id}", token=owner
+            )[0])
+
+    def test_timed_account_limit_blocks_writes_and_automatically_restores(self):
+        _, _, token, user = self.phone_account()
+        admin = self.admin_token()
+        status, limited = self.call(
+            "PATCH",
+            f"/api/v1/admin/users/{user['id']}",
+            {
+                "accountStatus": "LIMITED",
+                "suspensionDuration": "7_DAYS",
+                "reason": "自动化七天暂停测试",
+            },
+            admin,
+        )
+        self.assertEqual(200, status)
+        self.assertGreater(limited["data"]["account_status_expires_at"], server.now_ms())
+        self.assertEqual(403, self.call(
+            "POST",
+            "/api/v1/lost-found",
+            {
+                "type": "FOUND",
+                "itemName": "受限发布",
+                "category": "OTHER",
+                "location": "测试地点",
+                "eventDate": date.today().isoformat(),
+            },
+            token,
+        )[0])
+        with server.connection() as db:
+            db.execute(
+                "UPDATE users SET account_status_expires_at=? WHERE id=?",
+                (server.now_ms() - 1, user["id"]),
+            )
+        self.assertEqual(200, self.call("GET", "/api/v1/auth/me", token=token)[0])
+        with server.connection() as db:
+            restored = db.execute("SELECT * FROM users WHERE id=?", (user["id"],)).fetchone()
+            self.assertEqual("ACTIVE", restored["account_status"])
+            self.assertIsNone(restored["account_status_expires_at"])
+        self.assertEqual(201, self.call(
+            "POST",
+            "/api/v1/lost-found",
+            {
+                "type": "FOUND",
+                "itemName": "恢复后发布",
+                "category": "OTHER",
+                "location": "测试地点",
+                "eventDate": date.today().isoformat(),
+            },
+            token,
+        )[0])
+
+    def test_bulk_user_governance_is_user_only_and_requires_second_confirmation(self):
+        _, _, token_a, user_a = self.phone_account()
+        _, _, token_b, user_b = self.phone_account()
+        admin = self.admin_token()
+        ids = [user_a["id"], user_b["id"]]
+        self.assertEqual(400, self.call(
+            "POST",
+            "/api/v1/admin/users/bulk-status",
+            {
+                "ids": ids,
+                "accountStatus": "DELETED",
+                "reason": "自动化测试账号清理",
+                "confirmation": "UPDATE USERS",
+            },
+            admin,
+        )[0])
+        status, updated = self.call(
+            "POST",
+            "/api/v1/admin/users/bulk-status",
+            {
+                "ids": ids,
+                "accountStatus": "DELETED",
+                "reason": "自动化测试账号清理",
+                "confirmation": "UPDATE 2 USERS",
+            },
+            admin,
+        )
+        self.assertEqual(200, status)
+        self.assertEqual(2, updated["data"]["updated"])
+        self.assertEqual(401, self.call("GET", "/api/v1/auth/me", token=token_a)[0])
+        self.assertEqual(401, self.call("GET", "/api/v1/auth/me", token=token_b)[0])
+        self.assertEqual(200, self.call("GET", "/api/v1/admin/overview", token=admin)[0])
+        with server.connection() as db:
+            self.assertGreaterEqual(
+                db.execute("SELECT COUNT(*) FROM users WHERE role='ADMIN'").fetchone()[0],
+                1,
+            )
+
     def test_client_local_id_is_idempotent(self):
         token = self.device_token("migration-device")
         payload = {
@@ -1292,6 +1482,9 @@ class ApiTest(unittest.TestCase):
         with urllib.request.urlopen(self.base + "/admin/app.js", timeout=5) as response:
             javascript = response.read().decode("utf-8")
             self.assertIn("生产运行说明", javascript)
+            self.assertIn("lost-details", javascript)
+            self.assertIn("bulk-delete-lost", javascript)
+            self.assertIn("suspensionDuration", javascript)
             self.assertNotIn("本地运行说明", javascript)
 
     def test_platform_metrics_user_events_status_and_risk_are_separated(self):

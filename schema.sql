@@ -133,6 +133,19 @@ CREATE TABLE IF NOT EXISTS lost_found_posts (
 CREATE INDEX IF NOT EXISTS lost_found_updated ON lost_found_posts(updated_at DESC);
 CREATE INDEX IF NOT EXISTS lost_found_owner ON lost_found_posts(owner_user_id, updated_at DESC);
 
+CREATE TABLE IF NOT EXISTS lost_found_deletion_tombstones (
+    id TEXT PRIMARY KEY,
+    owner_user_id TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+    client_local_id TEXT NOT NULL,
+    deleted_by_user_id TEXT,
+    reason TEXT NOT NULL DEFAULT '',
+    created_at INTEGER NOT NULL,
+    UNIQUE(owner_user_id, client_local_id)
+);
+
+CREATE INDEX IF NOT EXISTS lost_found_tombstone_owner
+ON lost_found_deletion_tombstones(owner_user_id, created_at DESC);
+
 CREATE TABLE IF NOT EXISTS lost_found_favorites (
     user_id TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
     post_id TEXT NOT NULL REFERENCES lost_found_posts(id) ON DELETE CASCADE,
