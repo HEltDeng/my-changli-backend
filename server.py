@@ -648,7 +648,10 @@ def require_admin_path_access(user: sqlite3.Row, method: str, path: str) -> None
     elif role == "LIBRARY_OPERATOR":
         allowed = any(token in path for token in ("/resources", "/resource-complaints", "/resource-activity", "/overview/library"))
     elif role == "CONTENT_OPERATOR":
-        allowed = "/announcements" in path or "/overview/content" in path
+        allowed = any(
+            token in path
+            for token in ("/announcements", "/website-announcements", "/overview/content")
+        )
     if not allowed:
         raise ApiError(403, "ADMIN_MODULE_FORBIDDEN", "当前管理员无权访问该业务模块")
 
@@ -1694,6 +1697,8 @@ class ApiHandler(BaseHTTPRequestHandler):
             return self.library_complaint(match.group(1)), 201
         if method == "GET" and path == "/api/v1/public/bootstrap":
             return self.public_bootstrap(), 200
+        if method == "GET" and path == "/api/v1/public/website-announcements":
+            return self.public_website_announcements(), 200
         if method == "GET" and path == "/api/v1/public/version/android":
             return self.public_version_check(query), 200
         if method == "GET" and path == "/api/v1/public/service-updates":
@@ -2858,6 +2863,23 @@ class ApiHandler(BaseHTTPRequestHandler):
                 # remote feature gates stuck on stale cache.
                 version["force_update"] = bool(version["force_update"])
             return {"flags": flags, "announcements": announcements, "version": version}
+
+    def public_website_announcements(self) -> dict[str, Any]:
+        """Return enabled website announcements, never App announcements."""
+        with connection() as db:
+            announcements = [
+                row_dict(row)
+                for row in db.execute(
+                    """SELECT id,title,content,
+                              published_at AS publishedAt,
+                              updated_at AS updatedAt
+                         FROM website_announcements
+                        WHERE enabled=1
+                        ORDER BY published_at DESC, updated_at DESC
+                        LIMIT 10"""
+                )
+            ]
+            return {"websiteAnnouncements": announcements}
 
     def public_version_check(self, query: dict[str, str]) -> dict[str, Any]:
         current_text = str(query.get("currentVersionCode", "0"))
@@ -4778,6 +4800,98 @@ class ApiHandler(BaseHTTPRequestHandler):
                         "SELECT * FROM announcements ORDER BY published_at DESC"
                     )
                 ], 200
+
+            if method == "GET" and path == "/api/v1/admin/website-announcements":
+                return [
+                    {
+                        **row_dict(row),
+                        "enabled": bool(row["enabled"]),
+                    }
+                    for row in db.execute(
+                        "SELECT * FROM website_announcements ORDER BY published_at DESC, updated_at DESC"
+                    )
+                ], 200
+
+            if method == "POST" and path == "/api/v1/admin/website-announcements":
+                data = self.body_json()
+                announcement_id = str(uuid.uuid4())
+                timestamp = now_ms()
+                enabled = 1 if bool(data.get("enabled", True)) else 0
+                db.execute(
+                    """INSERT INTO website_announcements(
+                           id,title,content,enabled,published_at,updated_at
+                       ) VALUES(?,?,?,?,?,?)""",
+                    (
+                        announcement_id,
+                        required_text(data, "title", 100),
+                        required_text(data, "content", 4000),
+                        enabled,
+                        timestamp,
+                        timestamp,
+                    ),
+                )
+                write_audit(
+                    db,
+                    admin["id"],
+                    "WEBSITE_ANNOUNCEMENT_CREATED",
+                    "WEBSITE_ANNOUNCEMENT",
+                    announcement_id,
+                    {"enabled": bool(enabled)},
+                )
+                return {"id": announcement_id, "enabled": bool(enabled)}, 201
+
+            website_match = re.fullmatch(
+                r"/api/v1/admin/website-announcements/([^/]+)", path
+            )
+            if method == "PATCH" and website_match:
+                data = self.body_json()
+                current = db.execute(
+                    "SELECT * FROM website_announcements WHERE id=?",
+                    (website_match.group(1),),
+                ).fetchone()
+                if not current:
+                    raise ApiError(404, "WEBSITE_ANNOUNCEMENT_NOT_FOUND", "网站公告不存在")
+                title = str(data.get("title", current["title"])).strip()[:100]
+                content_value = str(data.get("content", current["content"])).strip()[:4000]
+                enabled = 1 if bool(data.get("enabled", bool(current["enabled"]))) else 0
+                if not title or not content_value:
+                    raise ApiError(400, "VALIDATION_ERROR", "网站公告标题和内容不能为空")
+                updated_at = now_ms()
+                db.execute(
+                    """UPDATE website_announcements
+                          SET title=?,content=?,enabled=?,updated_at=?
+                        WHERE id=?""",
+                    (title, content_value, enabled, updated_at, current["id"]),
+                )
+                write_audit(
+                    db,
+                    admin["id"],
+                    "WEBSITE_ANNOUNCEMENT_UPDATED",
+                    "WEBSITE_ANNOUNCEMENT",
+                    current["id"],
+                    {"enabled": bool(enabled)},
+                )
+                return {
+                    "id": current["id"],
+                    "enabled": bool(enabled),
+                    "updatedAt": updated_at,
+                }, 200
+
+            if method == "DELETE" and website_match:
+                changed = db.execute(
+                    "DELETE FROM website_announcements WHERE id=?",
+                    (website_match.group(1),),
+                ).rowcount
+                if not changed:
+                    raise ApiError(404, "WEBSITE_ANNOUNCEMENT_NOT_FOUND", "网站公告不存在")
+                write_audit(
+                    db,
+                    admin["id"],
+                    "WEBSITE_ANNOUNCEMENT_DELETED",
+                    "WEBSITE_ANNOUNCEMENT",
+                    website_match.group(1),
+                )
+                return {"id": website_match.group(1), "deleted": True}, 200
 
             if method == "POST" and path == "/api/v1/admin/announcements":
                 data = self.body_json()

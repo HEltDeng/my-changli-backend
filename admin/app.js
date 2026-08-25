@@ -20,7 +20,8 @@ const titles = {
   resources: "资料管理",
   resourceComplaints: "资料投诉 / 举报处理",
   resourceActivity: "资料库用户记录",
-  announcements: "公告",
+  announcements: "APP 公告",
+  websiteAnnouncements: "网站公告",
   config: "版本与功能开关",
   feedback: "用户反馈",
   riskCandidates: "异常候选",
@@ -628,6 +629,25 @@ const renderers = {
       </div>`;
   },
 
+  async websiteAnnouncements() {
+    const rows = await api("/api/v1/admin/website-announcements");
+    content.innerHTML = `
+      <article class="card">
+        <h3>发布网站公告</h3>
+        <p class="muted">网站公告只显示在 mychangliapp.cn 官网，不会进入 App 公告或 App 服务动态。</p>
+        <form id="website-announcement-form" class="stack">
+          <label>标题<input name="title" maxlength="100" required></label>
+          <label>内容<textarea name="content" maxlength="4000" required></textarea></label>
+          <label class="checkbox-row"><input type="checkbox" name="enabled" checked> 发布后立即在官网显示</label>
+          <div><button class="primary">发布网站公告</button></div>
+        </form>
+      </article>
+      <h3 class="section-title">网站公告记录</h3>
+      <div class="grid">
+        ${rows.length ? rows.map((row) => `<article class="card"><div class="card-header"><div><h3>${escapeHtml(row.title)}</h3><span class="subtle">${formatTime(row.published_at || row.publishedAt)}</span></div><div>${row.enabled ? badge("OPEN") : badge("CLOSED")}</div></div><p>${escapeHtml(row.content).replaceAll("\n", "<br>")}</p><div class="actions"><button class="ghost" data-action="edit-website-announcement" data-id="${escapeHtml(row.id)}" data-title="${escapeHtml(row.title)}" data-content="${escapeHtml(row.content)}" data-enabled="${row.enabled}">编辑</button><button class="${row.enabled ? "danger" : "primary"}" data-action="toggle-website-announcement" data-id="${escapeHtml(row.id)}" data-enabled="${row.enabled}">${row.enabled ? "撤回" : "重新发布"}</button><button class="danger" data-action="delete-website-announcement" data-id="${escapeHtml(row.id)}">删除</button></div></article>`).join("") : '<div class="empty">还没有网站公告</div>'}
+      </div>`;
+  },
+
   async config() {
     const data = await api("/api/v1/admin/config");
     const version = data.version || {};
@@ -917,6 +937,14 @@ content.addEventListener("submit", async (event) => {
       });
       toast("公告已发布");
       return renderers.announcements();
+    }
+    if (form.id === "website-announcement-form") {
+      await api("/api/v1/admin/website-announcements", {
+        method: "POST",
+        body: { ...values, enabled: form.enabled.checked },
+      });
+      toast("网站公告已发布");
+      return renderers.websiteAnnouncements();
     }
     if (form.id === "version-form") {
       await api("/api/v1/admin/version/android", {
@@ -1367,6 +1395,35 @@ content.addEventListener("click", async (event) => {
           });
           toast("公告已更新");
           renderers.announcements();
+        });
+    }
+    if (action === "toggle-website-announcement") {
+      const next = button.dataset.enabled !== "true";
+      if (!next && !confirm("确认撤回这条网站公告？官网将不再显示它。")) return;
+      await api(`/api/v1/admin/website-announcements/${encodeURIComponent(button.dataset.id)}`, {
+        method: "PATCH",
+        body: { enabled: next },
+      });
+      toast(next ? "网站公告已重新发布" : "网站公告已撤回");
+      return renderers.websiteAnnouncements();
+    }
+    if (action === "delete-website-announcement") {
+      if (!confirm("确认永久删除这条网站公告？删除后官网将不再显示，且无法从页面恢复。")) return;
+      await api(`/api/v1/admin/website-announcements/${encodeURIComponent(button.dataset.id)}`, {
+        method: "DELETE",
+      });
+      toast("网站公告已删除");
+      return renderers.websiteAnnouncements();
+    }
+    if (action === "edit-website-announcement") {
+      return openDialog("编辑网站公告", `<div class="stack"><label>标题<input name="title" value="${escapeHtml(button.dataset.title)}" required></label><label>内容<textarea name="content" required>${escapeHtml(button.dataset.content)}</textarea></label><label class="checkbox-row"><input type="checkbox" name="enabled" ${button.dataset.enabled === "true" ? "checked" : ""}> 在官网显示</label></div>`,
+        async (form) => {
+          await api(`/api/v1/admin/website-announcements/${encodeURIComponent(button.dataset.id)}`, {
+            method: "PATCH",
+            body: { title: form.get("title"), content: form.get("content"), enabled: form.enabled.checked },
+          });
+          toast("网站公告已更新");
+          renderers.websiteAnnouncements();
         });
     }
   } catch (error) {

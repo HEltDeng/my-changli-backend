@@ -180,6 +180,21 @@ CREATE TABLE IF NOT EXISTS announcements (
     updated_at INTEGER NOT NULL
 );
 
+-- Website announcements are intentionally isolated from App announcements.
+-- `enabled` controls publication on the static website only; App's
+-- `service_visible` flag remains scoped to the App service-updates feed.
+CREATE TABLE IF NOT EXISTS website_announcements (
+    id TEXT PRIMARY KEY,
+    title TEXT NOT NULL,
+    content TEXT NOT NULL,
+    enabled INTEGER NOT NULL DEFAULT 1,
+    published_at INTEGER NOT NULL,
+    updated_at INTEGER NOT NULL
+);
+
+CREATE INDEX IF NOT EXISTS website_announcements_listing
+ON website_announcements(enabled, published_at DESC, updated_at DESC);
+
 CREATE TABLE IF NOT EXISTS app_versions (
     platform TEXT PRIMARY KEY,
     latest_version_code INTEGER NOT NULL,

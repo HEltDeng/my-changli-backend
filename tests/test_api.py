@@ -524,6 +524,15 @@ class ApiTest(unittest.TestCase):
             operator_token = login["data"]["token"]
             self.assertEqual(role, login["data"]["user"]["adminRole"])
             self.assertEqual(200, self.call("GET", allowed, token=operator_token)[0])
+            if role == "CONTENT_OPERATOR":
+                self.assertEqual(
+                    200,
+                    self.call(
+                        "GET",
+                        "/api/v1/admin/website-announcements",
+                        token=operator_token,
+                    )[0],
+                )
             self.assertEqual(403, self.call("GET", forbidden, token=operator_token)[0])
             self.assertEqual(403, self.call("GET", "/api/v1/admin/admins", token=operator_token)[0])
             self.assertEqual(200, self.call(
@@ -830,6 +839,79 @@ class ApiTest(unittest.TestCase):
         self.assertTrue(any(flag["key"] == "sports_reservation" for flag in body["data"]["flags"]))
         if body["data"].get("version"):
             self.assertIsInstance(body["data"]["version"]["force_update"], bool)
+
+    def test_website_announcements_are_independent_from_app_announcements(self):
+        admin = self.admin_token()
+        app_status, app_response = self.call(
+            "POST",
+            "/api/v1/admin/announcements",
+            {"title": "仅 App 公告", "content": "App 内容", "enabled": True},
+            admin,
+        )
+        self.assertEqual(201, app_status)
+        app_id = app_response["data"]["id"]
+
+        website_status, website_response = self.call(
+            "POST",
+            "/api/v1/admin/website-announcements",
+            {"title": "仅网站公告", "content": "官网内容", "enabled": True},
+            admin,
+        )
+        self.assertEqual(201, website_status)
+        website_id = website_response["data"]["id"]
+
+        status, listing = self.call(
+            "GET", "/api/v1/admin/website-announcements", token=admin
+        )
+        self.assertEqual(200, status)
+        listed = next(row for row in listing["data"] if row["id"] == website_id)
+        self.assertTrue(listed["enabled"])
+
+        status, public = self.call("GET", "/api/v1/public/website-announcements")
+        self.assertEqual(200, status)
+        public_rows = public["data"]["websiteAnnouncements"]
+        public_row = next(row for row in public_rows if row["id"] == website_id)
+        self.assertEqual(
+            {"id", "title", "content", "publishedAt", "updatedAt"},
+            set(public_row),
+        )
+        self.assertNotIn(app_id, {row["id"] for row in public_rows})
+
+        status, bootstrap = self.call("GET", "/api/v1/public/bootstrap")
+        self.assertEqual(200, status)
+        bootstrap_ids = {row["id"] for row in bootstrap["data"]["announcements"]}
+        self.assertIn(app_id, bootstrap_ids)
+        self.assertNotIn(website_id, bootstrap_ids)
+
+        status, updates = self.call("GET", "/api/v1/public/service-updates")
+        self.assertEqual(200, status)
+        self.assertFalse(any(item["targetId"] == website_id for item in updates["data"]))
+
+        self.assertEqual(
+            200,
+            self.call(
+                "PATCH",
+                f"/api/v1/admin/website-announcements/{website_id}",
+                {"title": "网站公告已更新", "content": "更新后的官网内容", "enabled": False},
+                admin,
+            )[0],
+        )
+        status, public_after_disable = self.call(
+            "GET", "/api/v1/public/website-announcements"
+        )
+        self.assertEqual(200, status)
+        self.assertFalse(
+            any(row["id"] == website_id for row in public_after_disable["data"]["websiteAnnouncements"])
+        )
+
+        self.assertEqual(
+            200,
+            self.call(
+                "DELETE",
+                f"/api/v1/admin/website-announcements/{website_id}",
+                token=admin,
+            )[0],
+        )
 
     def test_service_updates_aggregation_and_visibility(self):
         admin = self.admin_token()
@@ -1645,6 +1727,8 @@ class ApiTest(unittest.TestCase):
             self.assertIn("默认隐藏已注销用户", javascript)
             self.assertIn("恢复账号", javascript)
             self.assertIn("已注销，可重新注册", javascript)
+            self.assertIn("网站公告", javascript)
+            self.assertIn("website-announcements", javascript)
             self.assertNotIn("本地运行说明", javascript)
 
     def test_platform_metrics_user_events_status_and_risk_are_separated(self):

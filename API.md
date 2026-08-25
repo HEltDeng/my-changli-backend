@@ -73,6 +73,7 @@
 ## 公共基础能力
 
 - `GET /api/v1/public/bootstrap`：公告、版本、远程开关。
+- `GET /api/v1/public/website-announcements`：官网独立公告。`data.websiteAnnouncements` 只返回网站公告的 `id`、`title`、`content`、`publishedAt`、`updatedAt`，不会读取或返回 App 公告。
 - `GET /api/v1/public/version/android?currentVersionCode=...`：只返回已发布的 Android 版本检查结果。
 - `GET /api/v1/public/service-updates`：服务页“服务动态”聚合接口。只返回用户端必要信息，按优先级稳定排序：
   - `UPDATE`：已发布且高于当前客户端的 Android 版本（版本号、版本名、更新说明、是否强制/最低版本）；
@@ -110,6 +111,10 @@
 - `POST /api/v1/admin/announcements`
 - `PATCH /api/v1/admin/announcements/{id}`
 - `DELETE /api/v1/admin/announcements/{id}`
+- `GET /api/v1/admin/website-announcements`
+- `POST /api/v1/admin/website-announcements`
+- `PATCH /api/v1/admin/website-announcements/{id}`
+- `DELETE /api/v1/admin/website-announcements/{id}`
 - `PUT /api/v1/admin/version/android`
 - `PUT /api/v1/admin/flags/{key}`
 - `GET /api/v1/admin/feedback`
