@@ -88,6 +88,7 @@ ROLE_PERMISSIONS = {
     "CONTENT_OPERATOR": {"CONTENT_VIEW", "CONTENT_MANAGE"},
 }
 CONTROLLED_FEATURES = {"sports_reservation", "lost_found", "resource_library"}
+DEFAULT_DEVICE_NICKNAME = "长理同学"
 
 
 def ensure_column(
@@ -181,6 +182,14 @@ def initialize_database() -> None:
                WHEN role='ADMIN' THEN 'ADMIN'
                WHEN username LIKE 'device_%' THEN 'DEVICE'
                ELSE account_type END"""
+        )
+        # Legacy device accounts are real anonymous App users, not test fixtures.
+        # Keep this migration deliberately narrow so user-selected nicknames are
+        # never changed.
+        db.execute(
+            """UPDATE users SET nickname=?
+               WHERE role='USER' AND account_type='DEVICE' AND nickname='测试设备'""",
+            (DEFAULT_DEVICE_NICKNAME,),
         )
         if not RUNTIME.is_production:
             # Explicit development-only compatibility for local databases created
@@ -1727,8 +1736,8 @@ class ApiHandler(BaseHTTPRequestHandler):
                     """INSERT INTO users(
                            id,username,password_hash,password_salt,role,account_type,
                            nickname,account_status,created_at
-                       ) VALUES(?,?,?,?,'USER','DEVICE','测试设备','ACTIVE',?)""",
-                    (user_id, username, digest, salt, now_ms()),
+                       ) VALUES(?,?,?,?,'USER','DEVICE',?,'ACTIVE',?)""",
+                    (user_id, username, digest, salt, DEFAULT_DEVICE_NICKNAME, now_ms()),
                 )
                 user = db.execute("SELECT * FROM users WHERE id=?", (user_id,)).fetchone()
             return {"token": issue_token(db, user["id"]), "user": serialize_user(user)}

@@ -66,7 +66,7 @@ function datetimeLocal(value) {
 }
 
 function userLabel(row) {
-  return row.reservation_name || row.nickname || row.phone_masked || "测试用户";
+  return row.reservation_name || row.nickname || row.phone_masked || "长理同学";
 }
 
 function statusText(value) {
@@ -92,7 +92,7 @@ function statusText(value) {
     RESOLVED: "已解决",
     SUSPENDED: "已停用",
     PHONE: "手机号账号",
-    DEVICE: "测试设备",
+    DEVICE: "未登录用户",
     DRAFT: "草稿",
     PUBLISHED: "已发布",
     DISABLED: "已停用",
@@ -704,7 +704,7 @@ const renderers = {
         <button class="primary">筛选</button>
       </form>
       ${rows.length ? `<div class="table-wrap"><table class="feedback-table"><thead><tr><th>编号</th><th>类型</th><th>状态</th><th>用户</th><th>内容摘要</th><th>提交时间</th><th>最后更新</th><th>操作</th></tr></thead><tbody>
-        ${rows.map((row) => `<tr><td class="mono-cell">${escapeHtml(row.id.slice(0, 8))}</td><td>${escapeHtml(feedbackCategoryText(row.category))}</td><td>${feedbackBadge(row.workflow_status)}</td><td><strong>${escapeHtml(row.nickname || "长理同学")}</strong><br><span class="subtle">${escapeHtml(row.phone_masked || "测试设备")}</span></td><td class="feedback-summary"><strong>${escapeHtml(row.title || "未命名反馈")}</strong><span>${escapeHtml(row.content)}</span></td><td>${formatTime(row.created_at)}</td><td>${formatTime(row.updated_at)}</td><td><button class="ghost" data-action="feedback-details" data-id="${escapeHtml(row.id)}">查看详情</button></td></tr>`).join("")}
+        ${rows.map((row) => `<tr><td class="mono-cell">${escapeHtml(row.id.slice(0, 8))}</td><td>${escapeHtml(feedbackCategoryText(row.category))}</td><td>${feedbackBadge(row.workflow_status)}</td><td><strong>${escapeHtml(row.nickname || "长理同学")}</strong><br><span class="subtle">${escapeHtml(row.phone_masked || "未绑定手机号")}</span></td><td class="feedback-summary"><strong>${escapeHtml(row.title || "未命名反馈")}</strong><span>${escapeHtml(row.content)}</span></td><td>${formatTime(row.created_at)}</td><td>${formatTime(row.updated_at)}</td><td><button class="ghost" data-action="feedback-details" data-id="${escapeHtml(row.id)}">查看详情</button></td></tr>`).join("")}
       </tbody></table></div>` : '<div class="empty">暂无用户反馈</div>'}`;
   },
 
@@ -1085,7 +1085,7 @@ content.addEventListener("click", async (event) => {
           <div class="card-header"><div>${feedbackBadge(item.workflow_status)} <span class="badge">${escapeHtml(feedbackCategoryText(item.category))}</span></div><span class="subtle">#${escapeHtml(item.id)}</span></div>
           <div><strong>${escapeHtml(item.title || "未命名反馈")}</strong><p class="long-text">${escapeHtml(item.content)}</p></div>
           <div class="grid two-columns">
-            <p class="subtle">用户：${escapeHtml(item.nickname || "长理同学")} · ${escapeHtml(item.phone_masked || "测试设备")}</p>
+            <p class="subtle">用户：${escapeHtml(item.nickname || "长理同学")} · ${escapeHtml(item.phone_masked || "未绑定手机号")}</p>
             <p class="subtle">提交：${formatTime(item.created_at)}<br>更新：${formatTime(item.updated_at)}</p>
           </div>
           <p class="subtle">当前版本暂未支持反馈附件。</p>

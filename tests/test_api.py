@@ -66,6 +66,32 @@ class ApiTest(unittest.TestCase):
         self.assertEqual(200, status)
         return response["data"]["token"]
 
+    def test_device_accounts_are_real_anonymous_users_not_test_devices(self):
+        installation_id = "real-device-" + secrets.token_hex(8)
+        status, response = self.call(
+            "POST", "/api/v1/auth/device", {"installationId": installation_id}
+        )
+        self.assertEqual(200, status)
+        self.assertEqual("DEVICE", response["data"]["user"]["accountType"])
+        self.assertEqual("长理同学", response["data"]["user"]["nickname"])
+
+        legacy_id = "legacy-device-" + secrets.token_hex(8)
+        digest, salt = server.password_record(secrets.token_urlsafe(24))
+        with server.connection() as db:
+            db.execute(
+                """INSERT INTO users(
+                       id,username,password_hash,password_salt,role,account_type,
+                       nickname,account_status,created_at
+                   ) VALUES(?,?,?,?,'USER','DEVICE','测试设备','ACTIVE',?)""",
+                (legacy_id, "device_" + secrets.token_hex(16), digest, salt, server.now_ms()),
+            )
+        server.initialize_database()
+        with server.connection() as db:
+            migrated = db.execute(
+                "SELECT nickname FROM users WHERE id=?", (legacy_id,)
+            ).fetchone()
+        self.assertEqual("长理同学", migrated["nickname"])
+
     def phone_account(self, installation_id=None):
         phone = "19" + "".join(str(secrets.randbelow(10)) for _ in range(9))
         password = secrets.token_urlsafe(18)
@@ -1717,6 +1743,8 @@ class ApiTest(unittest.TestCase):
         with urllib.request.urlopen(self.base + "/admin/app.js", timeout=5) as response:
             javascript = response.read().decode("utf-8")
             self.assertIn("生产运行说明", javascript)
+            self.assertIn('DEVICE: "未登录用户"', javascript)
+            self.assertNotIn('DEVICE: "测试设备"', javascript)
             self.assertIn("lost-details", javascript)
             self.assertIn("bulk-delete-lost", javascript)
             self.assertIn("suspensionDuration", javascript)
