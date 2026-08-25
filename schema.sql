@@ -11,11 +11,27 @@ CREATE TABLE IF NOT EXISTS users (
     nickname TEXT NOT NULL DEFAULT '长理同学',
     phone_hash TEXT UNIQUE,
     phone_masked TEXT,
+    phone_encrypted TEXT,
     student_id TEXT,
     real_name TEXT,
     campus_verified INTEGER NOT NULL DEFAULT 0,
     campus_verified_at INTEGER,
+    reservation_student_id TEXT,
+    reservation_name TEXT,
+    reservation_profile_consented_at INTEGER,
+    reservation_student_id_hash TEXT,
+    reservation_name_hash TEXT,
+    reservation_profile_version INTEGER NOT NULL DEFAULT 0,
+    reservation_profile_updated_at INTEGER,
+    admin_permissions_json TEXT NOT NULL DEFAULT '[]',
+    admin_role TEXT,
+    admin_enabled INTEGER NOT NULL DEFAULT 1,
     account_status TEXT NOT NULL DEFAULT 'ACTIVE',
+    account_status_reason TEXT NOT NULL DEFAULT '',
+    account_status_changed_at INTEGER,
+    account_status_expires_at INTEGER,
+    last_active_at INTEGER,
+    first_login_at INTEGER,
     created_at INTEGER NOT NULL
 );
 
@@ -73,6 +89,8 @@ CREATE TABLE IF NOT EXISTS reservations (
     refund_status TEXT NOT NULL DEFAULT 'NOT_APPLICABLE',
     reservation_code TEXT,
     verification_status TEXT NOT NULL DEFAULT 'NOT_REQUIRED',
+    reservation_student_id_snapshot TEXT,
+    reservation_name_snapshot TEXT,
     cancelled_at INTEGER,
     cancelled_by TEXT,
     cancel_reason TEXT,
@@ -86,6 +104,12 @@ WHERE status = 'ACTIVE';
 
 CREATE INDEX IF NOT EXISTS reservations_user_created
 ON reservations(user_id, created_at DESC);
+CREATE INDEX IF NOT EXISTS reservations_admin_filter
+ON reservations(booking_date, venue_id, status, verification_status, created_at DESC);
+CREATE INDEX IF NOT EXISTS users_reservation_student_id_hash
+ON users(reservation_student_id_hash) WHERE reservation_student_id_hash IS NOT NULL;
+CREATE INDEX IF NOT EXISTS users_reservation_name_hash
+ON users(reservation_name_hash) WHERE reservation_name_hash IS NOT NULL;
 
 CREATE TABLE IF NOT EXISTS lost_found_posts (
     id TEXT PRIMARY KEY,
@@ -138,9 +162,25 @@ CREATE TABLE IF NOT EXISTS announcements (
     title TEXT NOT NULL,
     content TEXT NOT NULL,
     enabled INTEGER NOT NULL DEFAULT 1,
+    service_visible INTEGER NOT NULL DEFAULT 1,
     published_at INTEGER NOT NULL,
     updated_at INTEGER NOT NULL
 );
+
+-- Website announcements are intentionally isolated from App announcements.
+-- `enabled` controls publication on the static website only; App's
+-- `service_visible` flag remains scoped to the App service-updates feed.
+CREATE TABLE IF NOT EXISTS website_announcements (
+    id TEXT PRIMARY KEY,
+    title TEXT NOT NULL,
+    content TEXT NOT NULL,
+    enabled INTEGER NOT NULL DEFAULT 1,
+    published_at INTEGER NOT NULL,
+    updated_at INTEGER NOT NULL
+);
+
+CREATE INDEX IF NOT EXISTS website_announcements_listing
+ON website_announcements(enabled, published_at DESC, updated_at DESC);
 
 CREATE TABLE IF NOT EXISTS app_versions (
     platform TEXT PRIMARY KEY,
@@ -149,6 +189,15 @@ CREATE TABLE IF NOT EXISTS app_versions (
     latest_version_name TEXT NOT NULL,
     update_message TEXT NOT NULL DEFAULT '',
     download_url TEXT,
+    apk_sha256 TEXT,
+    apk_size INTEGER,
+    force_update INTEGER NOT NULL DEFAULT 0,
+    status TEXT NOT NULL DEFAULT 'DRAFT'
+        CHECK (status IN ('DRAFT', 'PUBLISHED', 'DISABLED')),
+    published_at INTEGER,
+    created_at INTEGER,
+    created_by TEXT REFERENCES users(id) ON DELETE SET NULL,
+    updated_by TEXT REFERENCES users(id) ON DELETE SET NULL,
     updated_at INTEGER NOT NULL
 );
 
@@ -156,20 +205,49 @@ CREATE TABLE IF NOT EXISTS remote_flags (
     key TEXT PRIMARY KEY,
     enabled INTEGER NOT NULL,
     payload_json TEXT NOT NULL DEFAULT '{}',
+    updated_by TEXT REFERENCES users(id) ON DELETE SET NULL,
+    change_note TEXT NOT NULL DEFAULT '',
     updated_at INTEGER NOT NULL
 );
+
+CREATE INDEX IF NOT EXISTS remote_flags_updated
+ON remote_flags(updated_at DESC);
 
 CREATE TABLE IF NOT EXISTS feedback (
     id TEXT PRIMARY KEY,
     user_id TEXT REFERENCES users(id),
     category TEXT NOT NULL,
+    title TEXT NOT NULL DEFAULT '',
     content TEXT NOT NULL,
     app_version TEXT,
     status TEXT NOT NULL DEFAULT 'OPEN' CHECK (status IN ('OPEN', 'PROCESSING', 'CLOSED')),
     workflow_status TEXT NOT NULL DEFAULT 'OPEN',
+    public_reply TEXT NOT NULL DEFAULT '',
+    internal_note TEXT NOT NULL DEFAULT '',
+    handled_by TEXT REFERENCES users(id) ON DELETE SET NULL,
+    resolved_at INTEGER,
     created_at INTEGER NOT NULL,
     updated_at INTEGER NOT NULL
 );
+
+CREATE INDEX IF NOT EXISTS feedback_user_created
+ON feedback(user_id, created_at DESC);
+
+CREATE TABLE IF NOT EXISTS feedback_events (
+    id TEXT PRIMARY KEY,
+    feedback_id TEXT NOT NULL REFERENCES feedback(id) ON DELETE CASCADE,
+    actor_user_id TEXT REFERENCES users(id) ON DELETE SET NULL,
+    actor_role TEXT NOT NULL,
+    action TEXT NOT NULL,
+    old_status TEXT,
+    new_status TEXT,
+    public_visible INTEGER NOT NULL DEFAULT 0,
+    public_message TEXT NOT NULL DEFAULT '',
+    created_at INTEGER NOT NULL
+);
+
+CREATE INDEX IF NOT EXISTS feedback_events_feedback
+ON feedback_events(feedback_id, created_at ASC);
 
 CREATE TABLE IF NOT EXISTS reservation_rules (
     id TEXT PRIMARY KEY CHECK (id = 'default'),
@@ -177,6 +255,9 @@ CREATE TABLE IF NOT EXISTS reservation_rules (
     max_user_cancellations_per_day INTEGER NOT NULL DEFAULT 2,
     cancel_cutoff_minutes INTEGER NOT NULL DEFAULT 30,
     restriction_hours_after_excess_cancel INTEGER NOT NULL DEFAULT 24,
+    require_reservation_student_id INTEGER NOT NULL DEFAULT 0,
+    reservation_profile_mode TEXT NOT NULL DEFAULT 'OPTIONAL'
+        CHECK (reservation_profile_mode IN ('OFF', 'OPTIONAL', 'REQUIRED')),
     updated_at INTEGER NOT NULL
 );
 
@@ -214,3 +295,111 @@ CREATE TABLE IF NOT EXISTS admin_audit_logs (
 
 CREATE INDEX IF NOT EXISTS admin_audit_created
 ON admin_audit_logs(created_at DESC);
+
+CREATE TABLE IF NOT EXISTS user_behavior_events (
+    id TEXT PRIMARY KEY,
+    user_id TEXT REFERENCES users(id) ON DELETE SET NULL,
+    module TEXT NOT NULL,
+    event_type TEXT NOT NULL,
+    result TEXT NOT NULL CHECK (result IN ('SUCCESS', 'FAILURE', 'DENIED')),
+    target_type TEXT,
+    target_id TEXT,
+    client_source TEXT NOT NULL DEFAULT 'APP',
+    client_version TEXT,
+    risk_flag TEXT,
+    created_at INTEGER NOT NULL
+);
+
+CREATE INDEX IF NOT EXISTS user_behavior_events_created
+ON user_behavior_events(created_at DESC);
+CREATE INDEX IF NOT EXISTS user_behavior_events_user_created
+ON user_behavior_events(user_id, created_at DESC);
+CREATE INDEX IF NOT EXISTS user_behavior_events_filter
+ON user_behavior_events(module, event_type, result, created_at DESC);
+
+CREATE TABLE IF NOT EXISTS risk_candidates (
+    id TEXT PRIMARY KEY,
+    user_id TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+    rule_key TEXT NOT NULL,
+    rule_label TEXT NOT NULL,
+    trigger_count INTEGER NOT NULL DEFAULT 1,
+    window_started_at INTEGER NOT NULL,
+    window_ended_at INTEGER NOT NULL,
+    status TEXT NOT NULL DEFAULT 'OPEN'
+        CHECK (status IN ('OPEN', 'WATCHING', 'IGNORED', 'CLOSED')),
+    admin_note TEXT NOT NULL DEFAULT '',
+    created_at INTEGER NOT NULL,
+    updated_at INTEGER NOT NULL,
+    UNIQUE(user_id, rule_key, window_started_at)
+);
+
+CREATE INDEX IF NOT EXISTS risk_candidates_status_updated
+ON risk_candidates(status, updated_at DESC);
+
+CREATE TABLE IF NOT EXISTS resource_items (
+    id TEXT PRIMARY KEY,
+    title TEXT NOT NULL,
+    summary TEXT NOT NULL DEFAULT '',
+    category TEXT NOT NULL,
+    tags_json TEXT NOT NULL DEFAULT '[]',
+    audience_scope TEXT NOT NULL DEFAULT '',
+    publisher_label TEXT NOT NULL DEFAULT '我的长理资料库',
+    source_label TEXT NOT NULL DEFAULT '',
+    usage_note TEXT NOT NULL DEFAULT '',
+    resource_type TEXT NOT NULL DEFAULT 'EXTERNAL_LINK',
+    external_url TEXT NOT NULL,
+    cover_url TEXT,
+    publish_status TEXT NOT NULL DEFAULT 'DRAFT'
+        CHECK (publish_status IN ('DRAFT', 'PUBLISHED', 'UNLISTED')),
+    visibility TEXT NOT NULL DEFAULT 'MEMBERS'
+        CHECK (visibility IN ('MEMBERS', 'PUBLIC')),
+    is_free INTEGER NOT NULL DEFAULT 1,
+    future_price_fen INTEGER,
+    sort_order INTEGER NOT NULL DEFAULT 0,
+    published_at INTEGER,
+    created_at INTEGER NOT NULL,
+    updated_at INTEGER NOT NULL
+);
+
+CREATE INDEX IF NOT EXISTS resource_items_listing
+ON resource_items(publish_status, sort_order DESC, published_at DESC);
+
+CREATE TABLE IF NOT EXISTS resource_favorites (
+    user_id TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+    resource_id TEXT NOT NULL REFERENCES resource_items(id) ON DELETE CASCADE,
+    created_at INTEGER NOT NULL,
+    PRIMARY KEY(user_id, resource_id)
+);
+
+CREATE TABLE IF NOT EXISTS resource_views (
+    user_id TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+    resource_id TEXT NOT NULL REFERENCES resource_items(id) ON DELETE CASCADE,
+    view_count INTEGER NOT NULL DEFAULT 1,
+    last_viewed_at INTEGER NOT NULL,
+    PRIMARY KEY(user_id, resource_id)
+);
+
+CREATE TABLE IF NOT EXISTS resource_complaints (
+    id TEXT PRIMARY KEY,
+    user_id TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+    resource_id TEXT NOT NULL REFERENCES resource_items(id) ON DELETE CASCADE,
+    reason TEXT NOT NULL,
+    detail TEXT NOT NULL DEFAULT '',
+    status TEXT NOT NULL DEFAULT 'OPEN'
+        CHECK (status IN ('OPEN', 'PROCESSING', 'RESOLVED', 'CLOSED')),
+    resolution_note TEXT NOT NULL DEFAULT '',
+    created_at INTEGER NOT NULL,
+    updated_at INTEGER NOT NULL
+);
+
+CREATE INDEX IF NOT EXISTS resource_complaints_status
+ON resource_complaints(status, created_at DESC);
+
+CREATE TABLE IF NOT EXISTS resource_unlocks (
+    user_id TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+    resource_id TEXT NOT NULL REFERENCES resource_items(id) ON DELETE CASCADE,
+    unlock_status TEXT NOT NULL DEFAULT 'NOT_REQUIRED',
+    price_fen INTEGER NOT NULL DEFAULT 0,
+    created_at INTEGER NOT NULL,
+    PRIMARY KEY(user_id, resource_id)
+);

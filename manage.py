@@ -33,8 +33,9 @@ def create_admin(username: str) -> None:
             raise ValueError("该用户名已经存在")
         db.execute(
             """INSERT INTO users(
-                   id,username,password_hash,password_salt,role,account_type,nickname,created_at
-               ) VALUES(?,?,?,?, 'ADMIN','ADMIN','本地管理员',?)""",
+                   id,username,password_hash,password_salt,role,account_type,nickname,
+                   admin_permissions_json,admin_role,admin_enabled,created_at
+               ) VALUES(?,?,?,?, 'ADMIN','ADMIN','本地管理员','["*"]','SUPER_ADMIN',1,?)""",
             (str(uuid.uuid4()), username, digest, salt, server.now_ms()),
         )
     print("管理员账号创建成功。")
