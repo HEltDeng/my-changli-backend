@@ -1995,5 +1995,69 @@ class ApiTest(unittest.TestCase):
         self.assertTrue(any(row["action"] == "USER_STATUS_UPDATED" for row in audits["data"]))
 
 
+class EmptyDailyLoginContractTest(unittest.TestCase):
+    """Keep the zero-user dashboard/detail contract explicit and isolated."""
+
+    @classmethod
+    def setUpClass(cls):
+        cls.temp = tempfile.TemporaryDirectory()
+        cls.database = Path(cls.temp.name) / "empty.db"
+        core.configure_test_runtime(cls.database)
+        server.DB_PATH = cls.database
+        server.UPLOADS = Path(cls.temp.name) / "uploads"
+        server.initialize_database()
+        cls.admin_id = "empty-admin"
+        digest, salt = server.password_record(secrets.token_urlsafe(24))
+        with server.connection() as db:
+            db.execute(
+                """INSERT INTO users(
+                       id,username,password_hash,password_salt,role,account_type,nickname,
+                       admin_permissions_json,admin_role,admin_enabled,account_status,created_at
+                   ) VALUES(?,?,?,?, 'ADMIN','ADMIN','空数据管理员','[\"*\"]','SUPER_ADMIN',1,'ACTIVE',?)""",
+                (cls.admin_id, "empty-admin", digest, salt, server.now_ms()),
+            )
+            cls.admin_token = server.issue_token(db, cls.admin_id)
+        cls.httpd = server.ThreadingHTTPServer(("127.0.0.1", 0), server.ApiHandler)
+        cls.base = f"http://127.0.0.1:{cls.httpd.server_port}"
+        cls.thread = threading.Thread(target=cls.httpd.serve_forever, daemon=True)
+        cls.thread.start()
+
+    @classmethod
+    def tearDownClass(cls):
+        cls.httpd.shutdown()
+        cls.httpd.server_close()
+        cls.thread.join(timeout=3)
+        with server.connection() as db:
+            db.execute("PRAGMA wal_checkpoint(TRUNCATE)")
+        cls.temp.cleanup()
+
+    def call(self, method, path, token=None):
+        parts = urllib.parse.urlsplit(path)
+        headers = {"Content-Type": "application/json"}
+        if token:
+            headers["Authorization"] = f"Bearer {token}"
+        target = urllib.parse.quote(parts.path)
+        if parts.query:
+            target += "?" + urllib.parse.quote(parts.query, safe="=&")
+        request = urllib.request.Request(self.base + target, headers=headers, method=method)
+        try:
+            with urllib.request.urlopen(request, timeout=5) as response:
+                return response.status, json.loads(response.read())
+        except urllib.error.HTTPError as error:
+            return error.code, json.loads(error.read())
+
+    def test_zero_users_produce_zero_dashboard_and_first_login_detail(self):
+        status, overview = self.call("GET", "/api/v1/admin/overview", self.admin_token)
+        self.assertEqual(200, status)
+        self.assertEqual(0, overview["data"]["todayFirstLogins"])
+
+        status, details = self.call(
+            "GET", "/api/v1/admin/user-events?firstLoginToday=true", self.admin_token
+        )
+        self.assertEqual(200, status)
+        self.assertEqual(0, details["data"]["total"])
+        self.assertEqual([], details["data"]["items"])
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)
