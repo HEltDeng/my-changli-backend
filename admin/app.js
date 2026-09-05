@@ -383,7 +383,7 @@ const renderers = {
       ["活跃情况", [
         ["最近 5 分钟活跃账号", data.active5m, "users", {activeWindow:"5m"}], ["今日活跃账号（DAU）", data.dau, "users", {activeWindow:"dau"}],
         ["近 7 日活跃账号（WAU）", data.wau, "users", {activeWindow:"wau"}], ["近 30 日活跃账号（MAU）", data.mau, "users", {activeWindow:"mau"}],
-        ["今日首次登录账号", data.todayFirstLogins, "userEvents", {eventType:"LOGIN_SUCCESS",today:"true"}],
+        ["今日首次登录账号", data.todayFirstLogins, "userEvents", {eventType:"LOGIN_SUCCESS",firstLoginToday:"true"}],
       ]],
       ["业务与处理", [
         ["体育预约 · 当前有效预约", data.activeReservations, "reservations", {status:"ACTIVE"}], ["体育预约 · 今日有效预约", data.todayReservations, "reservations", {date:new Date().toISOString().slice(0,10),status:"ACTIVE"}],
@@ -662,10 +662,11 @@ const renderers = {
             <label>更新说明<textarea name="updateMessage">${escapeHtml(version.update_message || "")}</textarea></label>
             <label>下载地址（可留空）<input name="downloadUrl" value="${escapeHtml(version.download_url || "")}"></label>
             <label>发布状态<select name="status">${options(["DRAFT","PUBLISHED","DISABLED"], version.status || "DRAFT")}</select></label>
-            <label class="checkbox-row"><input type="checkbox" name="forceUpdate" ${version.force_update ? "checked" : ""}> 标记为强制更新（本地仅演示逻辑，不锁死 App）</label>
+            <label class="checkbox-row"><input type="checkbox" name="forceUpdate" ${version.force_update ? "checked" : ""}> 强制更新</label>
+            <p class="subtle version-policy-note">开启后，低于该版本的客户端必须完成更新后才能继续使用。</p>
             <label>APK SHA-256（可留空）<input name="apkSha256" maxlength="64" value="${escapeHtml(version.apk_sha256 || "")}"></label>
             <label>APK 大小（字节，可留空）<input type="number" min="1" name="apkSize" value="${version.apk_size || ""}"></label>
-            <p class="muted">仅“已发布”版本会返回给 App。本地可使用 HTTPS 的 .invalid 占位地址；当前不会下载或安装 APK。</p>
+            <p class="muted">仅“已发布”版本会返回给 App。APK 地址、SHA-256 和大小会随更新合同一并下发，由客户端负责下载、校验与安装。</p>
             <button class="primary">保存版本配置</button>
           </form>
         </article>
@@ -738,7 +739,9 @@ const renderers = {
     if (normalized.last24h) { normalized.from = Date.now()-86400000; delete normalized.last24h; }
     const params = new URLSearchParams({...normalized, limit: "100"});
     const data = await api(`/api/v1/admin/user-events?${params}`);
-    const summary = Object.keys(filters).length ? `<div class="filter-summary"><span>当前筛选：${escapeHtml(Object.values(filters).join(" · "))}</span><button class="ghost" data-action="clear-page-filter">清除筛选</button></div>` : "";
+    const filterLabels = {...filters};
+    if (filterLabels.firstLoginToday) filterLabels.firstLoginToday = "今日首次登录账号";
+    const summary = Object.keys(filters).length ? `<div class="filter-summary"><span>当前筛选：${escapeHtml(Object.values(filterLabels).join(" · "))}</span><button class="ghost" data-action="clear-page-filter">清除筛选</button></div>` : "";
     content.innerHTML = `${summary}<article class="card"><p class="muted">仅记录我的长理账号使用后端服务所需的最小事件，默认保留 ${data.retentionDays} 天；不包含教务账号、课表、成绩、密码、Cookie、Session 或完整 Token。</p></article>
       <form id="user-event-filter" class="toolbar"><label>用户<input name="user" value="${escapeHtml(filters.user || "")}" placeholder="内部 ID、昵称或完整手机号"></label><label class="compact">模块<input name="module" value="${escapeHtml(filters.module || "")}" placeholder="如 ACCOUNT"></label><label class="compact">事件<input name="eventType" value="${escapeHtml(filters.eventType || "")}" placeholder="如 LOGIN_FAILURE"></label><label class="compact">结果<select name="result">${options(["SUCCESS","FAILURE","DENIED"], filters.result, true)}</select></label><button class="primary">筛选</button></form>
       <p class="muted">共 ${data.total} 条，本页最多显示 ${data.limit} 条。</p>
@@ -753,7 +756,7 @@ const renderers = {
 
   async adminAudit() {
     const rows = await api("/api/v1/admin/audit-logs?limit=200");
-    content.innerHTML = `<article class="card"><p class="muted">仅超级管理员可访问。记录最小必要的管理动作，不保存密码、完整 Token、教务凭据或敏感字段原文。</p></article>${rows.length ? `<div class="table-wrap"><table><thead><tr><th>时间</th><th>管理员</th><th>操作</th><th>对象</th><th>最小摘要</th></tr></thead><tbody>${rows.map((row) => `<tr><td>${formatTime(row.created_at)}</td><td>${escapeHtml(row.actor_name || row.actor_user_id || "系统")}</td><td>${escapeHtml(row.action)}</td><td>${escapeHtml(row.entity_type)} · ${escapeHtml(row.entity_id || "—")}</td><td class="feedback-summary"><span>${escapeHtml(row.details_json || "{}")}</span></td></tr>`).join("")}</tbody></table></div>` : '<div class="empty">暂无管理员操作记录</div>'}`;
+    content.innerHTML = `<article class="card"><p class="muted">仅超级管理员可访问。只显示真实管理员 Actor 执行的管理动作，不保存密码、完整 Token、教务凭据或敏感字段原文。</p></article>${rows.length ? `<div class="table-wrap"><table><thead><tr><th>时间</th><th>管理员</th><th>操作</th><th>对象</th><th>最小摘要</th></tr></thead><tbody>${rows.map((row) => `<tr><td>${formatTime(row.created_at)}</td><td>${escapeHtml(row.actor_name || "管理员")}</td><td>${escapeHtml(row.action)}</td><td>${escapeHtml(row.entity_type)} · ${escapeHtml(row.entity_id || "—")}</td><td class="feedback-summary"><span>${escapeHtml(row.details_json || "{}")}</span></td></tr>`).join("")}</tbody></table></div>` : '<div class="empty">暂无管理员操作记录</div>'}`;
   },
 };
 

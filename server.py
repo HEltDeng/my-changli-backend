@@ -35,6 +35,9 @@ from core import (
     DB_PATH,
     MAX_BODY,
     SESSION_SECONDS,
+    BUSINESS_TIMEZONE_NAME,
+    business_day_bounds_ms,
+    business_today,
     connection,
     json_response,
     now_ms,
@@ -947,6 +950,49 @@ def serialize_user(user: sqlite3.Row) -> dict[str, Any]:
     }
 
 
+def serialize_public_version(
+    row: sqlite3.Row,
+    *,
+    effective_force_update: bool | None = None,
+) -> dict[str, Any]:
+    """Keep the legacy snake_case DTO and add the direct-update contract fields."""
+    version = row_dict(row) or {}
+    configured_force_update = bool(version.get("force_update"))
+    version["force_update"] = configured_force_update
+    version.update(
+        {
+            "versionCode": version.get("latest_version_code"),
+            "versionName": version.get("latest_version_name"),
+            "minimumSupportedVersionCode": version.get("minimum_version_code"),
+            "releaseNotes": version.get("update_message") or "",
+            "downloadUrl": version.get("download_url"),
+            "apkUrl": version.get("download_url"),
+            "apkSha256": version.get("apk_sha256"),
+            "apkSize": version.get("apk_size"),
+            "publishedAt": version.get("published_at"),
+            "forceUpdate": (
+                configured_force_update
+                if effective_force_update is None
+                else bool(effective_force_update)
+            ),
+        }
+    )
+    return version
+
+
+def parse_boolean(value: Any, field: str, default: bool = False) -> bool:
+    """Parse JSON booleans without treating the string ``"false"`` as true."""
+    if value is None:
+        return default
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, int) and value in {0, 1}:
+        return bool(value)
+    if isinstance(value, str) and value.strip().lower() in {"true", "false"}:
+        return value.strip().lower() == "true"
+    raise ApiError(400, "VALIDATION_ERROR", f"{field} 必须为布尔值")
+
+
 def write_audit(
     db: sqlite3.Connection,
     actor_user_id: str | None,
@@ -1558,16 +1604,19 @@ class ApiHandler(BaseHTTPRequestHandler):
 
     def send_admin_asset(self, path: str) -> None:
         relative = "index.html" if path in {"/admin", "/admin/"} else path.removeprefix("/admin/")
-        if relative not in {"index.html", "app.js", "styles.css"}:
+        allowed_assets = {"index.html", "app.js", "styles.css", "assets/my-changli-app-icon.png"}
+        if relative not in allowed_assets:
             raise ApiError(404, "NOT_FOUND", "管理后台资源不存在")
         target = (ADMIN_WEB / relative).resolve()
-        if target.parent != ADMIN_WEB.resolve() or not target.is_file():
+        allowed_parents = {ADMIN_WEB.resolve(), (ADMIN_WEB / "assets").resolve()}
+        if target.parent not in allowed_parents or not target.is_file():
             raise ApiError(404, "NOT_FOUND", "管理后台资源不存在")
         content = target.read_bytes()
         content_type = {
             ".html": "text/html; charset=utf-8",
             ".js": "text/javascript; charset=utf-8",
             ".css": "text/css; charset=utf-8",
+            ".png": "image/png",
         }[target.suffix]
         self._response_status = 200
         self.send_response(200)
@@ -1740,6 +1789,14 @@ class ApiHandler(BaseHTTPRequestHandler):
                     (user_id, username, digest, salt, DEFAULT_DEVICE_NICKNAME, now_ms()),
                 )
                 user = db.execute("SELECT * FROM users WHERE id=?", (user_id,)).fetchone()
+            timestamp = now_ms()
+            db.execute(
+                """UPDATE users SET first_login_at=COALESCE(first_login_at,?),
+                   last_active_at=? WHERE id=?""",
+                (timestamp, timestamp, user["id"]),
+            )
+            write_user_event(db, user["id"], "ACCOUNT", "LOGIN_SUCCESS")
+            user = db.execute("SELECT * FROM users WHERE id=?", (user["id"],)).fetchone()
             return {"token": issue_token(db, user["id"]), "user": serialize_user(user)}
 
     def auth_register(self) -> dict[str, Any]:
@@ -1785,19 +1842,16 @@ class ApiHandler(BaseHTTPRequestHandler):
                 db, str(data.get("installationId", "")).strip() or None, user_id
             )
             user = db.execute("SELECT * FROM users WHERE id=?", (user_id,)).fetchone()
-            write_audit(
-                db,
-                user_id,
-                "USER_REGISTER",
-                "USER",
-                user_id,
-                {"migratedDeviceData": migrated},
-            )
+            timestamp = now_ms()
+            # Registration returns an authenticated session. Record both the
+            # ordinary user action and that session's first successful access so
+            # the dashboard's daily-login metric has a matching detail row.
             db.execute(
                 "UPDATE users SET first_login_at=?,last_active_at=? WHERE id=?",
-                (now_ms(), now_ms(), user_id),
+                (timestamp, timestamp, user_id),
             )
-            write_user_event(db, user_id, "ACCOUNT", "REGISTER_SUCCESS")
+            write_user_event(db, user_id, "ACCOUNT", "USER_REGISTER")
+            write_user_event(db, user_id, "ACCOUNT", "LOGIN_SUCCESS")
             return {"token": issue_token(db, user_id), "user": serialize_user(user)}
 
     def auth_login(self) -> dict[str, Any]:
@@ -1991,9 +2045,7 @@ class ApiHandler(BaseHTTPRequestHandler):
             if not verify_password(password, user["password_hash"], user["password_salt"]):
                 raise ApiError(401, "INVALID_CREDENTIALS", "密码错误")
             result = delete_user_account_data(db, user, reason="用户主动注销账号")
-            write_audit(
-                db, user["id"], "USER_ACCOUNT_DELETED", "USER", user["id"]
-            )
+            write_user_event(db, user["id"], "ACCOUNT", "USER_ACCOUNT_DELETED")
             return result
 
     def sports_venues(self) -> list[dict[str, Any]]:
@@ -2862,9 +2914,10 @@ class ApiHandler(BaseHTTPRequestHandler):
                     "SELECT id,title,content,published_at AS publishedAt FROM announcements WHERE enabled=1 ORDER BY published_at DESC LIMIT 10"
                 )
             ]
-            version = row_dict(db.execute(
+            version_row = db.execute(
                 "SELECT * FROM app_versions WHERE platform='android' AND status='PUBLISHED'"
-            ).fetchone())
+            ).fetchone()
+            version = serialize_public_version(version_row) if version_row else None
             if version:
                 # SQLite stores booleans as integers, while Android's Gson model
                 # correctly expects a JSON boolean.  A numeric value here makes
@@ -2903,14 +2956,26 @@ class ApiHandler(BaseHTTPRequestHandler):
                    FROM app_versions WHERE platform='android' AND status='PUBLISHED'"""
             ).fetchone()
             if not row:
-                return {"updateAvailable": False, "currentVersionCode": current, "latestVersion": None}
-            version = row_dict(row)
-            version["force_update"] = bool(version["force_update"])
+                return {
+                    "updateAvailable": False,
+                    "forceUpdate": False,
+                    "minimumVersionViolated": False,
+                    "mandatoryUpdate": False,
+                    "currentVersionCode": current,
+                    "latestVersion": None,
+                }
+            update_available = row["latest_version_code"] > current
+            minimum_violated = current < row["minimum_version_code"]
+            effective_force_update = update_available and (
+                bool(row["force_update"]) or minimum_violated
+            )
+            version = serialize_public_version(row)
             return {
-                "updateAvailable": version["latest_version_code"] > current,
-                "minimumVersionViolated": current < version["minimum_version_code"],
-                "mandatoryUpdate": bool(version["force_update"])
-                or current < version["minimum_version_code"],
+                "updateAvailable": update_available,
+                "forceUpdate": effective_force_update,
+                "minimumVersionViolated": minimum_violated,
+                # Retained as the V1 compatibility alias for existing clients.
+                "mandatoryUpdate": effective_force_update,
                 "currentVersionCode": current,
                 "latestVersion": version,
             }
@@ -2928,7 +2993,8 @@ class ApiHandler(BaseHTTPRequestHandler):
         with connection() as db:
             version = db.execute(
                 """SELECT platform,latest_version_code,minimum_version_code,
-                   latest_version_name,update_message,force_update,published_at
+                   latest_version_name,update_message,download_url,apk_sha256,
+                   apk_size,force_update,published_at
                    FROM app_versions WHERE platform='android' AND status='PUBLISHED'"""
             ).fetchone()
             if version:
@@ -2947,6 +3013,9 @@ class ApiHandler(BaseHTTPRequestHandler):
                         "versionName": version["latest_version_name"],
                         "forceUpdate": force_update,
                         "minimumVersionCode": version["minimum_version_code"],
+                        "downloadUrl": version["download_url"],
+                        "apkSha256": version["apk_sha256"],
+                        "apkSize": version["apk_size"],
                         "moduleKey": None,
                         "recoverAt": None,
                         "publishedAt": version["published_at"],
@@ -3835,9 +3904,11 @@ class ApiHandler(BaseHTTPRequestHandler):
                 return [
                     row_dict(row)
                     for row in db.execute(
-                        """SELECT a.*,u.nickname AS actor_name
+                        """SELECT a.*,u.nickname AS actor_name,
+                                  u.admin_role AS actor_role,
+                                  'ADMIN' AS actor_type
                            FROM admin_audit_logs a
-                           LEFT JOIN users u ON u.id=a.actor_user_id
+                           JOIN users u ON u.id=a.actor_user_id AND u.role='ADMIN'
                            ORDER BY a.created_at DESC LIMIT ?""",
                         (limit,),
                     )
@@ -3847,6 +3918,7 @@ class ApiHandler(BaseHTTPRequestHandler):
                 require_admin_permission(admin, "USER_EVENTS_VIEW")
                 clauses = ["u.role='USER'"]
                 values: list[Any] = []
+                first_login_today = str(query.get("firstLoginToday", "")).lower() == "true"
                 append_user_search(clauses, values, query.get("user"), "u")
                 for parameter, column, allowed in (
                     ("module", "e.module", None),
@@ -3863,6 +3935,29 @@ class ApiHandler(BaseHTTPRequestHandler):
                     if raw.isdigit():
                         clauses.append(f"e.created_at{operator}?")
                         values.append(int(raw))
+                if first_login_today:
+                    day_start, day_end = business_day_bounds_ms()
+                    clauses.extend(
+                        [
+                            "e.event_type='LOGIN_SUCCESS'",
+                            "e.result='SUCCESS'",
+                            "e.created_at>=?",
+                            "e.created_at<?",
+                            """NOT EXISTS (
+                                SELECT 1 FROM user_behavior_events first_login
+                                WHERE first_login.user_id=e.user_id
+                                  AND first_login.event_type='LOGIN_SUCCESS'
+                                  AND first_login.result='SUCCESS'
+                                  AND first_login.created_at>=?
+                                  AND first_login.created_at<?
+                                  AND (
+                                      first_login.created_at < e.created_at
+                                      OR (first_login.created_at=e.created_at AND first_login.id < e.id)
+                                  )
+                            )""",
+                        ]
+                    )
+                    values.extend([day_start, day_end, day_start, day_end])
                 limit, offset = parse_pagination(query, default_limit=50, max_limit=100)
                 total = db.execute(
                     """SELECT COUNT(*) AS count FROM user_behavior_events e
@@ -3884,6 +3979,12 @@ class ApiHandler(BaseHTTPRequestHandler):
                         offset,
                     ),
                     "retentionDays": USER_EVENT_RETENTION_DAYS,
+                    "businessTimezone": BUSINESS_TIMEZONE_NAME,
+                    "firstLoginDefinition": (
+                        "Asia/Shanghai 当日内至少一次成功认证的去重账号数；每个账号返回当日最早 LOGIN_SUCCESS"
+                        if first_login_today
+                        else None
+                    ),
                 }, 200
 
             if method == "GET" and path == "/api/v1/admin/risk-candidates":
@@ -3920,8 +4021,8 @@ class ApiHandler(BaseHTTPRequestHandler):
                 return {"id": candidate["id"], "status": status}, 200
 
             if method == "GET" and path == "/api/v1/admin/overview":
-                today = date.today().isoformat()
-                day_start = int(datetime.combine(date.today(), datetime.min.time()).timestamp() * 1000)
+                today = business_today().isoformat()
+                day_start, day_end = business_day_bounds_ms()
                 now = now_ms()
                 def count(sql: str, params: tuple[Any, ...] = ()) -> int:
                     return int(db.execute(sql, params).fetchone()["count"])
@@ -3937,7 +4038,16 @@ class ApiHandler(BaseHTTPRequestHandler):
                     "dau": count("SELECT COUNT(*) AS count FROM users WHERE role='USER' AND last_active_at>=?", (day_start,)),
                     "wau": count("SELECT COUNT(*) AS count FROM users WHERE role='USER' AND last_active_at>=?", (now - 7 * 86400000,)),
                     "mau": count("SELECT COUNT(*) AS count FROM users WHERE role='USER' AND last_active_at>=?", (now - 30 * 86400000,)),
-                    "todayFirstLogins": count("SELECT COUNT(*) AS count FROM users WHERE role='USER' AND first_login_at>=?", (day_start,)),
+                    "todayFirstLogins": count(
+                        """SELECT COUNT(DISTINCT e.user_id) AS count
+                           FROM user_behavior_events e
+                           JOIN users u ON u.id=e.user_id
+                           WHERE u.role='USER'
+                             AND e.event_type='LOGIN_SUCCESS'
+                             AND e.result='SUCCESS'
+                             AND e.created_at>=? AND e.created_at<?""",
+                        (day_start, day_end),
+                    ),
                     "activeReservations": count("SELECT COUNT(*) AS count FROM reservations WHERE status='ACTIVE'"),
                     "todayReservations": count("SELECT COUNT(*) AS count FROM reservations WHERE booking_date=? AND status='ACTIVE'", (today,)),
                     "todayCancelledReservations": count("SELECT COUNT(*) AS count FROM reservations WHERE status='CANCELLED' AND cancelled_at>=?", (day_start,)),
@@ -5000,13 +5110,17 @@ class ApiHandler(BaseHTTPRequestHandler):
                             "changeNote": row["change_note"],
                         }
                     )
+                version = row_dict(
+                    db.execute(
+                        "SELECT * FROM app_versions WHERE platform='android'"
+                    ).fetchone()
+                )
+                if version:
+                    version["force_update"] = bool(version["force_update"])
+                    version["forceUpdate"] = version["force_update"]
                 return {
                     "flags": flags,
-                    "version": row_dict(
-                        db.execute(
-                            "SELECT * FROM app_versions WHERE platform='android'"
-                        ).fetchone()
-                    ),
+                    "version": version,
                 }, 200
 
             match = re.fullmatch(r"/api/v1/admin/flags/([^/]+)", path)
@@ -5072,8 +5186,11 @@ class ApiHandler(BaseHTTPRequestHandler):
 
             if method == "PUT" and path == "/api/v1/admin/version/android":
                 data = self.body_json()
-                latest = int(data.get("latestVersionCode", 0))
-                minimum = int(data.get("minimumVersionCode", 0))
+                try:
+                    latest = int(data.get("latestVersionCode", 0))
+                    minimum = int(data.get("minimumVersionCode", 0))
+                except (TypeError, ValueError) as exc:
+                    raise ApiError(400, "VALIDATION_ERROR", "版本号配置无效") from exc
                 if latest < 1 or minimum < 1 or minimum > latest:
                     raise ApiError(400, "VALIDATION_ERROR", "版本号配置无效")
                 status = str(data.get("status", "DRAFT")).upper()
@@ -5086,9 +5203,16 @@ class ApiHandler(BaseHTTPRequestHandler):
                 if sha256 and not re.fullmatch(r"[0-9a-f]{64}", sha256):
                     raise ApiError(400, "INVALID_APK_SHA256", "APK SHA-256 格式无效")
                 apk_size = data.get("apkSize")
-                apk_size = int(apk_size) if apk_size not in (None, "") else None
+                if apk_size not in (None, ""):
+                    try:
+                        apk_size = int(apk_size)
+                    except (TypeError, ValueError) as exc:
+                        raise ApiError(400, "INVALID_APK_SIZE", "APK 大小必须为整数") from exc
+                else:
+                    apk_size = None
                 if apk_size is not None and apk_size <= 0:
                     raise ApiError(400, "INVALID_APK_SIZE", "APK 大小必须大于 0")
+                force_update = parse_boolean(data.get("forceUpdate"), "forceUpdate")
                 timestamp = now_ms()
                 db.execute(
                     """INSERT INTO app_versions(
@@ -5120,7 +5244,7 @@ class ApiHandler(BaseHTTPRequestHandler):
                         download_url,
                         sha256 or None,
                         apk_size,
-                        1 if bool(data.get("forceUpdate", False)) else 0,
+                        1 if force_update else 0,
                         status,
                         timestamp if status == "PUBLISHED" else None,
                         timestamp,
@@ -5135,13 +5259,27 @@ class ApiHandler(BaseHTTPRequestHandler):
                     "APP_VERSION_UPDATED",
                     "APP_VERSION",
                     "android",
-                    {"latestVersionCode": latest, "minimumVersionCode": minimum, "status": status},
+                    {
+                        "latestVersionCode": latest,
+                        "minimumVersionCode": minimum,
+                        "status": status,
+                        "forceUpdate": force_update,
+                    },
                 )
+                saved = db.execute(
+                    "SELECT download_url,apk_sha256,apk_size,force_update,published_at "
+                    "FROM app_versions WHERE platform='android'"
+                ).fetchone()
                 return {
                     "platform": "android",
                     "latestVersionCode": latest,
                     "minimumVersionCode": minimum,
                     "status": status,
+                    "forceUpdate": bool(saved["force_update"]),
+                    "downloadUrl": saved["download_url"],
+                    "apkSha256": saved["apk_sha256"],
+                    "apkSize": saved["apk_size"],
+                    "publishedAt": saved["published_at"],
                 }, 200
 
             if method == "GET" and path == "/api/v1/admin/feedback":

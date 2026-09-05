@@ -750,10 +750,186 @@ class ApiTest(unittest.TestCase):
         self.assertTrue(below_minimum["data"]["minimumVersionViolated"])
         self.assertTrue(below_minimum["data"]["mandatoryUpdate"])
         self.assertEqual(42, newer["data"]["latestVersion"]["latest_version_code"])
+        self.assertFalse(newer["data"]["forceUpdate"])
+        self.assertEqual(42, newer["data"]["latestVersion"]["versionCode"])
+        self.assertEqual(
+            "https://updates.invalid/my-changli.apk",
+            newer["data"]["latestVersion"]["downloadUrl"],
+        )
+        self.assertEqual("a" * 64, newer["data"]["latestVersion"]["apkSha256"])
+        self.assertEqual(123456, newer["data"]["latestVersion"]["apkSize"])
+        forced_payload = dict(payload, forceUpdate=True)
+        self.assertEqual(
+            200,
+            self.call("PUT", "/api/v1/admin/version/android", forced_payload, admin)[0],
+        )
+        forced = self.call(
+            "GET", "/api/v1/public/version/android?currentVersionCode=21"
+        )[1]
+        self.assertTrue(forced["data"]["updateAvailable"])
+        self.assertTrue(forced["data"]["forceUpdate"])
+        self.assertTrue(forced["data"]["mandatoryUpdate"])
+        self.assertTrue(forced["data"]["latestVersion"]["force_update"])
+        config = self.call("GET", "/api/v1/admin/config", token=admin)[1]
+        self.assertTrue(config["data"]["version"]["force_update"])
+        self.assertTrue(config["data"]["version"]["forceUpdate"])
         current = self.call("GET", "/api/v1/public/version/android?currentVersionCode=42")[1]
         self.assertFalse(current["data"]["updateAvailable"])
+        self.assertFalse(current["data"]["forceUpdate"])
+        self.assertFalse(current["data"]["mandatoryUpdate"])
         unsafe = dict(payload, downloadUrl="javascript:alert(1)")
         self.assertEqual(400, self.call("PUT", "/api/v1/admin/version/android", unsafe, admin)[0])
+        invalid_size = dict(payload, apkSize="not-an-integer")
+        self.assertEqual(400, self.call("PUT", "/api/v1/admin/version/android", invalid_size, admin)[0])
+
+    def test_daily_first_login_metric_and_detail_are_distinct_and_consistent(self):
+        admin = self.admin_token()
+        before_status, before = self.call("GET", "/api/v1/admin/overview", token=admin)
+        self.assertEqual(200, before_status)
+
+        phone_a, password_a, _, user_a = self.phone_account()
+        phone_b, password_b, _, user_b = self.phone_account()
+
+        # B logged in during an earlier lifecycle day; today's successful login
+        # must still count for the daily product metric.
+        yesterday = server.now_ms() - 2 * 86400000
+        with server.connection() as db:
+            db.execute("DELETE FROM user_behavior_events WHERE user_id=?", (user_b["id"],))
+            db.execute(
+                "UPDATE users SET created_at=?,first_login_at=? WHERE id=?",
+                (yesterday, yesterday, user_b["id"]),
+            )
+        self.assertEqual(200, self.call(
+            "POST", "/api/v1/auth/login",
+            {"phone": phone_b, "password": password_b},
+        )[0])
+
+        # Repeated success events must not increase the distinct-account count.
+        for _ in range(5):
+            self.assertEqual(200, self.call(
+                "POST", "/api/v1/auth/login",
+                {"phone": phone_a, "password": password_a},
+            )[0])
+
+        after_status, after = self.call("GET", "/api/v1/admin/overview", token=admin)
+        self.assertEqual(200, after_status)
+        self.assertEqual(
+            before["data"]["todayFirstLogins"] + 2,
+            after["data"]["todayFirstLogins"],
+        )
+
+        for user in (user_a, user_b):
+            status, details = self.call(
+                "GET",
+                f"/api/v1/admin/user-events?user={user['id']}&eventType=LOGIN_SUCCESS&firstLoginToday=true",
+                token=admin,
+            )
+            self.assertEqual(200, status)
+            self.assertEqual(1, details["data"]["total"])
+            self.assertEqual(1, len(details["data"]["items"]))
+            self.assertEqual(user["id"], details["data"]["items"][0]["user_id"])
+            self.assertEqual("LOGIN_SUCCESS", details["data"]["items"][0]["event_type"])
+            self.assertEqual("Asia/Shanghai", details["data"]["businessTimezone"])
+            self.assertIn("去重账号数", details["data"]["firstLoginDefinition"])
+
+        empty_status, empty = self.call(
+            "GET",
+            "/api/v1/admin/user-events?user=not-a-real-account&firstLoginToday=true",
+            token=admin,
+        )
+        self.assertEqual(200, empty_status)
+        self.assertEqual(0, empty["data"]["total"])
+        self.assertEqual([], empty["data"]["items"])
+
+    def test_user_and_admin_audit_streams_are_actor_scoped(self):
+        phone, password, _, user = self.phone_account()
+        self.assertEqual(200, self.call(
+            "POST", "/api/v1/auth/login",
+            {"phone": phone, "password": password},
+        )[0])
+        admin = self.admin_token()
+
+        status, registered_events = self.call(
+            "GET",
+            f"/api/v1/admin/user-events?user={user['id']}&eventType=USER_REGISTER",
+            token=admin,
+        )
+        self.assertEqual(200, status)
+        self.assertGreaterEqual(registered_events["data"]["total"], 1)
+        status, login_events = self.call(
+            "GET",
+            f"/api/v1/admin/user-events?user={user['id']}&eventType=LOGIN_SUCCESS",
+            token=admin,
+        )
+        self.assertEqual(200, status)
+        self.assertGreaterEqual(login_events["data"]["total"], 1)
+
+        # Preserve a legacy misclassified row in storage; the admin query must
+        # filter it by Actor identity rather than deleting or action-blacklisting it.
+        legacy_audit_id = "legacy-" + secrets.token_hex(8)
+        with server.connection() as db:
+            db.execute(
+                """INSERT INTO admin_audit_logs(
+                       id,actor_user_id,action,entity_type,entity_id,details_json,created_at
+                   ) VALUES(?,?,?,?,?,?,?)""",
+                (
+                    legacy_audit_id,
+                    user["id"],
+                    "USER_REGISTER",
+                    "USER",
+                    user["id"],
+                    "{\"legacy\":true}",
+                    server.now_ms(),
+                ),
+            )
+
+        status, audits = self.call("GET", "/api/v1/admin/audit-logs", token=admin)
+        self.assertEqual(200, status)
+        self.assertTrue(audits["data"])
+        self.assertTrue(all(row["actor_type"] == "ADMIN" for row in audits["data"]))
+        self.assertTrue(all(row["actor_role"] in server.ADMIN_ROLES for row in audits["data"]))
+        self.assertFalse(any(row["actor_user_id"] == user["id"] for row in audits["data"]))
+        self.assertFalse(any(row["action"] == "USER_REGISTER" for row in audits["data"]))
+        self.assertTrue(any(row["action"] == "ADMIN_LOGIN_SUCCEEDED" for row in audits["data"]))
+
+        with server.connection() as db:
+            self.assertEqual(
+                1,
+                db.execute(
+                    "SELECT COUNT(*) FROM admin_audit_logs WHERE id=?",
+                    (legacy_audit_id,),
+                ).fetchone()[0],
+            )
+
+        version_payload = {
+            "latestVersionCode": 90,
+            "minimumVersionCode": 80,
+            "latestVersionName": "9.0-audit-test",
+            "updateMessage": "审计隔离测试",
+            "downloadUrl": "https://updates.invalid/audit-test.apk",
+            "apkSha256": "b" * 64,
+            "apkSize": 456789,
+            "forceUpdate": True,
+            "status": "DRAFT",
+        }
+        self.assertEqual(200, self.call(
+            "PUT", "/api/v1/admin/version/android", version_payload, admin,
+        )[0])
+        status, audits_after_update = self.call(
+            "GET", "/api/v1/admin/audit-logs", token=admin,
+        )
+        self.assertEqual(200, status)
+        self.assertTrue(any(
+            row["action"] == "APP_VERSION_UPDATED"
+            and row["actor_type"] == "ADMIN"
+            for row in audits_after_update["data"]
+        ))
+
+        serialized = json.dumps(
+            {"events": registered_events["data"], "audits": audits_after_update["data"]},
+            ensure_ascii=False,
+        )
+        self.assertNotIn(password, serialized)
 
     def test_resource_library_admin_publish_user_activity_and_complaint(self):
         _, _, token_a, _ = self.phone_account()
@@ -1735,8 +1911,14 @@ class ApiTest(unittest.TestCase):
         with urllib.request.urlopen(self.base + "/admin/", timeout=5) as response:
             html = response.read().decode("utf-8")
             self.assertIn("PRODUCTION ADMIN", html)
+            self.assertIn("/admin/assets/my-changli-app-icon.png", html)
             self.assertNotIn("LOCAL ADMIN", html)
             self.assertNotIn("仅本机", html)
+        with urllib.request.urlopen(
+            self.base + "/admin/assets/my-changli-app-icon.png", timeout=5
+        ) as response:
+            self.assertEqual("image/png", response.headers.get_content_type())
+            self.assertEqual(b"\x89PNG\r\n\x1a\n", response.read(8))
         with urllib.request.urlopen(self.base + "/admin/styles.css", timeout=5) as response:
             stylesheet = response.read().decode("utf-8")
             self.assertIn("#user-bulk-actions[hidden]", stylesheet)

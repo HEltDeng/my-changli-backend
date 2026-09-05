@@ -3,14 +3,14 @@
 ## 保留的合同
 
 - `GET /api/v1/public/version/android?currentVersionCode=N` 只读取 `PUBLISHED` 记录。
-- 返回 latest/minimum version code、version name、update message、HTTPS download URL、APK SHA-256、size、`force_update` 和 `published_at`。
-- 顶层同时返回 `updateAvailable`、`minimumVersionViolated`、`mandatoryUpdate`。当前 Android 会用 `force_update || current < minimum_version_code` 自行计算 mandatory，新增顶层字段向后兼容。
+- 返回 latest/minimum version code、version name、update message、HTTPS download URL、APK SHA-256、size、`force_update` 和 `published_at`，并以 camelCase 别名提供同一份直接更新合同。
+- 顶层同时返回 `updateAvailable`、`minimumVersionViolated`、`forceUpdate`、`mandatoryUpdate`。服务端只在确有新版本且后台配置强制更新或客户端低于最低支持版本时返回 `forceUpdate=true`；`mandatoryUpdate` 是兼容别名。
 - Admin `PUT /api/v1/admin/version/android` 支持 DRAFT/PUBLISHED/DISABLED；不安全 URL、错误 hash、size 或 minimum > latest 会拒绝。
 
 ## 验证策略
 
 - old but above minimum：提示可更新，不错误强制；
-- current/latest：`updateAvailable=false`；
+- current/latest：`updateAvailable=false`、`forceUpdate=false`，即使最新发布记录本身勾选了强制更新；
 - below minimum：`minimumVersionViolated=true`、`mandatoryUpdate=true`；
 - DRAFT/DISABLED：不下发。
 

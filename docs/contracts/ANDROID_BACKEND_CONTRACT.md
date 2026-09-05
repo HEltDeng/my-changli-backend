@@ -44,4 +44,16 @@ Auth 列：Public 不要求 token；Bearer 要求 `Authorization: Bearer <token>
 
 ## 兼容性结论
 
-当前 Android DTO 与 Backend 字段兼容。Backend 新增的 `minimumVersionViolated`/`mandatoryUpdate` 会被旧 DTO 安全忽略，Android 现有 `VersionPolicy` 已按 minimum/force 计算。没有发现必须在本模块跨仓库修复的破坏性不一致。
+当前 Android DTO 与 Backend 字段兼容。`/public/version/android` 保留
+`latest_version_code`、`minimum_version_code`、`latest_version_name`、
+`update_message`、`download_url`、`apk_sha256`、`apk_size`、`force_update` 和
+`published_at`；同时增加 `versionCode`、`versionName`、
+`minimumSupportedVersionCode`、`releaseNotes`、`downloadUrl`、`apkSha256`、
+`apkSize`、`publishedAt` 和 `forceUpdate`。顶层的 `forceUpdate` 是服务端计算的
+有效策略，只有 `updateAvailable=true` 且后台强制发布或当前版本低于最低支持版本时
+才为 true；`mandatoryUpdate` 保留为兼容别名。当前版本已经等于最新版本时不会要求
+更新，即使该发布版本自身配置了强制更新。
+
+Android V1 只读取旧字段也能继续解析；新 App 可用同一个 manifest 直接获得更新
+判断、APK 直链、SHA-256、大小和说明。下载、校验、安装权限、PackageInstaller 和
+安装后重启仍属于 Android 端职责，本仓库不宣称 App 内更新 E2E 已完成。

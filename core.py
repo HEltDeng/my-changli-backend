@@ -14,7 +14,7 @@ from __future__ import annotations
 import json
 import sqlite3
 import time
-from datetime import date, datetime
+from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any
 
@@ -27,6 +27,10 @@ SESSION_SECONDS = 30 * 24 * 60 * 60
 MAX_PAGE_SIZE = 100
 MAX_PAGE_OFFSET = 10000
 TEST_DB_PREFIX = "TEST_"
+BUSINESS_TIMEZONE_NAME = "Asia/Shanghai"
+# Shanghai has no daylight-saving transition; a fixed UTC+8 offset keeps the
+# business-day contract dependency-free on Windows runtimes without tzdata.
+BUSINESS_TIMEZONE = timezone(timedelta(hours=8), name=BUSINESS_TIMEZONE_NAME)
 
 
 def configure_test_runtime(database_path: Path) -> None:
@@ -58,12 +62,25 @@ def now_ms() -> int:
     return int(time.time() * 1000)
 
 
+def business_today() -> date:
+    """Return the current calendar date in the product's business timezone."""
+    return datetime.now(BUSINESS_TIMEZONE).date()
+
+
+def business_day_bounds_ms(day: date | None = None) -> tuple[int, int]:
+    """Return the inclusive start/exclusive end of a business day in ms."""
+    business_day = day or business_today()
+    start = datetime.combine(business_day, datetime.min.time(), tzinfo=BUSINESS_TIMEZONE)
+    end = datetime.combine(business_day, datetime.max.time(), tzinfo=BUSINESS_TIMEZONE)
+    return int(start.timestamp() * 1000), int((end.timestamp() * 1000) + 1)
+
+
 def today_iso() -> str:
-    return date.today().isoformat()
+    return business_today().isoformat()
 
 
 def day_start_ms() -> int:
-    return int(datetime.combine(date.today(), datetime.min.time()).timestamp() * 1000)
+    return business_day_bounds_ms()[0]
 
 
 class ClosingConnection(sqlite3.Connection):
