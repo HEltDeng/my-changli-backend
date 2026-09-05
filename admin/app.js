@@ -347,7 +347,7 @@ const renderers = {
       </form>
       ${rows.length ? `<div class="table-wrap"><table><thead><tr><th>用户完整资料</th><th>预约资料</th><th>账号状态</th><th>业务统计</th><th>时间 / 限制</th><th>操作</th></tr></thead><tbody>
         ${rows.map((row) => `<tr>
-          <td><strong>${escapeHtml(row.nickname || "长理同学")}</strong><br>${escapeHtml(row.phone || "无手机号")}<br><span class="subtle">${escapeHtml(row.id)}</span></td>
+          <td><strong>${escapeHtml(row.nickname || "川农同学")}</strong><br>${escapeHtml(row.phone || "无手机号")}<br><span class="subtle">${escapeHtml(row.id)}</span></td>
           <td><strong>${escapeHtml(row.reservation_student_id || "未填写")}</strong><br><span class="subtle">${escapeHtml(row.reservation_name || "—")} · ${row.reservation_profile_consented_at ? "用户已同意" : "未记录同意"}</span></td>
           <td>${badge(row.account_type)}<br>${accountBadge(row.account_status)}</td>
           <td><span class="subtle">预约 ${row.reservation_count} · 失物 ${row.lost_found_count}<br>资料浏览 ${row.resource_view_count} · 收藏 ${row.resource_favorite_count}<br>投诉 ${row.resource_complaint_count} · 反馈 ${row.feedback_count}</span></td>
@@ -621,7 +621,7 @@ const renderers = {
         <button class="primary">筛选</button>
       </form>
       ${rows.length ? `<div class="table-wrap"><table class="feedback-table"><thead><tr><th>编号</th><th>类型</th><th>状态</th><th>用户</th><th>内容摘要</th><th>提交时间</th><th>最后更新</th><th>操作</th></tr></thead><tbody>
-        ${rows.map((row) => `<tr><td class="mono-cell">${escapeHtml(row.id.slice(0, 8))}</td><td>${escapeHtml(feedbackCategoryText(row.category))}</td><td>${feedbackBadge(row.workflow_status)}</td><td><strong>${escapeHtml(row.nickname || "长理同学")}</strong><br><span class="subtle">${escapeHtml(row.phone_masked || "测试设备")}</span></td><td class="feedback-summary"><strong>${escapeHtml(row.title || "未命名反馈")}</strong><span>${escapeHtml(row.content)}</span></td><td>${formatTime(row.created_at)}</td><td>${formatTime(row.updated_at)}</td><td><button class="ghost" data-action="feedback-details" data-id="${escapeHtml(row.id)}">查看详情</button></td></tr>`).join("")}
+        ${rows.map((row) => `<tr><td class="mono-cell">${escapeHtml(row.id.slice(0, 8))}</td><td>${escapeHtml(feedbackCategoryText(row.category))}</td><td>${feedbackBadge(row.workflow_status)}</td><td><strong>${escapeHtml(row.nickname || "川农同学")}</strong><br><span class="subtle">${escapeHtml(row.phone_masked || "测试设备")}</span></td><td class="feedback-summary"><strong>${escapeHtml(row.title || "未命名反馈")}</strong><span>${escapeHtml(row.content)}</span></td><td>${formatTime(row.created_at)}</td><td>${formatTime(row.updated_at)}</td><td><button class="ghost" data-action="feedback-details" data-id="${escapeHtml(row.id)}">查看详情</button></td></tr>`).join("")}
       </tbody></table></div>` : '<div class="empty">暂无用户反馈</div>'}`;
   },
 
@@ -656,7 +656,7 @@ const renderers = {
     const params = new URLSearchParams({...normalized, limit: "100"});
     const data = await api(`/api/v1/admin/user-events?${params}`);
     const summary = Object.keys(filters).length ? `<div class="filter-summary"><span>当前筛选：${escapeHtml(Object.values(filters).join(" · "))}</span><button class="ghost" data-action="clear-page-filter">清除筛选</button></div>` : "";
-    content.innerHTML = `${summary}<article class="card"><p class="muted">仅记录我的长理账号使用后端服务所需的最小事件，默认保留 ${data.retentionDays} 天；不包含教务账号、课表、成绩、密码、Cookie、Session 或完整 Token。</p></article>
+    content.innerHTML = `${summary}<article class="card"><p class="muted">仅记录川农账号使用后端服务所需的最小事件，默认保留 ${data.retentionDays} 天；不包含教务账号、课表、成绩、密码、Cookie、Session 或完整 Token。</p></article>
       <form id="user-event-filter" class="toolbar"><label>用户<input name="user" value="${escapeHtml(filters.user || "")}" placeholder="内部 ID、昵称或完整手机号"></label><label class="compact">模块<input name="module" value="${escapeHtml(filters.module || "")}" placeholder="如 ACCOUNT"></label><label class="compact">事件<input name="eventType" value="${escapeHtml(filters.eventType || "")}" placeholder="如 LOGIN_FAILURE"></label><label class="compact">结果<select name="result">${options(["SUCCESS","FAILURE","DENIED"], filters.result, true)}</select></label><button class="primary">筛选</button></form>
       <p class="muted">共 ${data.total} 条，本页最多显示 ${data.limit} 条。</p>
       ${data.items.length ? `<div class="table-wrap"><table><thead><tr><th>时间</th><th>用户</th><th>模块 / 事件</th><th>结果</th><th>目标</th><th>风险</th></tr></thead><tbody>${data.items.map((row) => `<tr><td>${formatTime(row.created_at)}</td><td>${escapeHtml(row.nickname || "已注销用户")}<br><span class="subtle">${escapeHtml(row.phone_masked || row.user_id || "—")}</span></td><td>${escapeHtml(row.module)}<br><span class="subtle">${escapeHtml(row.event_type)}</span></td><td>${badge(row.result)}</td><td>${escapeHtml(row.target_type || "—")} · ${escapeHtml(row.target_id || "—")}</td><td>${escapeHtml(row.risk_flag || "—")}</td></tr>`).join("")}</tbody></table></div>` : '<div class="empty">没有符合条件的用户行为记录</div>'}`;
@@ -975,7 +975,7 @@ content.addEventListener("click", async (event) => {
           <div class="card-header"><div>${feedbackBadge(item.workflow_status)} <span class="badge">${escapeHtml(feedbackCategoryText(item.category))}</span></div><span class="subtle">#${escapeHtml(item.id)}</span></div>
           <div><strong>${escapeHtml(item.title || "未命名反馈")}</strong><p class="long-text">${escapeHtml(item.content)}</p></div>
           <div class="grid two-columns">
-            <p class="subtle">用户：${escapeHtml(item.nickname || "长理同学")} · ${escapeHtml(item.phone_masked || "测试设备")}</p>
+            <p class="subtle">用户：${escapeHtml(item.nickname || "川农同学")} · ${escapeHtml(item.phone_masked || "测试设备")}</p>
             <p class="subtle">提交：${formatTime(item.created_at)}<br>更新：${formatTime(item.updated_at)}</p>
           </div>
           <p class="subtle">当前版本暂未支持反馈附件。</p>
@@ -1004,7 +1004,7 @@ content.addEventListener("click", async (event) => {
       const user = JSON.parse(button.dataset.user);
       return openDialog("编辑用户", `
         <div class="stack">
-          <label>昵称<input name="nickname" maxlength="40" value="${escapeHtml(user.nickname || "长理同学")}" required></label>
+          <label>昵称<input name="nickname" maxlength="40" value="${escapeHtml(user.nickname || "川农同学")}" required></label>
           <label>账号状态<select name="accountStatus">${accountStatusOptions(user.account_status)}</select></label>
           <label>处理原因<input name="reason" maxlength="300" placeholder="变更状态时必须填写"></label>
           <label>状态到期时间（可选）<input type="datetime-local" name="expiresAt"></label>

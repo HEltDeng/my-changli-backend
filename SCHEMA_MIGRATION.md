@@ -2,7 +2,7 @@
 
 ## 当前 SQLite 数据域
 
-- `users`、`sessions`：我的长理用户、管理员、角色、账号状态与会话。所有业务以内部 `users.id` 关联，手机号不是业务主键。
+- `users`、`sessions`：川农用户、管理员、角色、账号状态与会话。所有业务以内部 `users.id` 关联，手机号不是业务主键。
 - `reservations`、`reservation_*`、`venues`、`time_slots`、`inventory_blocks`：场地、库存、预约、规则、资料快照与操作事件。
 - `lost_found_*`：失物信息、收藏、认领申请和举报。
 - `resource_*`：资料条目、浏览、收藏和投诉。

@@ -10,7 +10,7 @@ App 冷启动首页可用后，低优先级调用 `GET /api/v1/public/version/an
 
 - 原 `AppVersionApi`、`LegacyApkApi`、`UpdateDialog` 与 `DownloadService` 代码仍因兼容和未来安全实现参考而保留；
 - `UserStore.QueryIsLastedApk` 已改为明确的本地 no-op，不再创建原上游 Retrofit 客户端，也不再回退旧接口；
-- 新入口只使用 `CAMPUS_TOOLS_API_BASE_URL`，不会访问原“长理星球”的域名、APK 地址、密钥或资源；
+- 新入口只使用 `CAMPUS_TOOLS_API_BASE_URL`，不会访问旧上游服务的域名、APK 地址、密钥或资源；
 - 旧下载服务没有被新检查流程调用。
 
 ## 未来真实发布前

@@ -54,7 +54,7 @@
 - `POST /api/v1/library/{id}/favorite`
 - `POST /api/v1/library/{id}/complaints`
 
-第一期只有管理员能发布资料条目，资源地址仅允许 HTTP/HTTPS。收藏、浏览与投诉均关联当前我的长理账号；未实现学生上传或真实付费。
+第一期只有管理员能发布资料条目，资源地址仅允许 HTTP/HTTPS。收藏、浏览与投诉均关联当前川农账号；未实现学生上传或真实付费。
 
 ## 独立失物招领
 

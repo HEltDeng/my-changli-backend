@@ -1,4 +1,4 @@
-"""My Changli campus-tools backend MVP.
+"""SICAU campus-tools backend MVP.
 
 Small HTTP + SQLite service for local development. It deliberately
 does not include payment, reservation codes, public deployment, or academic-system
@@ -46,6 +46,9 @@ UPLOADS = ROOT / "uploads"
 ADMIN_WEB = ROOT / "admin"
 HOST = os.getenv("MY_CHANGLI_HOST", "127.0.0.1")
 PORT = int(os.getenv("MY_CHANGLI_PORT", "8787"))
+SCHOOL_NAME = os.getenv("MY_CHANGLI_SCHOOL_NAME", "四川农业大学")
+SCHOOL_SHORT_NAME = os.getenv("MY_CHANGLI_SCHOOL_SHORT_NAME", "川农")
+APP_DISPLAY_NAME = os.getenv("MY_CHANGLI_APP_DISPLAY_NAME", "川农")
 SPORTS = {"BADMINTON", "TABLE_TENNIS"}
 LOST_TYPES = {"LOST", "FOUND"}
 LOST_STATUSES = {
@@ -102,7 +105,7 @@ def initialize_database() -> None:
         ensure_column(db, "venues", "maintenance_note", "TEXT NOT NULL DEFAULT ''")
         ensure_column(db, "venues", "expected_restore_at", "INTEGER")
         ensure_column(db, "users", "account_type", "TEXT NOT NULL DEFAULT 'DEVICE'")
-        ensure_column(db, "users", "nickname", "TEXT NOT NULL DEFAULT '长理同学'")
+        ensure_column(db, "users", "nickname", f"TEXT NOT NULL DEFAULT '{SCHOOL_SHORT_NAME}同学'")
         ensure_column(db, "users", "phone_hash", "TEXT")
         ensure_column(db, "users", "phone_masked", "TEXT")
         ensure_column(db, "users", "phone_encrypted", "TEXT")
@@ -642,53 +645,53 @@ def seed_resources(db: sqlite3.Connection, timestamp: int) -> None:
     resources = (
         (
             "computer_exam_archive",
-            "计算机学院往年试题",
-            "由校友维护的计通学院课程题库与复习资料归档。",
-            "考试资料",
-            ["题库", "真题", "复习", "计算机"],
-            "计算机相关课程",
-            "GitHub",
-            "https://github.com/MedivhTirisfal/csust_test_database",
+            "四川农业大学官网",
+            "学校新闻、公共服务、校历和各校区官方入口。",
+            "学生服务",
+            ["官网", "通知", "校历", "雅安", "成都", "都江堰"],
+            "全校学生",
+            SCHOOL_NAME,
+            "https://www.sicau.edu.cn/",
         ),
         (
             "university_library",
-            "长沙理工大学图书馆",
-            "查看开放安排、数字资源、读者服务与图书馆通知。",
-            "图书馆",
-            ["图书", "论文", "数据库"],
+            "教务处通知公告",
+            "查看选课、考试、学籍、竞赛与教学运行相关通知。",
+            "教务信息",
+            ["教务", "选课", "考试", "学籍", "通知"],
             "全校学生",
-            "学校图书馆",
-            "https://www.csust.edu.cn/tsg/index.htm",
+            f"{SCHOOL_NAME}教务处",
+            "https://jiaowu.sicau.edu.cn/",
         ),
         (
             "library_catalog_search",
-            "馆藏书目检索",
-            "按题名、作者、ISBN 等条件查询学校纸质与馆藏文献。",
-            "图书馆",
-            ["馆藏", "借阅", "书目"],
+            "教务管理系统入口",
+            "进入川农教务管理系统；登录参数与课表解析仍以学生账号实测为准。",
+            "教务信息",
+            ["学号", "教务系统", "课表", "成绩", "考试"],
             "全校学生",
-            "馆藏检索系统",
-            "https://opac.csust.edu.cn/index",
+            f"{SCHOOL_NAME}教务管理系统",
+            "https://jiaowu.sicau.edu.cn/web/web/web/index.asp",
         ),
         (
             "academic_affairs_notices",
-            "教务处通知公告",
-            "获取选课、考试、学籍、竞赛与教学运行相关通知。",
+            f"{SCHOOL_NAME}校历",
+            "打开学校官方校历页面查看学期、教学周和假期安排。",
             "教务信息",
-            ["教务", "选课", "考试", "通知"],
+            ["校历", "学期", "教学周", "假期"],
             "全校学生",
-            "长沙理工大学教务处",
-            "https://www.csust.edu.cn/jwc/index/tzgg.htm",
+            SCHOOL_NAME,
+            "https://www.sicau.edu.cn/ggfw/rlxl.htm",
         ),
         (
             "current_student_services",
-            "在校学生服务",
-            "学校汇总的校园生活、学生事务与公共服务入口。",
+            "一网通办",
+            "进入四川农业大学校内服务入口；需要统一身份认证时将由学校页面处理。",
             "学生服务",
-            ["学生", "就业", "资助", "医疗"],
+            ["学生", "服务", "办事", "统一认证"],
             "全校学生",
-            "长沙理工大学",
-            "https://www.csust.edu.cn/fldh/zxxs1.htm",
+            SCHOOL_NAME,
+            "https://ywtb.sicau.edu.cn/",
         ),
     )
     for index, item in enumerate(resources):
@@ -708,13 +711,35 @@ def seed_resources(db: sqlite3.Connection, timestamp: int) -> None:
                 category,
                 json.dumps(tags, ensure_ascii=False),
                 audience,
-                "我的长理资料库",
+                f"{APP_DISPLAY_NAME}资料库",
                 source,
                 url,
                 100 - index,
                 timestamp,
                 timestamp,
                 timestamp,
+            ),
+        )
+        # Existing local databases may already contain the old school seed rows.
+        # Migrate only those known seed IDs whose URL still points at the legacy
+        # school; user-created resources are left untouched.
+        db.execute(
+            """UPDATE resource_items
+               SET title=?,summary=?,category=?,tags_json=?,audience_scope=?,
+                   publisher_label=?,source_label=?,external_url=?,updated_at=?
+               WHERE id=? AND (external_url LIKE '%csust%' OR
+                               external_url LIKE '%MedivhTirisfal%')""",
+            (
+                title,
+                summary,
+                category,
+                json.dumps(tags, ensure_ascii=False),
+                audience,
+                f"{APP_DISPLAY_NAME}资料库",
+                source,
+                url,
+                timestamp,
+                resource_id,
             ),
         )
 
@@ -1231,7 +1256,7 @@ class ApiHandler(BaseHTTPRequestHandler):
         ).fetchone()
         payload = json.loads(row["payload_json"] or "{}") if row else {}
         if not bool(payload.get("allowGuestBrowsing", False)):
-            raise ApiError(401, "UNAUTHORIZED", "登录我的长理账号后可浏览资料库")
+            raise ApiError(401, "UNAUTHORIZED", "登录川农账号后可浏览资料库")
         return None
 
     def do_GET(self) -> None:
@@ -1450,7 +1475,7 @@ class ApiHandler(BaseHTTPRequestHandler):
         password = required_text(data, "password", 200)
         if len(password) < 8:
             raise ApiError(400, "WEAK_PASSWORD", "密码至少 8 位")
-        nickname = str(data.get("nickname", "长理同学")).strip()[:30] or "长理同学"
+        nickname = str(data.get("nickname", f"{SCHOOL_SHORT_NAME}同学")).strip()[:30] or f"{SCHOOL_SHORT_NAME}同学"
         digest_phone = phone_digest(phone)
         username = "phone_" + digest_phone[:32]
         digest, salt = password_record(password)
@@ -3170,13 +3195,13 @@ class ApiHandler(BaseHTTPRequestHandler):
                         expires_at = int(expires_at)
                     except (TypeError, ValueError) as exc:
                         raise ApiError(400, "VALIDATION_ERROR", "状态到期时间无效") from exc
-                nickname = str(data.get("nickname", user["nickname"] or "长理同学")).strip()[:40]
+                nickname = str(data.get("nickname", user["nickname"] or f"{SCHOOL_SHORT_NAME}同学")).strip()[:40]
                 db.execute(
                     """UPDATE users SET account_status=?,nickname=?,account_status_reason=?,
                        account_status_changed_at=?,account_status_expires_at=? WHERE id=?""",
                     (
                         account_status,
-                        nickname or "长理同学",
+                        nickname or f"{SCHOOL_SHORT_NAME}同学",
                         reason,
                         now_ms() if account_status != user["account_status"] else user["account_status_changed_at"],
                         expires_at,
@@ -4005,8 +4030,8 @@ class ApiHandler(BaseHTTPRequestHandler):
                         required_text(data, "category", 80),
                         json.dumps([str(value)[:40] for value in tags[:20]], ensure_ascii=False),
                         str(data.get("audienceScope", "")).strip()[:200],
-                        str(data.get("publisherLabel", "我的长理资料库")).strip()[:100]
-                        or "我的长理资料库",
+                        str(data.get("publisherLabel", f"{APP_DISPLAY_NAME}资料库")).strip()[:100]
+                        or f"{APP_DISPLAY_NAME}资料库",
                         str(data.get("sourceLabel", "")).strip()[:100],
                         str(data.get("usageNote", "")).strip()[:1000],
                         str(data.get("resourceType", "EXTERNAL_LINK")).strip()[:40]

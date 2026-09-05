@@ -65,7 +65,7 @@ def has_admin() -> int:
 
 def main() -> int:
     server.initialize_database()
-    parser = argparse.ArgumentParser(description="我的长理本地后台账号管理")
+    parser = argparse.ArgumentParser(description="川农本地后台账号管理")
     commands = parser.add_subparsers(dest="command", required=True)
     create = commands.add_parser("create-admin", help="创建管理员")
     create.add_argument("username")
