@@ -71,8 +71,10 @@ def business_day_bounds_ms(day: date | None = None) -> tuple[int, int]:
     """Return the inclusive start/exclusive end of a business day in ms."""
     business_day = day or business_today()
     start = datetime.combine(business_day, datetime.min.time(), tzinfo=BUSINESS_TIMEZONE)
-    end = datetime.combine(business_day, datetime.max.time(), tzinfo=BUSINESS_TIMEZONE)
-    return int(start.timestamp() * 1000), int((end.timestamp() * 1000) + 1)
+    end = datetime.combine(
+        business_day + timedelta(days=1), datetime.min.time(), tzinfo=BUSINESS_TIMEZONE
+    )
+    return int(start.timestamp() * 1000), int(end.timestamp() * 1000)
 
 
 def today_iso() -> str:
