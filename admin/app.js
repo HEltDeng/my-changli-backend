@@ -405,16 +405,23 @@ const renderers = {
       return;
     }
     const data = await api("/api/v1/admin/overview");
+    const todayNewRegistrations = data.todayNewRegistrations ?? data.todayRegistrations ?? 0;
+    const todayFirstUseUsers = data.todayFirstUseUsers ?? data.todayNewUsers ?? 0;
     const groups = [
-      ["账号概况（仅 PHONE 注册账号）", [
-        ["累计注册账号", data.registeredAccounts, "users", {}], ["正常账号", data.activeAccounts, "users", {status:"ACTIVE"}],
-        ["受限账号", data.limitedAccounts, "users", {status:"LIMITED"}], ["已禁用账号", data.disabledAccounts, "users", {status:"DISABLED"}],
-        ["已注销账号", data.deletedAccounts, "users", {status:"DELETED"}], ["今日新增注册", data.todayRegistrations, "users", {createdToday:"true"}],
+      ["用户概况", [
+        ["累计用户量", data.totalUsers, null, {}], ["我的长理注册用户", data.registeredUsers, "users", {accountType:"PHONE"}],
+        ["未注册 / 游客用户", data.guestUsers, null, {}], ["今日新增用户", data.todayNewUsers, null, {}],
+        ["今日新增注册", todayNewRegistrations, "users", {createdToday:"true",accountType:"PHONE"}],
       ]],
       ["活跃情况", [
-        ["最近 5 分钟活跃账号", data.active5m, "users", {activeWindow:"5m"}], ["今日活跃账号（DAU）", data.dau, "users", {activeWindow:"dau"}],
-        ["近 7 日活跃账号（WAU）", data.wau, "users", {activeWindow:"wau"}], ["近 30 日活跃账号（MAU）", data.mau, "users", {activeWindow:"mau"}],
-        ["今日首次登录账号", data.todayFirstLogins, "userEvents", {eventType:"LOGIN_SUCCESS",firstLoginToday:"true"}],
+        ["最近 5 分钟活跃用户", data.active5m, null, {}], ["今日活跃用户（DAU）", data.dau, null, {}],
+        ["近 7 日活跃用户（WAU）", data.wau, null, {}], ["近 30 日活跃用户（MAU）", data.mau, null, {}],
+        ["今日首次使用用户", todayFirstUseUsers, null, {}],
+      ]],
+      ["我的长理账号", [
+        ["累计注册账号", data.registeredAccounts, "users", {}], ["正常账号", data.activeAccounts, "users", {status:"ACTIVE"}],
+        ["受限账号", data.limitedAccounts, "users", {status:"LIMITED"}], ["已禁用账号", data.disabledAccounts, "users", {status:"DISABLED"}],
+        ["已注销账号", data.deletedAccounts, "users", {status:"DELETED"}],
       ]],
       ["设备与安装实例", [
         ["累计独立设备", data.totalDevices, null, {}], ["今日新增设备", data.todayNewDevices, null, {}],
@@ -434,8 +441,14 @@ const renderers = {
         ["近 24 小时新受限 / 禁用账号", data.newLimitedOrDisabled24h, "users", {statusGroup:"restricted24h"}],
       ]],
     ];
+    const overviewNotes = {
+      "用户概况": "累计用户量按 canonical identity 去重；我的长理注册用户仅指本产品 PHONE 自有账号。",
+      "活跃情况": "DAU / WAU / MAU 按 canonical identity 去重，设备和安装实例不重复折算为用户。",
+      "我的长理账号": "这里是账号生命周期与权限治理数据，不代表产品用户规模。",
+      "设备与安装实例": "设备数 ≠ 用户数；安装实例数 ≠ 用户数。",
+    };
     content.innerHTML = `
-      ${groups.map(([title, metrics]) => `<h3 class="section-title">${title}</h3><div class="grid metric-grid">
+      ${groups.map(([title, metrics]) => `<h3 class="section-title">${title}</h3><p class="muted section-note">${overviewNotes[title] || ""}</p><div class="grid metric-grid">
         ${metrics.map(([label, value, page, filter]) => page ? `<button class="card metric metric-link" data-action="metric-nav" data-page="${page}" data-filter="${escapeHtml(JSON.stringify(filter))}"><span>${label}</span><strong>${value}</strong></button>` : `<div class="card metric"><span>${label}</span><strong>${value}</strong></div>`).join("")}
       </div>`).join("")}
       <article class="card section-title">

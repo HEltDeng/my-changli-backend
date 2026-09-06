@@ -100,6 +100,120 @@ OFFICIAL_SIGNING_CERTIFICATE_SHA256 = (
     "2C3B934931C26719C1A55FA707760A41E18BA15B00561F97691FE1D452F4BF3D"
 )
 
+# A canonical product user is either a PHONE account or an otherwise-unlinked
+# app identity.  Trusted devices are stable across installations; legacy
+# DEVICE rows are retained as the best available anonymous identity when the
+# client did not provide a stable device-scoped identifier.
+CANONICAL_IDENTITY_ROWS_SQL = """
+SELECT identity_key, identity_kind, first_seen_at
+  FROM (
+        SELECT 'USER:' || u.id AS identity_key,
+               'USER' AS identity_kind,
+               MIN(
+                   CASE
+                       WHEN ud.first_seen_at IS NULL OR u.created_at <= ud.first_seen_at
+                           THEN u.created_at
+                       ELSE ud.first_seen_at
+                   END
+               ) AS first_seen_at
+          FROM users u
+          LEFT JOIN user_devices ud ON ud.user_id=u.id
+         WHERE u.role='USER' AND u.account_type='PHONE'
+         GROUP BY u.id
+        UNION ALL
+        SELECT 'DEVICE:' || d.id AS identity_key,
+               'DEVICE' AS identity_kind,
+               d.first_seen_at AS first_seen_at
+          FROM devices d
+         WHERE NOT EXISTS (
+                   SELECT 1
+                     FROM user_devices ud
+                     JOIN users u ON u.id=ud.user_id
+                    WHERE ud.device_id=d.id
+                      AND u.role='USER'
+                      AND u.account_type='PHONE'
+               )
+        UNION ALL
+        SELECT 'LEGACY:' || u.id AS identity_key,
+               'LEGACY' AS identity_kind,
+               u.created_at AS first_seen_at
+          FROM users u
+         WHERE u.role='USER'
+           AND u.account_type='DEVICE'
+           AND NOT EXISTS (
+                   SELECT 1 FROM user_devices ud WHERE ud.user_id=u.id
+               )
+           AND NOT EXISTS (
+                   SELECT 1 FROM devices d WHERE u.username='device_' || d.id
+               )
+       )
+"""
+
+# Activity still comes from the retained event stream, but the identity key is
+# resolved through the current device-to-PHONE ownership relation first.  This
+# is what prevents pre-registration DEVICE events and post-registration PHONE
+# events from producing two active users for one person.
+CANONICAL_EVENT_IDENTITIES_SQL = """
+WITH phone_device_owners AS (
+    SELECT device_id, user_id
+      FROM (
+            SELECT ud.device_id,
+                   ud.user_id,
+                   ROW_NUMBER() OVER (
+                       PARTITION BY ud.device_id
+                       ORDER BY ud.last_seen_at DESC,
+                                ud.first_seen_at ASC,
+                                ud.user_id ASC
+                   ) AS owner_rank
+              FROM user_devices ud
+              JOIN users u ON u.id=ud.user_id
+             WHERE u.role='USER' AND u.account_type='PHONE'
+           ) ranked
+     WHERE owner_rank=1
+), event_observations AS (
+    SELECT e.id,
+           e.created_at,
+           e.user_id,
+           u.role,
+           u.account_type,
+           COALESCE(
+               e.device_id,
+               i.device_id,
+               (
+                   SELECT ud.device_id
+                     FROM user_devices ud
+                    WHERE ud.user_id=e.user_id
+                    ORDER BY ud.last_seen_at DESC,
+                             ud.first_seen_at ASC,
+                             ud.device_id ASC
+                    LIMIT 1
+               )
+           ) AS observed_device_id
+      FROM user_behavior_events e
+      LEFT JOIN users u ON u.id=e.user_id
+      LEFT JOIN installations i ON i.installation_id=e.installation_id
+     WHERE e.result='SUCCESS'
+), event_identities AS (
+    SELECT o.id,
+           o.created_at,
+           CASE
+               WHEN o.role='USER' AND o.account_type='PHONE' AND o.user_id IS NOT NULL
+                   THEN 'USER:' || o.user_id
+               WHEN p.user_id IS NOT NULL
+                   THEN 'USER:' || p.user_id
+               WHEN o.observed_device_id IS NOT NULL
+                   THEN 'DEVICE:' || o.observed_device_id
+               WHEN o.role='USER' AND o.account_type='DEVICE' AND o.user_id IS NOT NULL
+                   THEN 'LEGACY:' || o.user_id
+               ELSE NULL
+           END AS identity_key
+      FROM event_observations o
+      LEFT JOIN phone_device_owners p ON p.device_id=o.observed_device_id
+)
+SELECT id, created_at, identity_key
+  FROM event_identities
+"""
+
 
 def ensure_column(
     db: sqlite3.Connection, table: str, column: str, definition: str
@@ -109,6 +223,65 @@ def ensure_column(
     }
     if column not in columns:
         db.execute(f"ALTER TABLE {table} ADD COLUMN {column} {definition}")
+
+
+def canonical_identity_snapshot(
+    db: sqlite3.Connection,
+    day_start: int,
+    day_end: int,
+) -> dict[str, int]:
+    """Return persistent canonical-user cohorts for the dashboard.
+
+    The source of truth is the identity registry (PHONE users plus stable
+    devices), not a count of user rows or retained event rows.  A device that
+    is linked to any PHONE user is represented only by that user; this keeps an
+    anonymous pre-registration session from becoming a second person.
+    """
+    row = db.execute(
+        f"""SELECT
+                   COUNT(DISTINCT identity_key) AS total_users,
+                   COUNT(DISTINCT CASE WHEN identity_kind='USER'
+                                       THEN identity_key END) AS registered_users,
+                   COUNT(DISTINCT CASE WHEN identity_kind IN ('DEVICE','LEGACY')
+                                       THEN identity_key END) AS guest_users,
+                   COUNT(DISTINCT CASE
+                       WHEN first_seen_at>=? AND first_seen_at<?
+                           THEN identity_key END) AS today_new_users,
+                   COUNT(DISTINCT CASE
+                       WHEN identity_kind='USER'
+                        AND first_seen_at>=? AND first_seen_at<?
+                           THEN identity_key END) AS today_new_registrations
+              FROM ({CANONICAL_IDENTITY_ROWS_SQL}) identities""",
+        (day_start, day_end, day_start, day_end),
+    ).fetchone()
+    return {
+        "totalUsers": int(row["total_users"] or 0),
+        "registeredUsers": int(row["registered_users"] or 0),
+        "guestUsers": int(row["guest_users"] or 0),
+        "todayNewUsers": int(row["today_new_users"] or 0),
+        "todayNewRegistrations": int(row["today_new_registrations"] or 0),
+    }
+
+
+def canonical_activity_count(
+    db: sqlite3.Connection,
+    start: int,
+    end: int | None = None,
+) -> int:
+    """Count distinct canonical users represented by successful activity."""
+    clauses = ["identity_key IS NOT NULL", "created_at>=?"]
+    params: list[Any] = [start]
+    if end is not None:
+        clauses.append("created_at<?")
+        params.append(end)
+    return int(
+        db.execute(
+            f"""SELECT COUNT(DISTINCT identity_key) AS count
+                 FROM ({CANONICAL_EVENT_IDENTITIES_SQL}) identities
+                WHERE {" AND ".join(clauses)}""",
+            params,
+        ).fetchone()["count"]
+    )
 
 
 def _user_code_components(created_at: int | None) -> tuple[str, int]:
@@ -1372,6 +1545,26 @@ def migrate_device_data(
         (target_user_id, source_id),
     )
     db.execute("DELETE FROM lost_found_reports WHERE user_id=?", (source_id,))
+    # Preserve the canonical identity's earliest trusted-device timestamp.
+    # Without this transfer, registering after anonymous use would make the
+    # same person appear as a newly-created PHONE user in cohort metrics.
+    db.execute(
+        """INSERT INTO user_devices(user_id,device_id,first_seen_at,last_seen_at)
+           SELECT ?,device_id,first_seen_at,last_seen_at
+             FROM user_devices WHERE user_id=?
+           ON CONFLICT(user_id,device_id) DO UPDATE SET
+               first_seen_at=MIN(user_devices.first_seen_at,excluded.first_seen_at),
+               last_seen_at=MAX(user_devices.last_seen_at,excluded.last_seen_at)""",
+        (target_user_id, source_id),
+    )
+    # Keep user-behavior history attached to the canonical PHONE account.  The
+    # event rows themselves are retained, including their device/install
+    # identity fields, so the migration never creates a second person or drops
+    # the anonymous session from activity history.
+    db.execute(
+        "UPDATE user_behavior_events SET user_id=? WHERE user_id=?",
+        (target_user_id, source_id),
+    )
     db.execute(
         "UPDATE reservation_events SET user_id=? WHERE user_id=?",
         (target_user_id, source_id),
@@ -4760,40 +4953,15 @@ class ApiHandler(BaseHTTPRequestHandler):
                 now = now_ms()
                 def count(sql: str, params: tuple[Any, ...] = ()) -> int:
                     return int(db.execute(sql, params).fetchone()["count"])
-                def canonical_activity_count(start: int, end: int | None = None) -> int:
-                    end_clause = "" if end is None else " AND e.created_at<?"
-                    params: tuple[Any, ...] = (start,) if end is None else (start, end)
-                    return count(
-                        """SELECT COUNT(*) AS count FROM (
-                               SELECT DISTINCT 'USER:' || e.user_id AS identity_key
-                                 FROM user_behavior_events e
-                                 JOIN users u ON u.id=e.user_id
-                                WHERE u.role='USER' AND u.account_type='PHONE'
-                                  AND e.result='SUCCESS' AND e.created_at>=?"""
-                        + end_clause
-                        + """
-                               UNION
-                               SELECT DISTINCT 'DEVICE:' || COALESCE(
-                                   e.device_id,
-                                   (SELECT ud.device_id FROM user_devices ud
-                                     WHERE ud.user_id=e.user_id
-                                     ORDER BY ud.last_seen_at DESC LIMIT 1)
-                               ) AS identity_key
-                                 FROM user_behavior_events e
-                                 JOIN users u ON u.id=e.user_id
-                                WHERE u.role='USER' AND u.account_type='DEVICE'
-                                  AND COALESCE(
-                                      e.device_id,
-                                      (SELECT ud.device_id FROM user_devices ud
-                                        WHERE ud.user_id=e.user_id
-                                        ORDER BY ud.last_seen_at DESC LIMIT 1)
-                                  ) IS NOT NULL
-                                  AND e.result='SUCCESS' AND e.created_at>=?"""
-                        + end_clause
-                        + ")""",
-                        params + params,
-                    )
+                identity_metrics = canonical_identity_snapshot(db, day_start, day_end)
                 return {
+                    # New user-level metrics.  These are intentionally kept
+                    # separate from the account-governance counters below.
+                    **identity_metrics,
+                    "todayFirstUseUsers": identity_metrics["todayNewUsers"],
+                    # Existing names remain in the response for old admin
+                    # assets and integrations; their values now use canonical
+                    # identities rather than account rows.
                     "registeredAccounts": count("SELECT COUNT(*) AS count FROM users WHERE role='USER' AND account_type='PHONE'"),
                     "activeAccounts": count("SELECT COUNT(*) AS count FROM users WHERE role='USER' AND account_type='PHONE' AND account_status='ACTIVE'"),
                     "limitedAccounts": count("SELECT COUNT(*) AS count FROM users WHERE role='USER' AND account_type='PHONE' AND account_status IN ('LIMITED','SUSPENDED')"),
@@ -4801,10 +4969,10 @@ class ApiHandler(BaseHTTPRequestHandler):
                     "pendingDeletionAccounts": count("SELECT COUNT(*) AS count FROM users WHERE role='USER' AND account_type='PHONE' AND account_status='PENDING_DELETION'"),
                     "deletedAccounts": count("SELECT COUNT(*) AS count FROM users WHERE role='USER' AND account_type='PHONE' AND account_status='DELETED'"),
                     "todayRegistrations": count("SELECT COUNT(*) AS count FROM users WHERE role='USER' AND account_type='PHONE' AND created_at>=? AND created_at<?", (day_start, day_end)),
-                    "active5m": canonical_activity_count(now - 5 * 60 * 1000),
-                    "dau": canonical_activity_count(day_start, day_end),
-                    "wau": canonical_activity_count(now - 7 * 86400000),
-                    "mau": canonical_activity_count(now - 30 * 86400000),
+                    "active5m": canonical_activity_count(db, now - 5 * 60 * 1000),
+                    "dau": canonical_activity_count(db, day_start, day_end),
+                    "wau": canonical_activity_count(db, now - 7 * 86400000),
+                    "mau": canonical_activity_count(db, now - 30 * 86400000),
                     "todayFirstLogins": count(
                         """SELECT COUNT(DISTINCT e.user_id) AS count
                            FROM user_behavior_events e

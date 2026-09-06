@@ -160,6 +160,141 @@ class ApiTest(unittest.TestCase):
                 db.execute("SELECT COUNT(*) AS count FROM devices").fetchone()["count"],
             )
 
+    def test_z_dashboard_canonical_user_device_installation_metrics(self):
+        admin = self.admin_token()
+
+        def overview():
+            status, response = self.call("GET", "/api/v1/admin/overview", token=admin)
+            self.assertEqual(200, status)
+            return response["data"]
+
+        # A first anonymous app use creates one canonical user, one trusted
+        # device and one installation, but no PHONE account.
+        scoped_id = secrets.token_hex(32)
+        first_installation = "metrics-first-" + secrets.token_hex(8)
+        first_payload = {
+            "installationId": first_installation,
+            "deviceScopedId": scoped_id,
+            "versionName": "1.0.3",
+            "versionCode": 35,
+        }
+        before = overview()
+        first_status, first = self.call("POST", "/api/v1/auth/device", first_payload)
+        self.assertEqual(200, first_status)
+        anonymous_user_id = first["data"]["user"]["id"]
+        after_first = overview()
+        self.assertEqual(before["totalUsers"] + 1, after_first["totalUsers"])
+        self.assertEqual(before["registeredUsers"], after_first["registeredUsers"])
+        self.assertEqual(before["guestUsers"] + 1, after_first["guestUsers"])
+        self.assertEqual(before["todayNewUsers"] + 1, after_first["todayNewUsers"])
+        self.assertEqual(before["todayNewRegistrations"], after_first["todayNewRegistrations"])
+        self.assertEqual(before["totalDevices"] + 1, after_first["totalDevices"])
+        self.assertEqual(before["todayNewDevices"] + 1, after_first["todayNewDevices"])
+        self.assertEqual(before["totalInstallations"] + 1, after_first["totalInstallations"])
+        self.assertEqual(before["todayNewInstallations"] + 1, after_first["todayNewInstallations"])
+
+        # Replaying the same installation must not create another user,
+        # device, installation or active-user identity.
+        repeated_status, repeated = self.call("POST", "/api/v1/auth/device", first_payload)
+        self.assertEqual(200, repeated_status)
+        self.assertEqual(anonymous_user_id, repeated["data"]["user"]["id"])
+        after_repeat = overview()
+        self.assertEqual(after_first, after_repeat)
+
+        # Clearing app data creates a new installation, while the stable
+        # device-scoped identity remains one device and one anonymous user.
+        reinstall_payload = {
+            **first_payload,
+            "installationId": "metrics-reinstall-" + secrets.token_hex(8),
+        }
+        reinstall_status, reinstall = self.call("POST", "/api/v1/auth/device", reinstall_payload)
+        self.assertEqual(200, reinstall_status)
+        self.assertEqual(anonymous_user_id, reinstall["data"]["user"]["id"])
+        after_reinstall = overview()
+        self.assertEqual(after_repeat["totalUsers"], after_reinstall["totalUsers"])
+        self.assertEqual(after_repeat["guestUsers"], after_reinstall["guestUsers"])
+        self.assertEqual(after_repeat["totalDevices"], after_reinstall["totalDevices"])
+        self.assertEqual(after_repeat["totalInstallations"] + 1, after_reinstall["totalInstallations"])
+        self.assertEqual(after_repeat["todayNewInstallations"] + 1, after_reinstall["todayNewInstallations"])
+        self.assertEqual(after_repeat["reinstallations"] + 1, after_reinstall["reinstallations"])
+        self.assertEqual(after_repeat["todayNewUsers"], after_reinstall["todayNewUsers"])
+
+        # Registering the anonymous identity merges it into one PHONE user;
+        # the canonical user total stays flat while the guest cohort drops.
+        phone = "19" + "".join(str(secrets.randbelow(10)) for _ in range(9))
+        password = secrets.token_urlsafe(18)
+        before_register = overview()
+        register_status, register = self.call(
+            "POST",
+            "/api/v1/auth/register",
+            {
+                "phone": phone,
+                "password": password,
+                "nickname": "身份统计测试",
+                "installationId": reinstall_payload["installationId"],
+                "deviceScopedId": scoped_id,
+            },
+        )
+        self.assertEqual(201, register_status)
+        registered_user_id = register["data"]["user"]["id"]
+        self.assertNotEqual(anonymous_user_id, registered_user_id)
+        after_register = overview()
+        self.assertEqual(before_register["totalUsers"], after_register["totalUsers"])
+        self.assertEqual(before_register["registeredUsers"] + 1, after_register["registeredUsers"])
+        self.assertEqual(before_register["guestUsers"] - 1, after_register["guestUsers"])
+        self.assertEqual(before_register["totalDevices"], after_register["totalDevices"])
+        self.assertEqual(before_register["totalInstallations"], after_register["totalInstallations"])
+        self.assertEqual(before_register["todayNewUsers"], after_register["todayNewUsers"])
+        self.assertEqual(before_register["todayNewRegistrations"] + 1, after_register["todayNewRegistrations"])
+
+        # The same PHONE user signing in from a second device adds one device
+        # and one installation, but no user, guest or DAU identity.
+        second_device_payload = {
+            "phone": phone,
+            "password": password,
+            "installationId": "metrics-second-device-" + secrets.token_hex(8),
+            "deviceScopedId": secrets.token_hex(32),
+            "versionName": "1.0.3",
+            "versionCode": 35,
+        }
+        before_second_device = overview()
+        second_status, second = self.call("POST", "/api/v1/auth/login", second_device_payload)
+        self.assertEqual(200, second_status)
+        self.assertEqual(registered_user_id, second["data"]["user"]["id"])
+        after_second_device = overview()
+        self.assertEqual(before_second_device["totalUsers"], after_second_device["totalUsers"])
+        self.assertEqual(before_second_device["registeredUsers"], after_second_device["registeredUsers"])
+        self.assertEqual(before_second_device["guestUsers"], after_second_device["guestUsers"])
+        self.assertEqual(before_second_device["dau"], after_second_device["dau"])
+        self.assertEqual(before_second_device["active5m"], after_second_device["active5m"])
+        self.assertEqual(before_second_device["totalDevices"] + 1, after_second_device["totalDevices"])
+        self.assertEqual(before_second_device["totalInstallations"] + 1, after_second_device["totalInstallations"])
+        self.assertEqual(before_second_device["todayNewUsers"], after_second_device["todayNewUsers"])
+
+        # A different direct PHONE registration is a new canonical user and a
+        # new self-account, without inventing a device or installation row.
+        before_second_registration = overview()
+        other_phone = "19" + "".join(str(secrets.randbelow(10)) for _ in range(9))
+        other_status, other = self.call(
+            "POST",
+            "/api/v1/auth/register",
+            {
+                "phone": other_phone,
+                "password": secrets.token_urlsafe(18),
+                "nickname": "另一名身份测试用户",
+            },
+        )
+        self.assertEqual(201, other_status)
+        self.assertNotEqual(registered_user_id, other["data"]["user"]["id"])
+        after_second_registration = overview()
+        self.assertEqual(before_second_registration["totalUsers"] + 1, after_second_registration["totalUsers"])
+        self.assertEqual(before_second_registration["registeredUsers"] + 1, after_second_registration["registeredUsers"])
+        self.assertEqual(before_second_registration["guestUsers"], after_second_registration["guestUsers"])
+        self.assertEqual(before_second_registration["totalDevices"], after_second_registration["totalDevices"])
+        self.assertEqual(before_second_registration["totalInstallations"], after_second_registration["totalInstallations"])
+        self.assertEqual(before_second_registration["todayNewUsers"] + 1, after_second_registration["todayNewUsers"])
+        self.assertEqual(before_second_registration["todayNewRegistrations"] + 1, after_second_registration["todayNewRegistrations"])
+
     def test_user_codes_are_readable_searchable_and_concurrent(self):
         _, _, _, user = self.phone_account()
         self.assertRegex(user["userCode"], r"^\d{17}$")
@@ -2134,6 +2269,13 @@ class ApiTest(unittest.TestCase):
             self.assertIn("网站公告", javascript)
             self.assertIn("website-announcements", javascript)
             self.assertNotIn("本地运行说明", javascript)
+            self.assertIn("用户概况", javascript)
+            self.assertIn("累计用户量", javascript)
+            self.assertIn("我的长理注册用户", javascript)
+            self.assertIn("未注册 / 游客用户", javascript)
+            self.assertIn("今日首次使用用户", javascript)
+            self.assertIn("设备数 ≠ 用户数", javascript)
+            self.assertNotIn("账号概况（仅 PHONE 注册账号）", javascript)
 
     def test_platform_metrics_user_events_status_and_risk_are_separated(self):
         phone, password, user_token, user = self.phone_account()
@@ -2243,6 +2385,19 @@ class EmptyDailyLoginContractTest(unittest.TestCase):
     def test_zero_users_produce_zero_dashboard_and_first_login_detail(self):
         status, overview = self.call("GET", "/api/v1/admin/overview", self.admin_token)
         self.assertEqual(200, status)
+        for metric in (
+            "totalUsers",
+            "registeredUsers",
+            "guestUsers",
+            "todayNewUsers",
+            "todayNewRegistrations",
+            "todayFirstUseUsers",
+            "active5m",
+            "dau",
+            "wau",
+            "mau",
+        ):
+            self.assertEqual(0, overview["data"][metric])
         self.assertEqual(0, overview["data"]["todayFirstLogins"])
 
         status, details = self.call(
