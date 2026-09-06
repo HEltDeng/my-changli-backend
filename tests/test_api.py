@@ -219,6 +219,29 @@ class ApiTest(unittest.TestCase):
         self.assertEqual(after_repeat["reinstallations"] + 1, after_reinstall["reinstallations"])
         self.assertEqual(after_repeat["todayNewUsers"], after_reinstall["todayNewUsers"])
 
+        # Simulate an anonymous user whose first app use was yesterday.  Its
+        # registration today must count as a new PHONE registration while the
+        # canonical user cohort remains an existing user.
+        yesterday = server.now_ms() - 2 * 24 * 60 * 60 * 1000
+        with server.connection() as db:
+            source_device = db.execute(
+                "SELECT device_id FROM user_devices WHERE user_id=? LIMIT 1",
+                (anonymous_user_id,),
+            ).fetchone()["device_id"]
+            db.execute(
+                "UPDATE users SET created_at=? WHERE id=?",
+                (yesterday, anonymous_user_id),
+            )
+            db.execute(
+                "UPDATE user_devices SET first_seen_at=? WHERE user_id=?",
+                (yesterday, anonymous_user_id),
+            )
+            db.execute(
+                "UPDATE devices SET first_seen_at=? WHERE id=?",
+                (yesterday, source_device),
+            )
+            db.commit()
+
         # Registering the anonymous identity merges it into one PHONE user;
         # the canonical user total stays flat while the guest cohort drops.
         phone = "19" + "".join(str(secrets.randbelow(10)) for _ in range(9))

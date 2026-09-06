@@ -246,20 +246,27 @@ def canonical_identity_snapshot(
                                        THEN identity_key END) AS guest_users,
                    COUNT(DISTINCT CASE
                        WHEN first_seen_at>=? AND first_seen_at<?
-                           THEN identity_key END) AS today_new_users,
-                   COUNT(DISTINCT CASE
-                       WHEN identity_kind='USER'
-                        AND first_seen_at>=? AND first_seen_at<?
-                           THEN identity_key END) AS today_new_registrations
+                           THEN identity_key END) AS today_new_users
               FROM ({CANONICAL_IDENTITY_ROWS_SQL}) identities""",
-        (day_start, day_end, day_start, day_end),
+        (day_start, day_end),
+    ).fetchone()
+    registration_row = db.execute(
+        """SELECT COUNT(DISTINCT id) AS today_new_registrations
+             FROM users
+            WHERE role='USER'
+              AND account_type='PHONE'
+              AND created_at>=?
+              AND created_at<?""",
+        (day_start, day_end),
     ).fetchone()
     return {
         "totalUsers": int(row["total_users"] or 0),
         "registeredUsers": int(row["registered_users"] or 0),
         "guestUsers": int(row["guest_users"] or 0),
         "todayNewUsers": int(row["today_new_users"] or 0),
-        "todayNewRegistrations": int(row["today_new_registrations"] or 0),
+        "todayNewRegistrations": int(
+            registration_row["today_new_registrations"] or 0
+        ),
     }
 
 
