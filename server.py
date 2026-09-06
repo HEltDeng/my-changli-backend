@@ -105,7 +105,7 @@ OFFICIAL_SIGNING_CERTIFICATE_SHA256 = (
 # DEVICE rows are retained as the best available anonymous identity when the
 # client did not provide a stable device-scoped identifier.
 CANONICAL_IDENTITY_ROWS_SQL = """
-SELECT identity_key, identity_kind, first_seen_at
+SELECT identity_key, identity_kind, first_seen_at, user_id, device_id
   FROM (
         SELECT 'USER:' || u.id AS identity_key,
                'USER' AS identity_kind,
@@ -115,7 +115,9 @@ SELECT identity_key, identity_kind, first_seen_at
                            THEN u.created_at
                        ELSE ud.first_seen_at
                    END
-               ) AS first_seen_at
+               ) AS first_seen_at,
+               u.id AS user_id,
+               NULL AS device_id
           FROM users u
           LEFT JOIN user_devices ud ON ud.user_id=u.id
          WHERE u.role='USER' AND u.account_type='PHONE'
@@ -123,7 +125,9 @@ SELECT identity_key, identity_kind, first_seen_at
         UNION ALL
         SELECT 'DEVICE:' || d.id AS identity_key,
                'DEVICE' AS identity_kind,
-               d.first_seen_at AS first_seen_at
+               d.first_seen_at AS first_seen_at,
+               NULL AS user_id,
+               d.id AS device_id
           FROM devices d
          WHERE NOT EXISTS (
                    SELECT 1
@@ -136,7 +140,9 @@ SELECT identity_key, identity_kind, first_seen_at
         UNION ALL
         SELECT 'LEGACY:' || u.id AS identity_key,
                'LEGACY' AS identity_kind,
-               u.created_at AS first_seen_at
+               u.created_at AS first_seen_at,
+               u.id AS user_id,
+               NULL AS device_id
           FROM users u
          WHERE u.role='USER'
            AND u.account_type='DEVICE'
@@ -287,6 +293,294 @@ def canonical_activity_count(
                  FROM ({CANONICAL_EVENT_IDENTITIES_SQL}) identities
                 WHERE {" AND ".join(clauses)}""",
             params,
+        ).fetchone()["count"]
+    )
+
+
+def _short_business_code(prefix: str, value: str) -> str:
+    """Return a stable support-facing code without exposing an internal identifier."""
+    digest = hashlib.sha256(value.encode("utf-8")).hexdigest()[:10].upper()
+    return f"{prefix}-{digest}"
+
+
+def _canonical_identity_conditions(
+    query: dict[str, str], day_start: int, day_end: int, current: int
+) -> tuple[list[str], list[Any]]:
+    clauses: list[str] = []
+    values: list[Any] = []
+    cohort = str(query.get("cohort", "all")).strip().lower()
+    if cohort not in {"all", "registered", "guest"}:
+        raise ApiError(422, "VALIDATION_ERROR", "用户范围筛选无效")
+    if cohort == "registered":
+        clauses.append("identities.identity_kind='USER'")
+    elif cohort == "guest":
+        clauses.append("identities.identity_kind IN ('DEVICE','LEGACY')")
+
+    if str(query.get("firstSeen", "")).strip().lower() == "today":
+        clauses.extend(["identities.first_seen_at>=?", "identities.first_seen_at<?"])
+        values.extend([day_start, day_end])
+
+    activity = str(query.get("activity", "")).strip().lower()
+    starts = {
+        "5m": current - 5 * 60 * 1000,
+        "today": day_start,
+        "7d": current - 7 * 86400000,
+        "30d": current - 30 * 86400000,
+    }
+    if activity:
+        if activity not in starts:
+            raise ApiError(422, "VALIDATION_ERROR", "活跃时间筛选无效")
+        clauses.append("activity.last_active_at>=?")
+        values.append(starts[activity])
+        if activity == "today":
+            clauses.append("activity.last_active_at<?")
+            values.append(day_end)
+    return clauses, values
+
+
+def canonical_identity_listing(
+    db: sqlite3.Connection, query: dict[str, str]
+) -> dict[str, Any]:
+    """List the same canonical identities used by dashboard user metrics."""
+    day_start, day_end = business_day_bounds_ms()
+    current = int(query["asOf"]) if str(query.get("asOf", "")).isdigit() else now_ms()
+    clauses, values = _canonical_identity_conditions(
+        query, day_start, day_end, current
+    )
+    where_sql = " AND ".join(clauses) if clauses else "1=1"
+    cte = f"""
+        WITH identities AS ({CANONICAL_IDENTITY_ROWS_SQL}),
+             activity AS (
+                 SELECT identity_key,MIN(created_at) AS first_active_at,
+                        MAX(created_at) AS last_active_at
+                   FROM ({CANONICAL_EVENT_IDENTITIES_SQL}) events
+                  WHERE identity_key IS NOT NULL
+                  GROUP BY identity_key
+             )
+    """
+    total = int(
+        db.execute(
+            cte
+            + f"""SELECT COUNT(*) AS count
+                    FROM identities
+                    LEFT JOIN activity ON activity.identity_key=identities.identity_key
+                   WHERE {where_sql}""",
+            values,
+        ).fetchone()["count"]
+    )
+    limit, offset = parse_pagination(query, default_limit=100, max_limit=200)
+    rows = db.execute(
+        cte
+        + f"""SELECT identities.identity_key,identities.identity_kind,
+                      identities.first_seen_at,identities.user_id,identities.device_id,
+                      u.user_code,u.nickname,u.phone_masked,u.account_status,
+                      COALESCE(activity.last_active_at,u.last_active_at,d.last_seen_at,
+                               identities.first_seen_at) AS last_active_at,
+                      CASE WHEN identities.identity_kind='USER' THEN
+                           (SELECT COUNT(DISTINCT ud.device_id) FROM user_devices ud
+                             WHERE ud.user_id=identities.user_id)
+                           WHEN identities.identity_kind='DEVICE' THEN 1 ELSE 0 END
+                           AS device_count,
+                      CASE WHEN identities.identity_kind='USER' THEN
+                           (SELECT COUNT(DISTINCT i.installation_id)
+                              FROM user_devices ud JOIN installations i ON i.device_id=ud.device_id
+                             WHERE ud.user_id=identities.user_id)
+                           WHEN identities.identity_kind='DEVICE' THEN
+                           (SELECT COUNT(*) FROM installations i
+                             WHERE i.device_id=identities.device_id)
+                           ELSE 0 END AS installation_count
+                 FROM identities
+                 LEFT JOIN activity ON activity.identity_key=identities.identity_key
+                 LEFT JOIN users u ON u.id=identities.user_id
+                 LEFT JOIN devices d ON d.id=identities.device_id
+                WHERE {where_sql}
+                ORDER BY identities.first_seen_at DESC,identities.identity_key ASC
+                LIMIT ? OFFSET ?""",
+        [*values, limit, offset],
+    ).fetchall()
+    items = []
+    for row in rows:
+        internal = str(row["user_id"] or row["device_id"] or row["identity_key"])
+        registered = row["identity_kind"] == "USER"
+        items.append(
+            {
+                "identityCode": row["user_code"]
+                if registered and row["user_code"]
+                else _short_business_code("GUEST", internal),
+                "identityType": "REGISTERED" if registered else "GUEST",
+                "displayName": row["nickname"] if registered else "未注册用户",
+                "phoneMasked": row["phone_masked"] if registered else None,
+                "firstSeenAt": row["first_seen_at"],
+                "lastActiveAt": row["last_active_at"],
+                "deviceCount": int(row["device_count"] or 0),
+                "installationCount": int(row["installation_count"] or 0),
+                "status": row["account_status"] if registered else "ANONYMOUS",
+            }
+        )
+    return paginated_response(items, total, limit, offset)
+
+
+def _device_conditions(
+    query: dict[str, str], day_start: int, day_end: int, current: int
+) -> tuple[list[str], list[Any]]:
+    clauses: list[str] = []
+    values: list[Any] = []
+    window = str(query.get("window", "all")).strip().lower()
+    if window not in {"all", "today", "5m", "7d", "30d"}:
+        raise ApiError(422, "VALIDATION_ERROR", "设备时间筛选无效")
+    if window == "today":
+        clauses.extend(["d.created_at>=?", "d.created_at<?"])
+        values.extend([day_start, day_end])
+    elif window != "all":
+        starts = {
+            "5m": current - 5 * 60 * 1000,
+            "7d": current - 7 * 86400000,
+            "30d": current - 30 * 86400000,
+        }
+        clauses.append("d.last_seen_at>=?")
+        values.append(starts[window])
+    return clauses, values
+
+
+def device_listing(db: sqlite3.Connection, query: dict[str, str]) -> dict[str, Any]:
+    day_start, day_end = business_day_bounds_ms()
+    current = int(query["asOf"]) if str(query.get("asOf", "")).isdigit() else now_ms()
+    clauses, values = _device_conditions(query, day_start, day_end, current)
+    where_sql = " AND ".join(clauses) if clauses else "1=1"
+    total = int(
+        db.execute(
+            f"SELECT COUNT(*) AS count FROM devices d WHERE {where_sql}", values
+        ).fetchone()["count"]
+    )
+    limit, offset = parse_pagination(query, default_limit=100, max_limit=200)
+    rows = db.execute(
+        f"""SELECT d.id,d.first_seen_at,d.last_seen_at,
+                   d.first_app_version_name,d.first_app_version_code,
+                   d.last_app_version_name,d.last_app_version_code,
+                   (SELECT COUNT(*) FROM installations i WHERE i.device_id=d.id)
+                       AS installation_count,
+                   EXISTS(SELECT 1 FROM user_devices ud JOIN users u ON u.id=ud.user_id
+                           WHERE ud.device_id=d.id AND u.role='USER'
+                             AND u.account_type='PHONE') AS linked_registered_user
+              FROM devices d WHERE {where_sql}
+             ORDER BY d.first_seen_at DESC,d.id ASC LIMIT ? OFFSET ?""",
+        [*values, limit, offset],
+    ).fetchall()
+    return paginated_response(
+        [
+            {
+                "deviceCode": _short_business_code("DEVICE", str(row["id"])),
+                "firstSeenAt": row["first_seen_at"],
+                "lastSeenAt": row["last_seen_at"],
+                "firstVersionName": row["first_app_version_name"],
+                "firstVersionCode": row["first_app_version_code"],
+                "lastVersionName": row["last_app_version_name"],
+                "lastVersionCode": row["last_app_version_code"],
+                "installationCount": int(row["installation_count"] or 0),
+                "linkedRegisteredUser": bool(row["linked_registered_user"]),
+            }
+            for row in rows
+        ],
+        total,
+        limit,
+        offset,
+    )
+
+
+def device_count(db: sqlite3.Connection, query: dict[str, str]) -> int:
+    day_start, day_end = business_day_bounds_ms()
+    current = int(query["asOf"]) if str(query.get("asOf", "")).isdigit() else now_ms()
+    clauses, values = _device_conditions(query, day_start, day_end, current)
+    where_sql = " AND ".join(clauses) if clauses else "1=1"
+    return int(
+        db.execute(
+            f"SELECT COUNT(*) AS count FROM devices d WHERE {where_sql}", values
+        ).fetchone()["count"]
+    )
+
+
+def _installation_conditions(
+    query: dict[str, str], day_start: int, day_end: int
+) -> tuple[list[str], list[Any]]:
+    clauses: list[str] = []
+    values: list[Any] = []
+    window = str(query.get("window", "all")).strip().lower()
+    if window not in {"all", "today"}:
+        raise ApiError(422, "VALIDATION_ERROR", "安装时间筛选无效")
+    if window == "today":
+        clauses.extend(["ranked.created_at>=?", "ranked.created_at<?"])
+        values.extend([day_start, day_end])
+    if str(query.get("reinstallation", "")).strip().lower() == "true":
+        clauses.append("ranked.device_id IS NOT NULL AND ranked.install_rank>1")
+    return clauses, values
+
+
+INSTALLATION_RANKED_CTE = """
+    WITH ranked AS (
+        SELECT i.*,
+               CASE WHEN i.device_id IS NULL THEN 1 ELSE
+                    ROW_NUMBER() OVER (
+                        PARTITION BY i.device_id
+                        ORDER BY i.first_seen_at ASC,i.installation_id ASC
+                    ) END AS install_rank
+          FROM installations i
+    )
+"""
+
+
+def installation_listing(
+    db: sqlite3.Connection, query: dict[str, str]
+) -> dict[str, Any]:
+    day_start, day_end = business_day_bounds_ms()
+    clauses, values = _installation_conditions(query, day_start, day_end)
+    where_sql = " AND ".join(clauses) if clauses else "1=1"
+    total = int(
+        db.execute(
+            INSTALLATION_RANKED_CTE
+            + f"SELECT COUNT(*) AS count FROM ranked WHERE {where_sql}",
+            values,
+        ).fetchone()["count"]
+    )
+    limit, offset = parse_pagination(query, default_limit=100, max_limit=200)
+    rows = db.execute(
+        INSTALLATION_RANKED_CTE
+        + f"""SELECT ranked.* FROM ranked WHERE {where_sql}
+                ORDER BY ranked.first_seen_at DESC,ranked.installation_id ASC
+                LIMIT ? OFFSET ?""",
+        [*values, limit, offset],
+    ).fetchall()
+    return paginated_response(
+        [
+            {
+                "installationCode": _short_business_code(
+                    "INSTALL", str(row["installation_id"])
+                ),
+                "deviceCode": _short_business_code("DEVICE", str(row["device_id"]))
+                if row["device_id"]
+                else "LEGACY",
+                "firstSeenAt": row["first_seen_at"],
+                "lastActiveAt": row["last_seen_at"],
+                "versionName": row["last_app_version_name"],
+                "versionCode": row["last_app_version_code"],
+                "isReinstallation": bool(row["device_id"] and row["install_rank"] > 1),
+            }
+            for row in rows
+        ],
+        total,
+        limit,
+        offset,
+    )
+
+
+def installation_count(db: sqlite3.Connection, query: dict[str, str]) -> int:
+    day_start, day_end = business_day_bounds_ms()
+    clauses, values = _installation_conditions(query, day_start, day_end)
+    where_sql = " AND ".join(clauses) if clauses else "1=1"
+    return int(
+        db.execute(
+            INSTALLATION_RANKED_CTE
+            + f"SELECT COUNT(*) AS count FROM ranked WHERE {where_sql}",
+            values,
         ).fetchone()["count"]
     )
 
@@ -4096,6 +4390,15 @@ class ApiHandler(BaseHTTPRequestHandler):
                     for row in db.execute("SELECT * FROM users WHERE role='ADMIN' ORDER BY created_at")
                 ], 200
 
+            if method == "GET" and path == "/api/v1/admin/canonical-users":
+                return canonical_identity_listing(db, query), 200
+
+            if method == "GET" and path == "/api/v1/admin/devices":
+                return device_listing(db, query), 200
+
+            if method == "GET" and path == "/api/v1/admin/installations":
+                return installation_listing(db, query), 200
+
             if method == "POST" and path == "/api/v1/admin/admins":
                 data = self.body_json()
                 username = required_text(data, "username", 48)
@@ -4233,16 +4536,18 @@ class ApiHandler(BaseHTTPRequestHandler):
                 if created_since.isdigit():
                     clauses.append("u.created_at>=?")
                     values.append(int(created_since))
+                if query.get("createdToday", "").lower() == "true":
+                    created_day_start, created_day_end = business_day_bounds_ms()
+                    clauses.extend(["u.created_at>=?", "u.created_at<?"])
+                    values.extend([created_day_start, created_day_end])
                 changed_since = str(query.get("statusChangedSince", "")).strip()
                 if changed_since.isdigit():
                     clauses.append("u.account_status_changed_at>=?")
                     values.append(int(changed_since))
                 if query.get("anomaly", "").lower() == "true":
                     clauses.append("EXISTS (SELECT 1 FROM risk_candidates rc WHERE rc.user_id=u.id AND rc.status IN ('OPEN','WATCHING'))")
-                return [
-                    full_admin_user_row(row)
-                    for row in db.execute(
-                        """SELECT u.id,u.user_code,u.account_type,u.nickname,u.phone_masked,u.phone_encrypted,
+                where_sql = " AND ".join(clauses)
+                select_sql = """SELECT u.id,u.user_code,u.account_type,u.nickname,u.phone_masked,u.phone_encrypted,
                                   u.reservation_student_id,u.reservation_name,
                                   u.reservation_profile_consented_at,
                                   u.account_status,u.account_status_reason,
@@ -4263,12 +4568,27 @@ class ApiHandler(BaseHTTPRequestHandler):
                                   ur.reason AS restriction_reason
                            FROM users u
                            LEFT JOIN user_restrictions ur ON ur.user_id=u.id
-                           WHERE """
-                        + " AND ".join(clauses)
-                        + " ORDER BY u.created_at DESC LIMIT 500",
-                        values,
+                           WHERE """ + where_sql
+                paged = query.get("paged", "").lower() == "true"
+                limit, offset = parse_pagination(
+                    query, default_limit=100 if paged else 500, max_limit=500
+                )
+                rows = [
+                    full_admin_user_row(row)
+                    for row in db.execute(
+                        select_sql + " ORDER BY u.created_at DESC LIMIT ? OFFSET ?",
+                        [*values, limit, offset],
                     )
-                ], 200
+                ]
+                if not paged:
+                    return rows, 200
+                total = int(
+                    db.execute(
+                        "SELECT COUNT(*) AS count FROM users u WHERE " + where_sql,
+                        values,
+                    ).fetchone()["count"]
+                )
+                return paginated_response(rows, total, limit, offset), 200
 
             match = re.fullmatch(r"/api/v1/admin/users/([^/]+)/details", path)
             if method == "GET" and match:
@@ -4962,6 +5282,7 @@ class ApiHandler(BaseHTTPRequestHandler):
                     return int(db.execute(sql, params).fetchone()["count"])
                 identity_metrics = canonical_identity_snapshot(db, day_start, day_end)
                 return {
+                    "asOf": now,
                     # New user-level metrics.  These are intentionally kept
                     # separate from the account-governance counters below.
                     **identity_metrics,
@@ -4990,14 +5311,14 @@ class ApiHandler(BaseHTTPRequestHandler):
                              AND e.created_at>=? AND e.created_at<?""",
                         (day_start, day_end),
                     ),
-                    "totalDevices": count("SELECT COUNT(*) AS count FROM devices"),
-                    "todayNewDevices": count("SELECT COUNT(*) AS count FROM devices WHERE created_at>=? AND created_at<?", (day_start, day_end)),
-                    "activeDevices": count("SELECT COUNT(*) AS count FROM devices WHERE last_seen_at>=?", (now - 5 * 60 * 1000,)),
-                    "activeDevices7d": count("SELECT COUNT(*) AS count FROM devices WHERE last_seen_at>=?", (now - 7 * 86400000,)),
-                    "activeDevices30d": count("SELECT COUNT(*) AS count FROM devices WHERE last_seen_at>=?", (now - 30 * 86400000,)),
-                    "totalInstallations": count("SELECT COUNT(*) AS count FROM installations"),
-                    "todayNewInstallations": count("SELECT COUNT(*) AS count FROM installations WHERE created_at>=? AND created_at<?", (day_start, day_end)),
-                    "reinstallations": count("SELECT COALESCE(SUM(CASE WHEN install_count>1 THEN install_count-1 ELSE 0 END),0) AS count FROM devices"),
+                    "totalDevices": device_count(db, {"window": "all", "asOf": str(now)}),
+                    "todayNewDevices": device_count(db, {"window": "today", "asOf": str(now)}),
+                    "activeDevices": device_count(db, {"window": "5m", "asOf": str(now)}),
+                    "activeDevices7d": device_count(db, {"window": "7d", "asOf": str(now)}),
+                    "activeDevices30d": device_count(db, {"window": "30d", "asOf": str(now)}),
+                    "totalInstallations": installation_count(db, {"window": "all"}),
+                    "todayNewInstallations": installation_count(db, {"window": "today"}),
+                    "reinstallations": installation_count(db, {"reinstallation": "true"}),
                     "activeReservations": count("SELECT COUNT(*) AS count FROM reservations WHERE status='ACTIVE'"),
                     "todayReservations": count("SELECT COUNT(*) AS count FROM reservations WHERE booking_date=? AND status='ACTIVE'", (today,)),
                     "todayCancelledReservations": count("SELECT COUNT(*) AS count FROM reservations WHERE status='CANCELLED' AND cancelled_at>=?", (day_start,)),

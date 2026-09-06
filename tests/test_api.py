@@ -199,7 +199,10 @@ class ApiTest(unittest.TestCase):
         self.assertEqual(200, repeated_status)
         self.assertEqual(anonymous_user_id, repeated["data"]["user"]["id"])
         after_repeat = overview()
-        self.assertEqual(after_first, after_repeat)
+        self.assertEqual(
+            {key: value for key, value in after_first.items() if key != "asOf"},
+            {key: value for key, value in after_repeat.items() if key != "asOf"},
+        )
 
         # Clearing app data creates a new installation, while the stable
         # device-scoped identity remains one device and one anonymous user.
@@ -827,6 +830,15 @@ class ApiTest(unittest.TestCase):
                         token=operator_token,
                     )[0],
                 )
+                for protected_detail in (
+                    "/api/v1/admin/canonical-users",
+                    "/api/v1/admin/devices",
+                    "/api/v1/admin/installations",
+                ):
+                    self.assertEqual(
+                        403,
+                        self.call("GET", protected_detail, token=operator_token)[0],
+                    )
             self.assertEqual(403, self.call("GET", forbidden, token=operator_token)[0])
             self.assertEqual(403, self.call("GET", "/api/v1/admin/admins", token=operator_token)[0])
             self.assertEqual(200, self.call(
@@ -2297,8 +2309,112 @@ class ApiTest(unittest.TestCase):
             self.assertIn("我的长理注册用户", javascript)
             self.assertIn("未注册 / 游客用户", javascript)
             self.assertIn("今日首次使用用户", javascript)
-            self.assertIn("设备数 ≠ 用户数", javascript)
+            for removed_note in (
+                "累计用户量按 canonical identity 去重",
+                "DAU / WAU / MAU 按 canonical identity 去重",
+                "这里只是账号生命周期与权限治理数据",
+                "设备数 ≠ 用户数",
+            ):
+                self.assertNotIn(removed_note, javascript)
+            self.assertNotIn(", null, {}", javascript)
+            self.assertIn('"canonicalUsers"', javascript)
+            self.assertIn('"devices"', javascript)
+            self.assertIn('"installations"', javascript)
+            self.assertIn('data-action="back-overview"', javascript)
             self.assertNotIn("账号概况（仅 PHONE 注册账号）", javascript)
+
+    def test_dashboard_drilldown_filters_counts_privacy_and_permissions(self):
+        admin = self.admin_token()
+        status, overview_response = self.call(
+            "GET", "/api/v1/admin/overview", token=admin
+        )
+        self.assertEqual(200, status)
+        overview = overview_response["data"]
+        as_of = overview["asOf"]
+
+        canonical_cases = (
+            ("totalUsers", "cohort=all"),
+            ("registeredUsers", "cohort=registered"),
+            ("guestUsers", "cohort=guest"),
+            ("todayNewUsers", "firstSeen=today"),
+            ("todayFirstUseUsers", "firstSeen=today"),
+            ("active5m", f"activity=5m&asOf={as_of}"),
+            ("dau", f"activity=today&asOf={as_of}"),
+            ("wau", f"activity=7d&asOf={as_of}"),
+            ("mau", f"activity=30d&asOf={as_of}"),
+        )
+        for metric, query in canonical_cases:
+            detail_status, detail_response = self.call(
+                "GET", f"/api/v1/admin/canonical-users?{query}", token=admin
+            )
+            self.assertEqual(200, detail_status)
+            detail = detail_response["data"]
+            self.assertEqual(overview[metric], detail["total"], metric)
+            for row in detail["items"]:
+                self.assertRegex(row["identityCode"], r"^(?:\d{17}|GUEST-[0-9A-F]{10})$")
+                self.assertNotIn("identityKey", row)
+                self.assertNotIn("deviceId", row)
+                self.assertNotIn("userId", row)
+
+        user_status, user_response = self.call(
+            "GET",
+            "/api/v1/admin/users?accountType=PHONE&includeDeleted=true&paged=true&limit=100",
+            token=admin,
+        )
+        self.assertEqual(200, user_status)
+        self.assertEqual(overview["registeredUsers"], user_response["data"]["total"])
+        today_registration_status, today_registration_response = self.call(
+            "GET",
+            "/api/v1/admin/users?accountType=PHONE&includeDeleted=true&createdToday=true&paged=true&limit=100",
+            token=admin,
+        )
+        self.assertEqual(200, today_registration_status)
+        self.assertEqual(
+            overview["todayNewRegistrations"],
+            today_registration_response["data"]["total"],
+        )
+
+        device_cases = (
+            ("totalDevices", "window=all"),
+            ("todayNewDevices", "window=today"),
+            ("activeDevices", f"window=5m&asOf={as_of}"),
+            ("activeDevices7d", f"window=7d&asOf={as_of}"),
+            ("activeDevices30d", f"window=30d&asOf={as_of}"),
+        )
+        for metric, query in device_cases:
+            detail_status, detail_response = self.call(
+                "GET", f"/api/v1/admin/devices?{query}", token=admin
+            )
+            self.assertEqual(200, detail_status)
+            detail = detail_response["data"]
+            self.assertEqual(overview[metric], detail["total"], metric)
+            for row in detail["items"]:
+                self.assertRegex(row["deviceCode"], r"^DEVICE-[0-9A-F]{10}$")
+                self.assertNotIn("deviceId", row)
+                self.assertNotIn("deviceScopedId", row)
+
+        installation_cases = (
+            ("totalInstallations", "window=all"),
+            ("todayNewInstallations", "window=today"),
+            ("reinstallations", "reinstallation=true"),
+        )
+        for metric, query in installation_cases:
+            detail_status, detail_response = self.call(
+                "GET", f"/api/v1/admin/installations?{query}", token=admin
+            )
+            self.assertEqual(200, detail_status)
+            detail = detail_response["data"]
+            self.assertEqual(overview[metric], detail["total"], metric)
+            for row in detail["items"]:
+                self.assertRegex(row["installationCode"], r"^INSTALL-[0-9A-F]{10}$")
+                self.assertNotIn("installationId", row)
+
+        for endpoint in (
+            "/api/v1/admin/canonical-users",
+            "/api/v1/admin/devices",
+            "/api/v1/admin/installations",
+        ):
+            self.assertEqual(401, self.call("GET", endpoint)[0])
 
     def test_platform_metrics_user_events_status_and_risk_are_separated(self):
         phone, password, user_token, user = self.phone_account()

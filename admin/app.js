@@ -6,10 +6,14 @@ const state = {
   phoneRevealTimer: null,
   profileRevealTimer: null,
   filters: {},
+  overviewScrollY: 0,
 };
 
 const titles = {
   overview: "平台概览",
+  canonicalUsers: "用户明细",
+  devices: "设备明细",
+  installations: "安装实例明细",
   users: "用户与权限",
   venues: "场地与库存",
   reservations: "预约记录",
@@ -93,6 +97,9 @@ function statusText(value) {
     SUSPENDED: "已停用",
     PHONE: "手机号账号",
     DEVICE: "未登录用户",
+    REGISTERED: "注册用户",
+    GUEST: "游客用户",
+    ANONYMOUS: "未注册",
     DRAFT: "草稿",
     PUBLISHED: "已发布",
     DISABLED: "已停用",
@@ -369,13 +376,16 @@ async function showApp() {
 async function navigate(page, filters = {}) {
   state.page = page;
   state.filters = filters;
-  $("#page-title").textContent = titles[page];
+  $("#page-title").textContent = filters.title || titles[page];
   document.querySelectorAll("#nav button").forEach((button) => {
     button.classList.toggle("active", button.dataset.page === page);
   });
   content.innerHTML = '<div class="empty">正在读取本地数据…</div>';
   try {
     await renderers[page](filters);
+    if (page === "overview" && state.overviewScrollY) {
+      requestAnimationFrame(() => window.scrollTo(0, state.overviewScrollY));
+    }
   } catch (error) {
     const title = error.status === 403 ? "无权限访问" : "读取失败";
     content.innerHTML = `<div class="empty"><strong>${title}</strong><br>${escapeHtml(error.message)}<br><button class="ghost" data-action="reload">重新加载</button></div>`;
@@ -407,27 +417,28 @@ const renderers = {
     const data = await api("/api/v1/admin/overview");
     const todayNewRegistrations = data.todayNewRegistrations ?? data.todayRegistrations ?? 0;
     const todayFirstUseUsers = data.todayFirstUseUsers ?? data.todayNewUsers ?? 0;
+    const asOf = String(data.asOf || Date.now());
     const groups = [
       ["用户概况", [
-        ["累计用户量", data.totalUsers, null, {}], ["我的长理注册用户", data.registeredUsers, "users", {accountType:"PHONE"}],
-        ["未注册 / 游客用户", data.guestUsers, null, {}], ["今日新增用户", data.todayNewUsers, null, {}],
-        ["今日新增注册", todayNewRegistrations, "users", {createdToday:"true",accountType:"PHONE"}],
+        ["累计用户量", data.totalUsers, "canonicalUsers", {cohort:"all",title:"累计用户量"}], ["我的长理注册用户", data.registeredUsers, "users", {accountType:"PHONE",includeDeleted:"true"}],
+        ["未注册 / 游客用户", data.guestUsers, "canonicalUsers", {cohort:"guest",title:"未注册 / 游客用户"}], ["今日新增用户", data.todayNewUsers, "canonicalUsers", {firstSeen:"today",title:"今日新增用户"}],
+        ["今日新增注册", todayNewRegistrations, "users", {createdToday:"true",accountType:"PHONE",includeDeleted:"true"}],
       ]],
       ["活跃情况", [
-        ["最近 5 分钟活跃用户", data.active5m, null, {}], ["今日活跃用户（DAU）", data.dau, null, {}],
-        ["近 7 日活跃用户（WAU）", data.wau, null, {}], ["近 30 日活跃用户（MAU）", data.mau, null, {}],
-        ["今日首次使用用户", todayFirstUseUsers, null, {}],
+        ["最近 5 分钟活跃用户", data.active5m, "canonicalUsers", {activity:"5m",asOf,title:"最近 5 分钟活跃用户"}], ["今日活跃用户（DAU）", data.dau, "canonicalUsers", {activity:"today",asOf,title:"今日活跃用户（DAU）"}],
+        ["近 7 日活跃用户（WAU）", data.wau, "canonicalUsers", {activity:"7d",asOf,title:"近 7 日活跃用户（WAU）"}], ["近 30 日活跃用户（MAU）", data.mau, "canonicalUsers", {activity:"30d",asOf,title:"近 30 日活跃用户（MAU）"}],
+        ["今日首次使用用户", todayFirstUseUsers, "canonicalUsers", {firstSeen:"today",title:"今日首次使用用户"}],
       ]],
       ["我的长理账号", [
-        ["累计注册账号", data.registeredAccounts, "users", {}], ["正常账号", data.activeAccounts, "users", {status:"ACTIVE"}],
-        ["受限账号", data.limitedAccounts, "users", {status:"LIMITED"}], ["已禁用账号", data.disabledAccounts, "users", {status:"DISABLED"}],
-        ["已注销账号", data.deletedAccounts, "users", {status:"DELETED"}],
+        ["累计注册账号", data.registeredAccounts, "users", {accountType:"PHONE",includeDeleted:"true"}], ["正常账号", data.activeAccounts, "users", {status:"ACTIVE",accountType:"PHONE"}],
+        ["受限账号", data.limitedAccounts, "users", {status:"LIMITED",accountType:"PHONE"}], ["已禁用账号", data.disabledAccounts, "users", {status:"DISABLED",accountType:"PHONE"}],
+        ["已注销账号", data.deletedAccounts, "users", {status:"DELETED",accountType:"PHONE"}],
       ]],
       ["设备与安装实例", [
-        ["累计独立设备", data.totalDevices, null, {}], ["今日新增设备", data.todayNewDevices, null, {}],
-        ["最近 5 分钟活跃设备", data.activeDevices, null, {}], ["近 7 日活跃设备", data.activeDevices7d, null, {}],
-        ["近 30 日活跃设备", data.activeDevices30d, null, {}], ["累计安装实例", data.totalInstallations, null, {}],
-        ["今日新增安装", data.todayNewInstallations, null, {}], ["累计重新安装", data.reinstallations, null, {}],
+        ["累计独立设备", data.totalDevices, "devices", {window:"all",title:"累计独立设备"}], ["今日新增设备", data.todayNewDevices, "devices", {window:"today",title:"今日新增设备"}],
+        ["最近 5 分钟活跃设备", data.activeDevices, "devices", {window:"5m",asOf,title:"最近 5 分钟活跃设备"}], ["近 7 日活跃设备", data.activeDevices7d, "devices", {window:"7d",asOf,title:"近 7 日活跃设备"}],
+        ["近 30 日活跃设备", data.activeDevices30d, "devices", {window:"30d",asOf,title:"近 30 日活跃设备"}], ["累计安装实例", data.totalInstallations, "installations", {window:"all",title:"累计安装实例"}],
+        ["今日新增安装", data.todayNewInstallations, "installations", {window:"today",title:"今日新增安装"}], ["累计重新安装", data.reinstallations, "installations", {reinstallation:"true",title:"累计重新安装"}],
       ]],
       ["业务与处理", [
         ["体育预约 · 当前有效预约", data.activeReservations, "reservations", {status:"ACTIVE"}], ["体育预约 · 今日有效预约", data.todayReservations, "reservations", {date:new Date().toISOString().slice(0,10),status:"ACTIVE"}],
@@ -441,14 +452,8 @@ const renderers = {
         ["近 24 小时新受限 / 禁用账号", data.newLimitedOrDisabled24h, "users", {statusGroup:"restricted24h"}],
       ]],
     ];
-    const overviewNotes = {
-      "用户概况": "累计用户量按 canonical identity 去重；我的长理注册用户仅指本产品 PHONE 自有账号。",
-      "活跃情况": "DAU / WAU / MAU 按 canonical identity 去重，设备和安装实例不重复折算为用户。",
-      "我的长理账号": "这里是账号生命周期与权限治理数据，不代表产品用户规模。",
-      "设备与安装实例": "设备数 ≠ 用户数；安装实例数 ≠ 用户数。",
-    };
     content.innerHTML = `
-      ${groups.map(([title, metrics]) => `<h3 class="section-title">${title}</h3><p class="muted section-note">${overviewNotes[title] || ""}</p><div class="grid metric-grid">
+      ${groups.map(([title, metrics]) => `<h3 class="section-title">${title}</h3><div class="grid metric-grid">
         ${metrics.map(([label, value, page, filter]) => page ? `<button class="card metric metric-link" data-action="metric-nav" data-page="${page}" data-filter="${escapeHtml(JSON.stringify(filter))}"><span>${label}</span><strong>${value}</strong></button>` : `<div class="card metric"><span>${label}</span><strong>${value}</strong></div>`).join("")}
       </div>`).join("")}
       <article class="card section-title">
@@ -464,10 +469,13 @@ const renderers = {
       normalized.activeSince = normalized.activeWindow === "5m" ? now - 300000 : normalized.activeWindow === "dau" ? new Date().setHours(0,0,0,0) : normalized.activeWindow === "wau" ? now - 7*86400000 : now - 30*86400000;
       delete normalized.activeWindow;
     }
-    if (normalized.createdToday) { normalized.createdSince = new Date().setHours(0,0,0,0); delete normalized.createdToday; }
+    delete normalized.title;
     if (normalized.statusGroup === "restricted24h") { normalized.statusChangedSince = Date.now()-86400000; delete normalized.statusGroup; }
+    normalized.paged = "true";
+    normalized.limit = "100";
     const params = new URLSearchParams(normalized);
-    const rows = await api(`/api/v1/admin/users?${params}`);
+    const result = await api(`/api/v1/admin/users?${params}`);
+    const rows = result.items || [];
     const summary = Object.keys(filters).length ? `<div class="filter-summary"><span>当前筛选：${escapeHtml(Object.values(filters).join(" · "))}</span><button class="ghost" data-action="clear-page-filter">清除筛选</button></div>` : "";
     content.innerHTML = `
       ${summary}
@@ -477,7 +485,7 @@ const renderers = {
         <label class="compact">状态<select name="status">${accountStatusFilterOptions(filters.status)}</select></label>
         <button class="primary">筛选</button>
       </form>
-      <p class="muted">默认隐藏已注销用户；选择“已注销”可单独查询。</p>
+      <p class="muted">共 ${result.total} 个账号。默认隐藏已注销用户；选择“已注销”可单独查询。</p>
       ${rows.length ? `<div id="user-bulk-actions" class="toolbar" hidden><strong data-selected-user-count>已选择 0 个用户</strong><button type="button" class="danger" data-action="bulk-purge-users" hidden>永久删除所选已注销账号</button><button type="button" class="danger" data-action="bulk-delete-users">注销账号</button><button type="button" class="primary" data-action="bulk-limit-users">批量限制访问</button><button type="button" class="ghost" data-action="bulk-restore-users">批量恢复权限</button><span class="muted">管理员账号不属于此列表，也不会被批量操作修改。</span></div><div class="table-wrap"><table><thead><tr><th><input type="checkbox" data-action="toggle-user-all" aria-label="全选当前用户"></th><th>用户完整资料</th><th>预约资料</th><th>账号状态</th><th>业务统计</th><th>时间 / 限制</th><th>操作</th></tr></thead><tbody>
         ${rows.map((row) => `<tr>
           <td><input type="checkbox" class="user-select" value="${escapeHtml(row.id)}" data-account-status="${escapeHtml(row.account_status)}" aria-label="选择 ${escapeHtml(row.nickname || "用户")}"></td><td><strong>${escapeHtml(row.nickname || "长理同学")}</strong><br>${escapeHtml(row.phone || "无手机号")}<br><span class="subtle">用户编号：${escapeHtml(row.user_code || "待生成")}</span><br><span class="subtle">内部 UUID：${escapeHtml(row.id)}</span></td>
@@ -487,7 +495,44 @@ const renderers = {
           <td><span class="subtle">注册 ${formatTime(row.created_at)}<br>活跃 ${formatTime(row.last_active_at)}<br>${escapeHtml(row.restriction_reason || row.account_status_reason || "无限制")}</span></td>
           <td>${row.account_status === "DELETED" ? '<span class="subtle">已注销，可重新注册</span>' : `<div class="actions"><button class="ghost" data-action="user-details" data-id="${escapeHtml(row.id)}">详情</button><button class="ghost" data-action="edit-user" data-user="${escapeHtml(JSON.stringify(row))}">编辑</button>${["LIMITED","SUSPENDED","DISABLED","PENDING_DELETION"].includes(row.account_status) ? `<button class="primary" data-action="restore-user" data-id="${escapeHtml(row.id)}">恢复账号</button>` : ""}${row.restriction_reason ? `<button class="danger" data-action="clear-restriction" data-id="${escapeHtml(row.id)}">解除预约限制</button>` : ""}</div>`}</td>
         </tr>`).join("")}
-      </tbody></table></div>` : '<div class="empty">没有符合条件的用户</div>'}`;
+      </tbody></table></div>` : '<div class="empty">没有符合条件的用户</div>'}
+      ${drilldownPagination(result, "users", filters)}`;
+  },
+
+  async canonicalUsers(filters = {}) {
+    const params = new URLSearchParams(Object.entries(filters).filter(([key]) => key !== "title"));
+    const result = await api(`/api/v1/admin/canonical-users?${params}`);
+    const title = filters.title || "用户明细";
+    content.innerHTML = `
+      <div class="drilldown-header"><button type="button" class="ghost" data-action="back-overview">← 返回工作台</button><strong>${escapeHtml(title)}</strong><span class="muted">共 ${result.total} 个用户</span></div>
+      ${result.items.length ? `<div class="table-wrap"><table><thead><tr><th>用户</th><th>类型 / 状态</th><th>首次使用</th><th>最近活跃</th><th>关联设备</th><th>安装实例</th></tr></thead><tbody>
+        ${result.items.map((row) => `<tr><td><strong>${escapeHtml(row.displayName)}</strong><br><span class="subtle">用户编号：${escapeHtml(row.identityCode)}</span>${row.phoneMasked ? `<br><span class="subtle">${escapeHtml(row.phoneMasked)}</span>` : ""}</td><td>${badge(row.identityType)}<br><span class="subtle">${escapeHtml(statusText(row.status))}</span></td><td>${formatTime(row.firstSeenAt)}</td><td>${formatTime(row.lastActiveAt)}</td><td>${row.deviceCount}</td><td>${row.installationCount}</td></tr>`).join("")}
+      </tbody></table></div>` : '<div class="empty">暂无符合条件的数据</div>'}
+      ${drilldownPagination(result, "canonicalUsers", filters)}`;
+  },
+
+  async devices(filters = {}) {
+    const params = new URLSearchParams(Object.entries(filters).filter(([key]) => key !== "title"));
+    const result = await api(`/api/v1/admin/devices?${params}`);
+    const title = filters.title || "设备明细";
+    content.innerHTML = `
+      <div class="drilldown-header"><button type="button" class="ghost" data-action="back-overview">← 返回工作台</button><strong>${escapeHtml(title)}</strong><span class="muted">共 ${result.total} 台设备</span></div>
+      ${result.items.length ? `<div class="table-wrap"><table><thead><tr><th>设备业务编号</th><th>首次出现</th><th>最近活跃</th><th>首次版本</th><th>最近版本</th><th>安装实例</th><th>注册用户关联</th></tr></thead><tbody>
+        ${result.items.map((row) => `<tr><td><strong>${escapeHtml(row.deviceCode)}</strong></td><td>${formatTime(row.firstSeenAt)}</td><td>${formatTime(row.lastSeenAt)}</td><td>${escapeHtml(row.firstVersionName || "—")} · ${escapeHtml(row.firstVersionCode || "—")}</td><td>${escapeHtml(row.lastVersionName || "—")} · ${escapeHtml(row.lastVersionCode || "—")}</td><td>${row.installationCount}</td><td>${row.linkedRegisteredUser ? '<span class="badge ok">已关联</span>' : '<span class="badge">未关联</span>'}</td></tr>`).join("")}
+      </tbody></table></div>` : '<div class="empty">暂无符合条件的数据</div>'}
+      ${drilldownPagination(result, "devices", filters)}`;
+  },
+
+  async installations(filters = {}) {
+    const params = new URLSearchParams(Object.entries(filters).filter(([key]) => key !== "title"));
+    const result = await api(`/api/v1/admin/installations?${params}`);
+    const title = filters.title || "安装实例明细";
+    content.innerHTML = `
+      <div class="drilldown-header"><button type="button" class="ghost" data-action="back-overview">← 返回工作台</button><strong>${escapeHtml(title)}</strong><span class="muted">共 ${result.total} 个安装实例</span></div>
+      ${result.items.length ? `<div class="table-wrap"><table><thead><tr><th>安装业务标识</th><th>所属设备</th><th>首次出现</th><th>最近活动</th><th>App 版本</th><th>安装类型</th></tr></thead><tbody>
+        ${result.items.map((row) => `<tr><td><strong>${escapeHtml(row.installationCode)}</strong></td><td>${escapeHtml(row.deviceCode)}</td><td>${formatTime(row.firstSeenAt)}</td><td>${formatTime(row.lastActiveAt)}</td><td>${escapeHtml(row.versionName || "—")} · ${escapeHtml(row.versionCode || "—")}</td><td>${row.isReinstallation ? '<span class="badge warn">重新安装</span>' : '<span class="badge ok">首次安装</span>'}</td></tr>`).join("")}
+      </tbody></table></div>` : '<div class="empty">暂无符合条件的数据</div>'}
+      ${drilldownPagination(result, "installations", filters)}`;
   },
 
   async admins() {
@@ -820,6 +865,15 @@ function options(values, selected, allowBlank = false) {
   return `${allowBlank ? '<option value="">全部</option>' : ""}${values.map((value) => `<option value="${value}" ${value === selected ? "selected" : ""}>${escapeHtml(statusText(value))}</option>`).join("")}`;
 }
 
+function drilldownPagination(result, page, filters) {
+  if (!result.total || result.total <= result.limit) return "";
+  const previousOffset = Math.max(0, result.offset - result.limit);
+  const nextOffset = result.offset + result.limit;
+  const previousFilter = {...filters, offset:String(previousOffset)};
+  const nextFilter = {...filters, offset:String(nextOffset)};
+  return `<div class="pagination"><span>显示 ${result.offset + 1}–${Math.min(result.total, result.offset + result.items.length)} / ${result.total}</span><div class="actions"><button type="button" class="ghost" data-action="drilldown-page" data-page="${page}" data-filter="${escapeHtml(JSON.stringify(previousFilter))}" ${result.offset === 0 ? "disabled" : ""}>上一页</button><button type="button" class="ghost" data-action="drilldown-page" data-page="${page}" data-filter="${escapeHtml(JSON.stringify(nextFilter))}" ${nextOffset >= result.total ? "disabled" : ""}>下一页</button></div></div>`;
+}
+
 function releaseVersionOptions(versions, selected) {
   const items = [...(versions || [])];
   if (!items.some((item) => Number(item.version_code) === Number(selected))) {
@@ -1104,7 +1158,12 @@ content.addEventListener("click", async (event) => {
   const action = button.dataset.action;
   try {
     if (action === "reload") return navigate(state.page);
-    if (action === "metric-nav") return navigate(button.dataset.page, JSON.parse(button.dataset.filter || "{}"));
+    if (action === "metric-nav") {
+      state.overviewScrollY = window.scrollY;
+      return navigate(button.dataset.page, JSON.parse(button.dataset.filter || "{}"));
+    }
+    if (action === "back-overview") return navigate("overview");
+    if (action === "drilldown-page") return navigate(button.dataset.page, JSON.parse(button.dataset.filter || "{}"));
     if (action === "clear-page-filter") return navigate(state.page, {});
     if (action === "return-user-profile") {
       await navigate("users", {q: button.dataset.userId});
