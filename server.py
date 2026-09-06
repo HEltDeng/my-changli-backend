@@ -207,6 +207,11 @@ def sync_release_history(db: sqlite3.Connection) -> None:
     ).fetchone()
     if not row:
         return
+    def existing_user_reference(value: str | None) -> str | None:
+        if not value:
+            return None
+        return value if db.execute("SELECT 1 FROM users WHERE id=?", (value,)).fetchone() else None
+
     db.execute(
         """INSERT INTO app_release_versions(
                platform,version_code,version_name,update_message,download_url,
@@ -241,8 +246,8 @@ def sync_release_history(db: sqlite3.Connection) -> None:
             row["status"],
             row["published_at"],
             row["created_at"] or row["updated_at"],
-            row["created_by"],
-            row["updated_by"],
+            existing_user_reference(row["created_by"]),
+            existing_user_reference(row["updated_by"]),
             row["updated_at"],
         ),
     )
@@ -367,6 +372,25 @@ def initialize_database() -> None:
             db.execute(
                 """UPDATE users SET admin_role='SUPER_ADMIN',admin_enabled=1
                    WHERE role='ADMIN' AND (admin_role IS NULL OR TRIM(admin_role)='')"""
+            )
+        # Legacy releases sometimes stored an operator label instead of a
+        # users.id in nullable audit-reference columns.  The new release
+        # history table enforces those foreign keys; preserve the version row
+        # while clearing only references that cannot be resolved.
+        for table_name in ("app_versions", "app_release_versions"):
+            db.execute(
+                f"""UPDATE {table_name} SET created_by=NULL
+                    WHERE created_by IS NOT NULL
+                      AND NOT EXISTS (
+                          SELECT 1 FROM users WHERE users.id={table_name}.created_by
+                      )"""
+            )
+            db.execute(
+                f"""UPDATE {table_name} SET updated_by=NULL
+                    WHERE updated_by IS NOT NULL
+                      AND NOT EXISTS (
+                          SELECT 1 FROM users WHERE users.id={table_name}.updated_by
+                      )"""
             )
         db.execute(
             """UPDATE app_versions SET status='PUBLISHED',created_at=updated_at,

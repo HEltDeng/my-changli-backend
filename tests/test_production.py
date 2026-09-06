@@ -136,7 +136,6 @@ class ProductionUnitTest(unittest.TestCase):
             load_runtime_config(dict(environment, MY_CHANGLI_TRUSTED_PROXY="10.0.0.2"))
         with self.assertRaises(ConfigurationError):
             load_runtime_config(dict(environment, MY_CHANGLI_ADMIN_ORIGIN="https://admin.example.test"))
-
         ipv6_environment = dict(
             environment,
             MY_CHANGLI_HOST="::1",
@@ -172,6 +171,37 @@ class ProductionUnitTest(unittest.TestCase):
             load_runtime_config(
                 dict(environment, MY_CHANGLI_ADMIN_SESSION_SECONDS="86401")
             )
+
+    def test_release_history_clears_unresolvable_legacy_operator_references(self):
+        # A historical app_versions row may contain a human-readable operator
+        # label rather than a users.id. The migration must preserve the
+        # release row while making the new FK-backed history insertable.
+        db = sqlite3.connect(self.database)
+        try:
+            db.execute("PRAGMA foreign_keys=OFF")
+            db.execute(
+                "UPDATE app_versions SET created_by=?,updated_by=? WHERE platform='android'",
+                ("legacy-operator", "legacy-operator"),
+            )
+            db.commit()
+        finally:
+            db.close()
+
+        server.initialize_database()
+
+        with server.connection() as db:
+            current = db.execute(
+                "SELECT created_by,updated_by FROM app_versions WHERE platform='android'"
+            ).fetchone()
+            history = db.execute(
+                "SELECT created_by,updated_by FROM app_release_versions "
+                "WHERE platform='android' ORDER BY version_code DESC LIMIT 1"
+            ).fetchone()
+            self.assertIsNone(current["created_by"])
+            self.assertIsNone(current["updated_by"])
+            self.assertIsNone(history["created_by"])
+            self.assertIsNone(history["updated_by"])
+            self.assertEqual("ok", db.execute("PRAGMA integrity_check").fetchone()[0])
 
     def test_clean_database_wal_integrity_and_default_state(self):
         server.initialize_database()
