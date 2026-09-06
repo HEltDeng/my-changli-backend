@@ -8,6 +8,7 @@ CREATE TABLE IF NOT EXISTS users (
     password_salt TEXT NOT NULL,
     role TEXT NOT NULL DEFAULT 'USER' CHECK (role IN ('USER', 'ADMIN')),
     account_type TEXT NOT NULL DEFAULT 'DEVICE',
+    user_code TEXT,
     nickname TEXT NOT NULL DEFAULT '长理同学',
     phone_hash TEXT UNIQUE,
     phone_masked TEXT,
@@ -111,6 +112,60 @@ ON users(reservation_student_id_hash) WHERE reservation_student_id_hash IS NOT N
 CREATE INDEX IF NOT EXISTS users_reservation_name_hash
 ON users(reservation_name_hash) WHERE reservation_name_hash IS NOT NULL;
 
+-- A trusted, app-scoped device identity. The raw Android ID and the client
+-- derived value are never stored here; only the server HMAC is retained.
+CREATE TABLE IF NOT EXISTS devices (
+    id TEXT PRIMARY KEY,
+    device_key_hash TEXT NOT NULL UNIQUE,
+    first_seen_at INTEGER NOT NULL,
+    last_seen_at INTEGER NOT NULL,
+    first_app_version_name TEXT,
+    first_app_version_code INTEGER,
+    last_app_version_name TEXT,
+    last_app_version_code INTEGER,
+    install_count INTEGER NOT NULL DEFAULT 0,
+    created_at INTEGER NOT NULL,
+    updated_at INTEGER NOT NULL
+);
+
+CREATE INDEX IF NOT EXISTS devices_last_seen
+ON devices(last_seen_at DESC);
+
+CREATE TABLE IF NOT EXISTS installations (
+    installation_id TEXT PRIMARY KEY,
+    device_id TEXT REFERENCES devices(id) ON DELETE SET NULL,
+    first_seen_at INTEGER NOT NULL,
+    last_seen_at INTEGER NOT NULL,
+    first_app_version_name TEXT,
+    first_app_version_code INTEGER,
+    last_app_version_name TEXT,
+    last_app_version_code INTEGER,
+    legacy INTEGER NOT NULL DEFAULT 0,
+    created_at INTEGER NOT NULL,
+    updated_at INTEGER NOT NULL
+);
+
+CREATE INDEX IF NOT EXISTS installations_device_seen
+ON installations(device_id, last_seen_at DESC);
+
+CREATE TABLE IF NOT EXISTS user_devices (
+    user_id TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+    device_id TEXT NOT NULL REFERENCES devices(id) ON DELETE CASCADE,
+    first_seen_at INTEGER NOT NULL,
+    last_seen_at INTEGER NOT NULL,
+    PRIMARY KEY(user_id, device_id)
+);
+
+CREATE INDEX IF NOT EXISTS user_devices_device
+ON user_devices(device_id, last_seen_at DESC);
+
+-- Registration minutes are deliberately never decremented. A failed insert
+-- may leave a gap, but a business number is never reused.
+CREATE TABLE IF NOT EXISTS user_code_sequences (
+    registration_minute TEXT PRIMARY KEY,
+    next_sequence INTEGER NOT NULL CHECK (next_sequence BETWEEN 1 AND 100000)
+);
+
 CREATE TABLE IF NOT EXISTS lost_found_posts (
     id TEXT PRIMARY KEY,
     owner_user_id TEXT NOT NULL REFERENCES users(id),
@@ -204,6 +259,9 @@ CREATE TABLE IF NOT EXISTS app_versions (
     download_url TEXT,
     apk_sha256 TEXT,
     apk_size INTEGER,
+    package_name TEXT,
+    signing_certificate_sha256 TEXT,
+    metadata_verified INTEGER NOT NULL DEFAULT 0,
     force_update INTEGER NOT NULL DEFAULT 0,
     status TEXT NOT NULL DEFAULT 'DRAFT'
         CHECK (status IN ('DRAFT', 'PUBLISHED', 'DISABLED')),
@@ -213,6 +271,33 @@ CREATE TABLE IF NOT EXISTS app_versions (
     updated_by TEXT REFERENCES users(id) ON DELETE SET NULL,
     updated_at INTEGER NOT NULL
 );
+
+-- Published release history feeds the admin minimum-version selector. The
+-- app_versions row remains the effective policy for backward compatibility.
+CREATE TABLE IF NOT EXISTS app_release_versions (
+    platform TEXT NOT NULL,
+    version_code INTEGER NOT NULL,
+    version_name TEXT NOT NULL,
+    update_message TEXT NOT NULL DEFAULT '',
+    download_url TEXT,
+    apk_sha256 TEXT,
+    apk_size INTEGER,
+    package_name TEXT,
+    signing_certificate_sha256 TEXT,
+    metadata_verified INTEGER NOT NULL DEFAULT 0,
+    status TEXT NOT NULL DEFAULT 'DRAFT'
+        CHECK (status IN ('DRAFT', 'PUBLISHED', 'DISABLED')),
+    published_at INTEGER,
+    created_at INTEGER NOT NULL,
+    created_by TEXT REFERENCES users(id) ON DELETE SET NULL,
+    updated_by TEXT REFERENCES users(id) ON DELETE SET NULL,
+    updated_at INTEGER NOT NULL,
+    PRIMARY KEY(platform, version_code),
+    UNIQUE(platform, version_name)
+);
+
+CREATE INDEX IF NOT EXISTS app_release_versions_listing
+ON app_release_versions(platform, status, version_code DESC);
 
 CREATE TABLE IF NOT EXISTS remote_flags (
     key TEXT PRIMARY KEY,
@@ -320,6 +405,10 @@ CREATE TABLE IF NOT EXISTS user_behavior_events (
     client_source TEXT NOT NULL DEFAULT 'APP',
     client_version TEXT,
     risk_flag TEXT,
+    device_id TEXT REFERENCES devices(id) ON DELETE SET NULL,
+    installation_id TEXT REFERENCES installations(installation_id) ON DELETE SET NULL,
+    identity_kind TEXT NOT NULL DEFAULT 'LEGACY'
+        CHECK (identity_kind IN ('USER', 'DEVICE', 'LEGACY')),
     created_at INTEGER NOT NULL
 );
 

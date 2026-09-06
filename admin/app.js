@@ -160,6 +160,8 @@ function accountStatusFilterOptions(selected) {
   const values = [
     ["ACTIVE", "正常"],
     ["LIMITED", "已限制"],
+    ["DISABLED", "已禁用"],
+    ["PENDING_DELETION", "待注销"],
     ["DELETED", "已注销"],
   ];
   return `<option value="">全部（不含已注销）</option>${values.map(([value, label]) => `<option value="${value}" ${value === selected ? "selected" : ""}>${label}</option>`).join("")}`;
@@ -186,12 +188,41 @@ function refreshUserBulkActions() {
   const ids = selectedUserIds();
   toolbar.hidden = ids.length === 0;
   const count = toolbar.querySelector("[data-selected-user-count]");
-  if (count) count.textContent = `已选择 ${ids.length} 个普通用户`;
+  if (count) count.textContent = `已选择 ${ids.length} 个用户`;
+  const selected = Array.from(document.querySelectorAll(".user-select:checked"));
+  const onlyDeleted = selected.length > 0 && selected.every((item) => item.dataset.accountStatus === "DELETED");
+  const purge = toolbar.querySelector('[data-action="bulk-purge-users"]');
+  if (purge) purge.hidden = !onlyDeleted;
+  ["bulk-delete-users", "bulk-limit-users", "bulk-restore-users"].forEach((action) => {
+    const button = toolbar.querySelector(`[data-action="${action}"]`);
+    if (button) button.hidden = selected.some((item) => item.dataset.accountStatus === "DELETED");
+  });
 }
 
 function openBulkUserAction(action) {
   const ids = selectedUserIds();
   if (!ids.length) throw new Error("请先选择需要处理的普通用户");
+  if (action === "purge") {
+    const selected = Array.from(document.querySelectorAll(".user-select:checked"));
+    if (!selected.every((item) => item.dataset.accountStatus === "DELETED")) {
+      throw new Error("永久清理只能处理已注销账号");
+    }
+    if (!confirm(`即将永久删除 ${ids.length} 个已注销账号。此操作不可恢复，确认进入第二次核验？`)) return;
+    const confirmation = `PURGE ${ids.length} DELETED USERS`;
+    return openDialog(
+      "永久删除已注销账号",
+      `<div class="stack"><p><strong>即将永久删除 ${ids.length} 个已注销账号。</strong></p><p class="muted">此操作不可恢复。与账号相关的个人信息将按照系统清理规则永久删除或匿名化。存在业务关联的数据会先按服务端外键规则处理。</p><label>再次输入确认文本 <strong>${confirmation}</strong><input name="confirmation" autocomplete="off" required></label></div>`,
+      async (form) => {
+        const result = await api("/api/v1/admin/users/purge", {
+          method: "POST",
+          body: { ids, confirmation: form.get("confirmation") },
+        });
+        toast(`已永久清理 ${result.purged} 个已注销账号`);
+        renderers.users();
+      },
+      "确认永久删除",
+    );
+  }
   const definitions = {
     limit: {
       title: "批量限制访问",
@@ -370,12 +401,12 @@ const renderers = {
         CONTENT_OPERATOR: [["内容运营概览", [["已发布公告", data.publishedAnnouncements, "announcements", {enabled:"true"}]]]],
       };
       const groups = configs[role] || [];
-      content.innerHTML = groups.map(([title, metrics]) => `<h3 class="section-title">${title}</h3><div class="grid metric-grid">${metrics.map(([label,value,page,filter]) => `<button class="card metric metric-link" data-action="metric-nav" data-page="${page}" data-filter="${escapeHtml(JSON.stringify(filter))}"><span>${label}</span><strong>${value}</strong></button>`).join("")}</div>`).join("");
+      content.innerHTML = groups.map(([title, metrics]) => `<h3 class="section-title">${title}</h3><div class="grid metric-grid">${metrics.map(([label,value,page,filter]) => page ? `<button class="card metric metric-link" data-action="metric-nav" data-page="${page}" data-filter="${escapeHtml(JSON.stringify(filter))}"><span>${label}</span><strong>${value}</strong></button>` : `<div class="card metric"><span>${label}</span><strong>${value}</strong></div>`).join("")}</div>`).join("");
       return;
     }
     const data = await api("/api/v1/admin/overview");
     const groups = [
-      ["账号概况", [
+      ["账号概况（仅 PHONE 注册账号）", [
         ["累计注册账号", data.registeredAccounts, "users", {}], ["正常账号", data.activeAccounts, "users", {status:"ACTIVE"}],
         ["受限账号", data.limitedAccounts, "users", {status:"LIMITED"}], ["已禁用账号", data.disabledAccounts, "users", {status:"DISABLED"}],
         ["已注销账号", data.deletedAccounts, "users", {status:"DELETED"}], ["今日新增注册", data.todayRegistrations, "users", {createdToday:"true"}],
@@ -384,6 +415,12 @@ const renderers = {
         ["最近 5 分钟活跃账号", data.active5m, "users", {activeWindow:"5m"}], ["今日活跃账号（DAU）", data.dau, "users", {activeWindow:"dau"}],
         ["近 7 日活跃账号（WAU）", data.wau, "users", {activeWindow:"wau"}], ["近 30 日活跃账号（MAU）", data.mau, "users", {activeWindow:"mau"}],
         ["今日首次登录账号", data.todayFirstLogins, "userEvents", {eventType:"LOGIN_SUCCESS",firstLoginToday:"true"}],
+      ]],
+      ["设备与安装实例", [
+        ["累计独立设备", data.totalDevices, null, {}], ["今日新增设备", data.todayNewDevices, null, {}],
+        ["最近 5 分钟活跃设备", data.activeDevices, null, {}], ["近 7 日活跃设备", data.activeDevices7d, null, {}],
+        ["近 30 日活跃设备", data.activeDevices30d, null, {}], ["累计安装实例", data.totalInstallations, null, {}],
+        ["今日新增安装", data.todayNewInstallations, null, {}], ["累计重新安装", data.reinstallations, null, {}],
       ]],
       ["业务与处理", [
         ["体育预约 · 当前有效预约", data.activeReservations, "reservations", {status:"ACTIVE"}], ["体育预约 · 今日有效预约", data.todayReservations, "reservations", {date:new Date().toISOString().slice(0,10),status:"ACTIVE"}],
@@ -399,7 +436,7 @@ const renderers = {
     ];
     content.innerHTML = `
       ${groups.map(([title, metrics]) => `<h3 class="section-title">${title}</h3><div class="grid metric-grid">
-        ${metrics.map(([label, value, page, filter]) => `<button class="card metric metric-link" data-action="metric-nav" data-page="${page}" data-filter="${escapeHtml(JSON.stringify(filter))}"><span>${label}</span><strong>${value}</strong></button>`).join("")}
+        ${metrics.map(([label, value, page, filter]) => page ? `<button class="card metric metric-link" data-action="metric-nav" data-page="${page}" data-filter="${escapeHtml(JSON.stringify(filter))}"><span>${label}</span><strong>${value}</strong></button>` : `<div class="card metric"><span>${label}</span><strong>${value}</strong></div>`).join("")}
       </div>`).join("")}
       <article class="card section-title">
         <h3>生产运行说明</h3>
@@ -422,15 +459,15 @@ const renderers = {
     content.innerHTML = `
       ${summary}
       <form id="user-filter" class="toolbar">
-        <label>搜索<input name="q" value="${escapeHtml(filters.q || "")}" placeholder="完整手机号、昵称、内部 ID、预约学号或姓名"></label>
+        <label>搜索<input name="q" value="${escapeHtml(filters.q || "")}" placeholder="手机号、昵称、用户编号、内部 UUID、预约学号或姓名"></label>
         <label class="compact">账号类型<select name="accountType"><option value="">全部</option>${options(["PHONE","DEVICE"], filters.accountType)}</select></label>
         <label class="compact">状态<select name="status">${accountStatusFilterOptions(filters.status)}</select></label>
         <button class="primary">筛选</button>
       </form>
       <p class="muted">默认隐藏已注销用户；选择“已注销”可单独查询。</p>
-      ${rows.length ? `<div id="user-bulk-actions" class="toolbar" hidden><strong data-selected-user-count>已选择 0 个普通用户</strong><button type="button" class="danger" data-action="bulk-delete-users">注销账号</button><button type="button" class="primary" data-action="bulk-limit-users">批量限制访问</button><button type="button" class="ghost" data-action="bulk-restore-users">批量恢复权限</button><span class="muted">管理员账号不属于此列表，也不会被批量操作修改。</span></div><div class="table-wrap"><table><thead><tr><th><input type="checkbox" data-action="toggle-user-all" aria-label="全选当前普通用户"></th><th>用户完整资料</th><th>预约资料</th><th>账号状态</th><th>业务统计</th><th>时间 / 限制</th><th>操作</th></tr></thead><tbody>
+      ${rows.length ? `<div id="user-bulk-actions" class="toolbar" hidden><strong data-selected-user-count>已选择 0 个用户</strong><button type="button" class="danger" data-action="bulk-purge-users" hidden>永久删除所选已注销账号</button><button type="button" class="danger" data-action="bulk-delete-users">注销账号</button><button type="button" class="primary" data-action="bulk-limit-users">批量限制访问</button><button type="button" class="ghost" data-action="bulk-restore-users">批量恢复权限</button><span class="muted">管理员账号不属于此列表，也不会被批量操作修改。</span></div><div class="table-wrap"><table><thead><tr><th><input type="checkbox" data-action="toggle-user-all" aria-label="全选当前用户"></th><th>用户完整资料</th><th>预约资料</th><th>账号状态</th><th>业务统计</th><th>时间 / 限制</th><th>操作</th></tr></thead><tbody>
         ${rows.map((row) => `<tr>
-          <td><input type="checkbox" class="user-select" value="${escapeHtml(row.id)}" aria-label="选择 ${escapeHtml(row.nickname || "用户")}" ${row.account_status === "DELETED" ? "disabled" : ""}></td><td><strong>${escapeHtml(row.nickname || "长理同学")}</strong><br>${escapeHtml(row.phone || "无手机号")}<br><span class="subtle">${escapeHtml(row.id)}</span></td>
+          <td><input type="checkbox" class="user-select" value="${escapeHtml(row.id)}" data-account-status="${escapeHtml(row.account_status)}" aria-label="选择 ${escapeHtml(row.nickname || "用户")}"></td><td><strong>${escapeHtml(row.nickname || "长理同学")}</strong><br>${escapeHtml(row.phone || "无手机号")}<br><span class="subtle">用户编号：${escapeHtml(row.user_code || "待生成")}</span><br><span class="subtle">内部 UUID：${escapeHtml(row.id)}</span></td>
           <td><strong>${escapeHtml(row.reservation_student_id || "未填写")}</strong><br><span class="subtle">${escapeHtml(row.reservation_name || "—")} · ${row.reservation_profile_consented_at ? "用户已同意" : "未记录同意"}</span></td>
           <td>${badge(row.account_type)}<br>${accountBadge(row.account_status)}</td>
           <td><span class="subtle">预约 ${row.reservation_count} · 失物 ${row.lost_found_count}<br>资料浏览 ${row.resource_view_count} · 收藏 ${row.resource_favorite_count}<br>投诉 ${row.resource_complaint_count} · 反馈 ${row.feedback_count}</span></td>
@@ -651,23 +688,29 @@ const renderers = {
   async config() {
     const data = await api("/api/v1/admin/config");
     const version = data.version || {};
+    const availableVersions = data.availableVersions || [];
+    const configuredCode = Number(version.latest_version_code || 1);
+    const metadataState = version.metadata_verified ? "已自动校验" : "尚未完成自动校验";
     content.innerHTML = `
       <div class="grid two-columns">
         <article class="card">
-          <h3>Android 版本提示</h3>
+          <h3>Android 发布版本与更新策略</h3>
           <form id="version-form" class="stack">
-            <label>最新版本名称<input name="latestVersionName" value="${escapeHtml(version.latest_version_name || "")}" required></label>
-            <label>最新版本号<input type="number" min="1" name="latestVersionCode" value="${version.latest_version_code || 1}" required></label>
-            <label>最低支持版本号<input type="number" min="1" name="minimumVersionCode" value="${version.minimum_version_code || 1}" required></label>
+            <label>最新发布版本名称（给用户看的版本）<input name="latestVersionName" value="${escapeHtml(version.latest_version_name || "")}" placeholder="例如 1.0.4" required></label>
+            <label>Android 内部版本号（只用于递增比较）<input type="number" min="1" name="latestVersionCode" value="${configuredCode}" required><span class="subtle">后台展示为 V${escapeHtml(version.latest_version_name || "—")}（${configuredCode}）。客户端更新只比较这个整数。</span></label>
+            <label>最低支持版本<select name="minimumVersionCode">${releaseVersionOptions(availableVersions, version.minimum_version_code || configuredCode)}</select><span class="subtle">只能选择已经存在的正式版本；保存时服务端会再次校验。</span></label>
             <label>更新说明<textarea name="updateMessage">${escapeHtml(version.update_message || "")}</textarea></label>
-            <label>下载地址（可留空）<input name="downloadUrl" value="${escapeHtml(version.download_url || "")}"></label>
+            <label>正式 APK 下载地址<input name="downloadUrl" value="${escapeHtml(version.download_url || "")}" placeholder="https://..." required></label>
             <label>发布状态<select name="status">${options(["DRAFT","PUBLISHED","DISABLED"], version.status || "DRAFT")}</select></label>
             <label class="checkbox-row"><input type="checkbox" name="forceUpdate" ${version.force_update ? "checked" : ""}> 强制更新</label>
-            <p class="subtle version-policy-note">开启后，低于该版本的客户端必须完成更新后才能继续使用。</p>
-            <label>APK SHA-256（可留空）<input name="apkSha256" maxlength="64" value="${escapeHtml(version.apk_sha256 || "")}"></label>
-            <label>APK 大小（字节，可留空）<input type="number" min="1" name="apkSize" value="${version.apk_size || ""}"></label>
-            <p class="muted">仅“已发布”版本会返回给 App。APK 地址、SHA-256 和大小会随更新合同一并下发，由客户端负责下载、校验与安装。</p>
-            <button class="primary">保存版本配置</button>
+            <p class="subtle version-policy-note">最低支持版本是硬门槛；开启强制更新后，低于最新版本的客户端必须完成更新后才能继续使用。</p>
+            <label>APK SHA-256（自动读取）<input name="apkSha256" maxlength="64" value="${escapeHtml(version.apk_sha256 || "")}" readonly></label>
+            <label>APK 大小（自动读取）<input type="number" min="1" name="apkSize" value="${version.apk_size || ""}" readonly></label>
+            <label>正式包名（自动校验）<input name="packageName" value="${escapeHtml(version.package_name || "com.mychangli.app")}" readonly></label>
+            <label>正式签名证书 SHA-256（自动校验）<input name="signingCertificateSha256" value="${escapeHtml(version.signing_certificate_sha256 || "")}" readonly></label>
+            <input type="hidden" name="metadataVerified" value="${version.metadata_verified ? "true" : "false"}">
+            <p class="muted">APK 元数据状态：<strong>${metadataState}</strong>。Draft 可暂缺发布材料；保存为 Published 时，服务端必须验证下载文件大小、SHA-256、包名与正式签名证书。</p>
+            <button class="primary">保存并校验版本配置</button>
           </form>
         </article>
         <article class="card">
@@ -762,6 +805,21 @@ const renderers = {
 
 function options(values, selected, allowBlank = false) {
   return `${allowBlank ? '<option value="">全部</option>' : ""}${values.map((value) => `<option value="${value}" ${value === selected ? "selected" : ""}>${escapeHtml(statusText(value))}</option>`).join("")}`;
+}
+
+function releaseVersionOptions(versions, selected) {
+  const items = [...(versions || [])];
+  if (!items.some((item) => Number(item.version_code) === Number(selected))) {
+    items.push({
+      version_code: selected,
+      version_name: "当前配置版本",
+      status: "DRAFT",
+    });
+  }
+  return items
+    .sort((a, b) => Number(b.version_code) - Number(a.version_code))
+    .map((item) => `<option value="${Number(item.version_code)}" ${Number(item.version_code) === Number(selected) ? "selected" : ""}>V${escapeHtml(item.version_name)}（${Number(item.version_code)}）</option>`)
+    .join("");
 }
 
 function lostStatusOptions(type, selected) {
@@ -1057,6 +1115,7 @@ content.addEventListener("click", async (event) => {
     if (action === "bulk-limit-users") return openBulkUserAction("limit");
     if (action === "bulk-restore-users") return openBulkUserAction("restore");
     if (action === "bulk-delete-users") return openBulkUserAction("delete");
+    if (action === "bulk-purge-users") return openBulkUserAction("purge");
     if (action === "reservations-page") {
       return renderers.reservations({...state.filters, page: button.dataset.page});
     }
@@ -1160,7 +1219,8 @@ content.addEventListener("click", async (event) => {
       return openDialog("用户档案", `
         <div class="stack">
           <p><strong>${escapeHtml(u.nickname)}</strong> · ${escapeHtml(u.phone || "无手机号")}</p>
-          <p class="muted">内部用户 ID：${escapeHtml(u.id)}</p>
+          <p>用户编号：<strong>${escapeHtml(u.user_code || "待生成")}</strong></p>
+          <details><summary>技术信息</summary><p class="muted">内部 UUID：${escapeHtml(u.id)}</p></details>
           <p>账号状态：${accountBadge(u.account_status)} · 原因：${escapeHtml(u.account_status_reason || "无")}</p>
           <p class="muted">注册：${formatTime(u.created_at)} · 最近活跃：${formatTime(u.last_active_at)} · 状态生效：${formatTime(u.account_status_changed_at)} · 到期：${formatTime(u.account_status_expires_at)}</p>
           <div class="grid two-columns">

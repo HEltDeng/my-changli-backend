@@ -27,6 +27,8 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from typing import Any
 from urllib.parse import parse_qs, urlparse
+from urllib import error as urllib_error
+from urllib import request as urllib_request
 from cryptography.fernet import Fernet, InvalidToken
 from PIL import Image, UnidentifiedImageError
 from core import (
@@ -36,6 +38,7 @@ from core import (
     MAX_BODY,
     SESSION_SECONDS,
     BUSINESS_TIMEZONE_NAME,
+    BUSINESS_TIMEZONE,
     business_day_bounds_ms,
     business_today,
     connection,
@@ -84,7 +87,7 @@ ADMIN_ROLES = {
     "CONTENT_OPERATOR",
 }
 ROLE_PERMISSIONS = {
-    "SUPER_ADMIN": {"*"},
+    "SUPER_ADMIN": {"*", "USER_PURGE"},
     "SPORTS_OPERATOR": {"SPORTS_VIEW", "SPORTS_MANAGE", "SPORTS_PII_VIEW"},
     "LOST_FOUND_OPERATOR": {"LOST_VIEW", "LOST_MANAGE", "LOST_PII_VIEW"},
     "LIBRARY_OPERATOR": {"LIBRARY_VIEW", "LIBRARY_MANAGE", "LIBRARY_PII_VIEW"},
@@ -92,6 +95,10 @@ ROLE_PERMISSIONS = {
 }
 CONTROLLED_FEATURES = {"sports_reservation", "lost_found", "resource_library"}
 DEFAULT_DEVICE_NICKNAME = "长理同学"
+OFFICIAL_PACKAGE_NAME = "com.mychangli.app"
+OFFICIAL_SIGNING_CERTIFICATE_SHA256 = (
+    "2C3B934931C26719C1A55FA707760A41E18BA15B00561F97691FE1D452F4BF3D"
+)
 
 
 def ensure_column(
@@ -102,6 +109,143 @@ def ensure_column(
     }
     if column not in columns:
         db.execute(f"ALTER TABLE {table} ADD COLUMN {column} {definition}")
+
+
+def _user_code_components(created_at: int | None) -> tuple[str, int]:
+    timestamp = int(created_at or now_ms())
+    local_time = datetime.fromtimestamp(timestamp / 1000, tz=BUSINESS_TIMEZONE)
+    prefix = local_time.strftime("%Y%m%d%H%M")
+    return prefix, int(prefix)
+
+
+def backfill_user_codes(db: sqlite3.Connection) -> None:
+    """Assign stable, time-readable codes without using mutable profile data."""
+    rows = db.execute(
+        "SELECT id,created_at,user_code FROM users ORDER BY created_at ASC,id ASC"
+    ).fetchall()
+    counters: dict[str, int] = {}
+    occupied_codes: set[str] = {
+        str(row["user_code"])
+        for row in rows
+        if re.fullmatch(r"\d{17}", str(row["user_code"] or ""))
+    }
+    seen_codes: set[str] = set()
+    updates: list[tuple[str, str]] = []
+    for row in rows:
+        prefix, _ = _user_code_components(row["created_at"])
+        existing = str(row["user_code"] or "")
+        if (
+            re.fullmatch(r"\d{17}", existing)
+            and existing not in seen_codes
+        ):
+            seen_codes.add(existing)
+            if existing[:12] == prefix:
+                sequence = int(existing[-5:])
+                counters[prefix] = max(counters.get(prefix, 0), sequence)
+            continue
+        sequence = counters.get(prefix, 0) + 1
+        while f"{prefix}{sequence:05d}" in occupied_codes:
+            sequence += 1
+        if sequence > 99999:
+            raise RuntimeError(f"user_code minute capacity exceeded: {prefix}")
+        counters[prefix] = sequence
+        code = f"{prefix}{sequence:05d}"
+        occupied_codes.add(code)
+        updates.append((code, row["id"]))
+    for code, user_id in updates:
+        db.execute("UPDATE users SET user_code=? WHERE id=?", (code, user_id))
+    for prefix, sequence in counters.items():
+        db.execute(
+            """INSERT INTO user_code_sequences(registration_minute,next_sequence)
+               VALUES(?,?) ON CONFLICT(registration_minute) DO UPDATE SET
+               next_sequence=MAX(user_code_sequences.next_sequence,excluded.next_sequence)""",
+            (prefix, sequence + 1),
+        )
+
+
+def allocate_user_code(db: sqlite3.Connection, created_at: int | None = None) -> str:
+    """Reserve one immutable code under a SQLite write lock.
+
+    A failed user insert can leave a gap, but a business number is never reused.
+    """
+    timestamp = int(created_at or now_ms())
+    prefix, _ = _user_code_components(timestamp)
+    started_transaction = not db.in_transaction
+    if started_transaction:
+        db.execute("BEGIN IMMEDIATE")
+    try:
+        row = db.execute(
+            "SELECT next_sequence FROM user_code_sequences WHERE registration_minute=?",
+            (prefix,),
+        ).fetchone()
+        sequence = int(row["next_sequence"]) if row else 1
+        if sequence > 99999:
+            raise ApiError(409, "USER_CODE_CAPACITY_EXCEEDED", "当前分钟用户编号已达上限")
+        next_sequence = sequence + 1
+        if row:
+            db.execute(
+                "UPDATE user_code_sequences SET next_sequence=? WHERE registration_minute=?",
+                (next_sequence, prefix),
+            )
+        else:
+            db.execute(
+                "INSERT INTO user_code_sequences(registration_minute,next_sequence) VALUES(?,?)",
+                (prefix, next_sequence),
+            )
+        if started_transaction:
+            db.commit()
+        return f"{prefix}{sequence:05d}"
+    except Exception:
+        if started_transaction:
+            db.rollback()
+        raise
+
+
+def sync_release_history(db: sqlite3.Connection) -> None:
+    row = db.execute(
+        "SELECT * FROM app_versions WHERE platform='android'"
+    ).fetchone()
+    if not row:
+        return
+    db.execute(
+        """INSERT INTO app_release_versions(
+               platform,version_code,version_name,update_message,download_url,
+               apk_sha256,apk_size,package_name,signing_certificate_sha256,
+               metadata_verified,status,published_at,created_at,created_by,
+               updated_by,updated_at
+           ) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+           ON CONFLICT(platform,version_code) DO UPDATE SET
+               version_name=excluded.version_name,
+               update_message=excluded.update_message,
+               download_url=excluded.download_url,
+               apk_sha256=excluded.apk_sha256,
+               apk_size=excluded.apk_size,
+               package_name=excluded.package_name,
+               signing_certificate_sha256=excluded.signing_certificate_sha256,
+               metadata_verified=excluded.metadata_verified,
+               status=excluded.status,
+               published_at=excluded.published_at,
+               updated_by=excluded.updated_by,
+               updated_at=excluded.updated_at""",
+        (
+            row["platform"],
+            row["latest_version_code"],
+            row["latest_version_name"],
+            row["update_message"],
+            row["download_url"],
+            row["apk_sha256"],
+            row["apk_size"],
+            row["package_name"],
+            row["signing_certificate_sha256"],
+            row["metadata_verified"],
+            row["status"],
+            row["published_at"],
+            row["created_at"] or row["updated_at"],
+            row["created_by"],
+            row["updated_by"],
+            row["updated_at"],
+        ),
+    )
 
 
 def initialize_database() -> None:
@@ -116,6 +260,7 @@ def initialize_database() -> None:
         ensure_column(db, "venues", "maintenance_note", "TEXT NOT NULL DEFAULT ''")
         ensure_column(db, "venues", "expected_restore_at", "INTEGER")
         ensure_column(db, "users", "account_type", "TEXT NOT NULL DEFAULT 'DEVICE'")
+        ensure_column(db, "users", "user_code", "TEXT")
         ensure_column(db, "users", "nickname", "TEXT NOT NULL DEFAULT '长理同学'")
         ensure_column(db, "users", "phone_hash", "TEXT")
         ensure_column(db, "users", "phone_masked", "TEXT")
@@ -144,6 +289,9 @@ def initialize_database() -> None:
         ensure_column(db, "users", "first_login_at", "INTEGER")
         ensure_column(db, "app_versions", "apk_sha256", "TEXT")
         ensure_column(db, "app_versions", "apk_size", "INTEGER")
+        ensure_column(db, "app_versions", "package_name", "TEXT")
+        ensure_column(db, "app_versions", "signing_certificate_sha256", "TEXT")
+        ensure_column(db, "app_versions", "metadata_verified", "INTEGER NOT NULL DEFAULT 0")
         ensure_column(db, "app_versions", "force_update", "INTEGER NOT NULL DEFAULT 0")
         ensure_column(db, "app_versions", "status", "TEXT NOT NULL DEFAULT 'DRAFT'")
         ensure_column(db, "app_versions", "published_at", "INTEGER")
@@ -167,6 +315,18 @@ def initialize_database() -> None:
         ensure_column(db, "feedback", "internal_note", "TEXT NOT NULL DEFAULT ''")
         ensure_column(db, "feedback", "handled_by", "TEXT")
         ensure_column(db, "feedback", "resolved_at", "INTEGER")
+        ensure_column(db, "user_behavior_events", "device_id", "TEXT")
+        ensure_column(db, "user_behavior_events", "installation_id", "TEXT")
+        ensure_column(
+            db,
+            "user_behavior_events",
+            "identity_kind",
+            "TEXT NOT NULL DEFAULT 'LEGACY'",
+        )
+        db.execute(
+            "CREATE INDEX IF NOT EXISTS user_behavior_events_identity "
+            "ON user_behavior_events(identity_kind, device_id, created_at DESC)"
+        )
         ensure_column(
             db,
             "reservation_rules",
@@ -214,6 +374,11 @@ def initialize_database() -> None:
                WHERE created_at IS NULL"""
         )
         db.execute("CREATE INDEX IF NOT EXISTS users_admin_role ON users(role,admin_role,admin_enabled)")
+        backfill_user_codes(db)
+        db.execute(
+            "CREATE UNIQUE INDEX IF NOT EXISTS users_user_code_unique "
+            "ON users(user_code) WHERE user_code IS NOT NULL"
+        )
         db.execute("CREATE INDEX IF NOT EXISTS users_last_active ON users(last_active_at)")
         db.execute("CREATE INDEX IF NOT EXISTS sessions_user ON sessions(user_id,expires_at)")
         db.execute("CREATE INDEX IF NOT EXISTS reservations_booking ON reservations(booking_date,status)")
@@ -283,6 +448,7 @@ def initialize_database() -> None:
                ON CONFLICT(platform) DO NOTHING""",
             (timestamp, timestamp),
         )
+        sync_release_history(db)
         for key, enabled in (
             ("sports_reservation", 1),
             ("lost_found", 1),
@@ -402,15 +568,23 @@ def bootstrap_admin() -> None:
         return
     digest, salt = password_record(password)
     with connection() as db:
-        db.execute(
-            """INSERT INTO users(
-                   id,username,password_hash,password_salt,role,account_type,nickname,
-                   admin_permissions_json,admin_role,admin_enabled,account_status,created_at
-               ) VALUES(?,?,?,?, 'ADMIN','ADMIN','本地管理员','["*"]',
-                        'SUPER_ADMIN',1,'ACTIVE',?)
-               ON CONFLICT(username) DO NOTHING""",
-            (str(uuid.uuid4()), username, digest, salt, now_ms()),
-        )
+        if not db.execute("SELECT 1 FROM users WHERE username=?", (username,)).fetchone():
+            created_at = now_ms()
+            db.execute(
+                """INSERT INTO users(
+                       id,username,user_code,password_hash,password_salt,role,account_type,nickname,
+                       admin_permissions_json,admin_role,admin_enabled,account_status,created_at
+                   ) VALUES(?,?,?,?,?,'ADMIN','ADMIN','本地管理员','["*"]',
+                            'SUPER_ADMIN',1,'ACTIVE',?)""",
+                (
+                    str(uuid.uuid4()),
+                    username,
+                    allocate_user_code(db, created_at),
+                    digest,
+                    salt,
+                    created_at,
+                ),
+            )
 
 
 def issue_token(db: sqlite3.Connection, user_id: str) -> str:
@@ -485,6 +659,248 @@ def reservation_pii_digest(kind: str, value: Any) -> str | None:
 
 def phone_mask(phone: str) -> str:
     return f"{phone[:3]}****{phone[-4:]}"
+
+
+@lru_cache(maxsize=1)
+def device_key_secret() -> bytes:
+    """Derive a separate device HMAC key from the existing server secret."""
+    configured = os.getenv("MY_CHANGLI_DEVICE_KEY_SECRET", "").encode()
+    source = configured if len(configured) >= 32 else phone_hash_secret()
+    return hmac.new(source, b"my-changli-device-key-v1", hashlib.sha256).digest()
+
+
+def normalize_device_scoped_id(value: Any) -> str | None:
+    candidate = str(value or "").strip().lower()
+    if not re.fullmatch(r"[0-9a-f]{64}", candidate):
+        return None
+    return candidate
+
+
+def device_key_hash(device_scoped_id: str) -> str:
+    return hmac.new(
+        device_key_secret(),
+        f"device-scoped-v1:{device_scoped_id}".encode(),
+        hashlib.sha256,
+    ).hexdigest()
+
+
+def _client_version(data: dict[str, Any]) -> tuple[str | None, int | None]:
+    version_name = str(data.get("versionName", "")).strip()[:40] or None
+    raw_code = data.get("versionCode")
+    try:
+        version_code = int(raw_code) if raw_code not in (None, "") else None
+    except (TypeError, ValueError):
+        version_code = None
+    if version_code is not None and version_code < 1:
+        version_code = None
+    return version_name, version_code
+
+
+def record_device_identity(
+    db: sqlite3.Connection,
+    data: dict[str, Any],
+    *,
+    user_id: str | None = None,
+    create_anonymous_user: bool = False,
+) -> dict[str, Any]:
+    """Record an installation and, when needed, one stable anonymous user.
+
+    V1.0.3 payloads omit ``deviceScopedId`` and are retained as legacy
+    installations. They never enter trusted device counts.
+    """
+    installation_id = str(data.get("installationId", "")).strip()
+    if not installation_id or len(installation_id) > 100:
+        raise ApiError(400, "INVALID_INSTALLATION_ID", "安装实例标识无效")
+    scoped_id = normalize_device_scoped_id(data.get("deviceScopedId"))
+    version_name, version_code = _client_version(data)
+    timestamp = now_ms()
+    db.execute("BEGIN IMMEDIATE")
+    try:
+        trusted_device_id: str | None = None
+        if scoped_id:
+            key_hash = device_key_hash(scoped_id)
+            device = db.execute(
+                "SELECT * FROM devices WHERE device_key_hash=?", (key_hash,)
+            ).fetchone()
+            if not device:
+                trusted_device_id = str(uuid.uuid4())
+                db.execute(
+                    """INSERT INTO devices(
+                           id,device_key_hash,first_seen_at,last_seen_at,
+                           first_app_version_name,first_app_version_code,
+                           last_app_version_name,last_app_version_code,
+                           install_count,created_at,updated_at
+                       ) VALUES(?,?,?,?,?,?,?,?,0,?,?)""",
+                    (
+                        trusted_device_id,
+                        key_hash,
+                        timestamp,
+                        timestamp,
+                        version_name,
+                        version_code,
+                        version_name,
+                        version_code,
+                        timestamp,
+                        timestamp,
+                    ),
+                )
+            else:
+                trusted_device_id = device["id"]
+                db.execute(
+                    """UPDATE devices SET last_seen_at=?,last_app_version_name=?,
+                       last_app_version_code=?,updated_at=? WHERE id=?""",
+                    (timestamp, version_name, version_code, timestamp, device["id"]),
+                )
+
+        installation = db.execute(
+            "SELECT * FROM installations WHERE installation_id=?", (installation_id,)
+        ).fetchone()
+        if not installation:
+            db.execute(
+                """INSERT INTO installations(
+                       installation_id,device_id,first_seen_at,last_seen_at,
+                       first_app_version_name,first_app_version_code,
+                       last_app_version_name,last_app_version_code,legacy,
+                       created_at,updated_at
+                   ) VALUES(?,?,?,?,?,?,?,?,?,?,?)""",
+                (
+                    installation_id,
+                    trusted_device_id,
+                    timestamp,
+                    timestamp,
+                    version_name,
+                    version_code,
+                    version_name,
+                    version_code,
+                    0 if trusted_device_id else 1,
+                    timestamp,
+                    timestamp,
+                ),
+            )
+            if trusted_device_id:
+                db.execute(
+                    "UPDATE devices SET install_count=install_count+1,updated_at=? WHERE id=?",
+                    (timestamp, trusted_device_id),
+                )
+        else:
+            # Never silently reassign an installation to a different device.
+            # A replay or malformed client is retained as legacy evidence.
+            if installation["device_id"] not in (None, trusted_device_id):
+                trusted_device_id = None
+            elif installation["device_id"] is None and trusted_device_id:
+                db.execute(
+                    """UPDATE installations SET device_id=?,legacy=0,
+                       last_seen_at=?,last_app_version_name=?,last_app_version_code=?,
+                       updated_at=? WHERE installation_id=?""",
+                    (
+                        trusted_device_id,
+                        timestamp,
+                        version_name,
+                        version_code,
+                        timestamp,
+                        installation_id,
+                    ),
+                )
+                db.execute(
+                    "UPDATE devices SET install_count=install_count+1,updated_at=? WHERE id=?",
+                    (timestamp, trusted_device_id),
+                )
+            else:
+                db.execute(
+                    """UPDATE installations SET last_seen_at=?,last_app_version_name=?,
+                       last_app_version_code=?,updated_at=? WHERE installation_id=?""",
+                    (timestamp, version_name, version_code, timestamp, installation_id),
+                )
+
+        anonymous_user_id: str | None = None
+        if create_anonymous_user:
+            if trusted_device_id:
+                row = db.execute(
+                    """SELECT u.* FROM users u JOIN user_devices ud ON ud.user_id=u.id
+                       WHERE ud.device_id=? AND u.role='USER' AND u.account_type='DEVICE'
+                         AND u.account_status!='DELETED'
+                       ORDER BY ud.first_seen_at ASC LIMIT 1""",
+                    (trusted_device_id,),
+                ).fetchone()
+                if row:
+                    anonymous_user_id = row["id"]
+                else:
+                    legacy = db.execute(
+                        """SELECT * FROM users WHERE username=? AND role='USER'
+                           AND account_type='DEVICE' AND account_status!='DELETED'""",
+                        (device_username(installation_id),),
+                    ).fetchone()
+                    if legacy:
+                        anonymous_user_id = legacy["id"]
+                    else:
+                        anonymous_user_id = str(uuid.uuid4())
+                        digest, salt = password_record(secrets.token_urlsafe(32))
+                        created_at = now_ms()
+                        db.execute(
+                            """INSERT INTO users(
+                                   id,username,user_code,password_hash,password_salt,
+                                   role,account_type,nickname,account_status,created_at
+                               ) VALUES(?,?,?,?,?,'USER','DEVICE',?,'ACTIVE',?)""",
+                            (
+                                anonymous_user_id,
+                                f"device_{trusted_device_id}",
+                                allocate_user_code(db, created_at),
+                                digest,
+                                salt,
+                                DEFAULT_DEVICE_NICKNAME,
+                                created_at,
+                            ),
+                        )
+                db.execute(
+                    """INSERT INTO user_devices(user_id,device_id,first_seen_at,last_seen_at)
+                       VALUES(?,?,?,?) ON CONFLICT(user_id,device_id) DO UPDATE SET
+                       last_seen_at=excluded.last_seen_at""",
+                    (anonymous_user_id, trusted_device_id, timestamp, timestamp),
+                )
+            else:
+                legacy = db.execute(
+                    "SELECT * FROM users WHERE username=? AND role='USER' AND account_type='DEVICE'",
+                    (device_username(installation_id),),
+                ).fetchone()
+                if legacy and legacy["account_status"] != "DELETED":
+                    anonymous_user_id = legacy["id"]
+                else:
+                    anonymous_user_id = str(uuid.uuid4())
+                    digest, salt = password_record(secrets.token_urlsafe(32))
+                    created_at = now_ms()
+                    db.execute(
+                        """INSERT INTO users(
+                               id,username,user_code,password_hash,password_salt,
+                               role,account_type,nickname,account_status,created_at
+                           ) VALUES(?,?,?,?,?,'USER','DEVICE',?,'ACTIVE',?)""",
+                        (
+                            anonymous_user_id,
+                            device_username(installation_id),
+                            allocate_user_code(db, created_at),
+                            digest,
+                            salt,
+                            DEFAULT_DEVICE_NICKNAME,
+                            created_at,
+                        ),
+                    )
+
+        if user_id and trusted_device_id:
+            db.execute(
+                """INSERT INTO user_devices(user_id,device_id,first_seen_at,last_seen_at)
+                   VALUES(?,?,?,?) ON CONFLICT(user_id,device_id) DO UPDATE SET
+                   last_seen_at=excluded.last_seen_at""",
+                (user_id, trusted_device_id, timestamp, timestamp),
+            )
+        db.commit()
+        return {
+            "installation_id": installation_id,
+            "device_id": trusted_device_id,
+            "anonymous_user_id": anonymous_user_id,
+            "trusted": bool(trusted_device_id),
+        }
+    except Exception:
+        db.rollback()
+        raise
 
 
 @lru_cache(maxsize=1)
@@ -716,6 +1132,10 @@ def append_user_search(
         clauses.append(f"{alias}.phone_hash=?")
         values.append(phone_digest(compact))
         return
+    if re.fullmatch(r"\d{17}", compact):
+        clauses.append(f"{alias}.user_code=?")
+        values.append(compact)
+        return
     if re.fullmatch(r"[A-Za-z0-9_-]{6,32}", compact):
         clauses.append(
             f"({alias}.reservation_student_id_hash=? OR {alias}.id=?)"
@@ -731,9 +1151,9 @@ def append_user_search(
     token = f"%{term}%"
     clauses.append(
         f"""({alias}.nickname LIKE ? OR {alias}.phone_masked LIKE ?
-            OR {alias}.id LIKE ?)"""
+            OR {alias}.id LIKE ? OR {alias}.user_code LIKE ?)"""
     )
-    values.extend([token, token, token])
+    values.extend([token, token, token, token])
 
 
 def validate_external_url(value: Any, *, required: bool = True) -> str | None:
@@ -850,6 +1270,16 @@ def migrate_device_data(
         "SELECT * FROM users WHERE username=? AND account_type='DEVICE'",
         (device_username(installation_id),),
     ).fetchone()
+    if not source:
+        source = db.execute(
+            """SELECT u.* FROM users u
+               JOIN user_devices ud ON ud.user_id=u.id
+               JOIN installations i ON i.device_id=ud.device_id
+               WHERE i.installation_id=? AND u.account_type='DEVICE'
+                 AND u.account_status!='DELETED'
+               ORDER BY ud.first_seen_at ASC LIMIT 1""",
+            (installation_id,),
+        ).fetchone()
     if not source or source["id"] == target_user_id:
         return False
     source_id = source["id"]
@@ -932,6 +1362,7 @@ def serialize_user(user: sqlite3.Row) -> dict[str, Any]:
         "id": user["id"],
         "role": user["role"],
         "accountType": user["account_type"],
+        "userCode": user["user_code"],
         "nickname": user["nickname"],
         "phoneMasked": user["phone_masked"],
         # Academic-system identity is deliberately not part of the My Changli account API.
@@ -969,6 +1400,9 @@ def serialize_public_version(
             "apkUrl": version.get("download_url"),
             "apkSha256": version.get("apk_sha256"),
             "apkSize": version.get("apk_size"),
+            "packageName": version.get("package_name"),
+            "signingCertificateSha256": version.get("signing_certificate_sha256"),
+            "metadataVerified": bool(version.get("metadata_verified")),
             "publishedAt": version.get("published_at"),
             "forceUpdate": (
                 configured_force_update
@@ -1028,22 +1462,37 @@ def write_user_event(
     client_source: str = "APP",
     client_version: str | None = None,
     risk_flag: str | None = None,
+    device_id: str | None = None,
+    installation_id: str | None = None,
+    identity_kind: str | None = None,
 ) -> None:
     """Store only a minimal operational event; never accepts free-form user content."""
     normalized_result = result.upper()
     if normalized_result not in USER_EVENT_RESULTS:
         normalized_result = "FAILURE"
     timestamp = now_ms()
+    if identity_kind not in {"USER", "DEVICE", "LEGACY"}:
+        identity_kind = "DEVICE" if device_id else "LEGACY"
+        if user_id:
+            user = db.execute(
+                "SELECT account_type FROM users WHERE id=?", (user_id,)
+            ).fetchone()
+            if user and user["account_type"] == "PHONE":
+                identity_kind = "USER"
     db.execute(
         """INSERT INTO user_behavior_events(
                id,user_id,module,event_type,result,target_type,target_id,
-               client_source,client_version,risk_flag,created_at
-           ) VALUES(?,?,?,?,?,?,?,?,?,?,?)""",
+               client_source,client_version,risk_flag,device_id,installation_id,
+               identity_kind,created_at
+           ) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
         (
             str(uuid.uuid4()), user_id, module[:40], event_type[:60],
             normalized_result, (target_type or "")[:40] or None,
             (target_id or "")[:100] or None, client_source[:20],
             (client_version or "")[:40] or None, (risk_flag or "")[:60] or None,
+            device_id,
+            (installation_id or "")[:100] or None,
+            identity_kind,
             timestamp,
         ),
     )
@@ -1202,6 +1651,97 @@ def delete_user_account_data(
         "id": user_id,
         "removedImages": len(image_names),
         "removedReservations": len(reservation_ids),
+    }
+
+
+def purge_deleted_user(
+    db: sqlite3.Connection,
+    user: sqlite3.Row,
+) -> dict[str, Any]:
+    """Permanently remove one already-deleted user after FK-aware cleanup."""
+    if user["role"] != "USER":
+        raise ApiError(409, "ADMIN_ACCOUNT_PROTECTED", "管理员账号不能永久清理")
+    if user["account_status"] != "DELETED":
+        raise ApiError(409, "PURGE_REQUIRES_DELETED", "只有已注销账号可以永久清理")
+
+    user_id = user["id"]
+    image_names = [
+        row["image_name"]
+        for row in db.execute(
+            "SELECT image_name FROM lost_found_posts WHERE owner_user_id=? AND image_name IS NOT NULL",
+            (user_id,),
+        ).fetchall()
+    ]
+    association_counts = {
+        "reservations": db.execute(
+            "SELECT COUNT(*) AS count FROM reservations WHERE user_id=?", (user_id,)
+        ).fetchone()["count"],
+        "lostFound": db.execute(
+            "SELECT COUNT(*) AS count FROM lost_found_posts WHERE owner_user_id=?", (user_id,)
+        ).fetchone()["count"],
+        "feedback": db.execute(
+            "SELECT COUNT(*) AS count FROM feedback WHERE user_id=?", (user_id,)
+        ).fetchone()["count"],
+        "resourceViews": db.execute(
+            "SELECT COUNT(*) AS count FROM resource_views WHERE user_id=?", (user_id,)
+        ).fetchone()["count"],
+        "resourceFavorites": db.execute(
+            "SELECT COUNT(*) AS count FROM resource_favorites WHERE user_id=?", (user_id,)
+        ).fetchone()["count"],
+        "userEvents": db.execute(
+            "SELECT COUNT(*) AS count FROM user_behavior_events WHERE user_id=?", (user_id,)
+        ).fetchone()["count"],
+    }
+    reservation_ids = [
+        row["id"]
+        for row in db.execute(
+            "SELECT id FROM reservations WHERE user_id=?", (user_id,)
+        ).fetchall()
+    ]
+    if reservation_ids:
+        placeholders = ",".join("?" for _ in reservation_ids)
+        db.execute(
+            f"DELETE FROM reservation_events WHERE reservation_id IN ({placeholders})",
+            reservation_ids,
+        )
+
+    # Delete dependent/user-authored records before the users row. Tables that
+    # represent shared platform history retain their rows but lose the user FK.
+    db.execute("DELETE FROM feedback WHERE user_id=?", (user_id,))
+    db.execute("DELETE FROM lost_found_posts WHERE owner_user_id=?", (user_id,))
+    db.execute("DELETE FROM lost_found_favorites WHERE user_id=?", (user_id,))
+    db.execute("DELETE FROM lost_found_claims WHERE user_id=?", (user_id,))
+    db.execute("DELETE FROM lost_found_reports WHERE user_id=?", (user_id,))
+    db.execute("DELETE FROM lost_found_deletion_tombstones WHERE owner_user_id=?", (user_id,))
+    db.execute("DELETE FROM resource_favorites WHERE user_id=?", (user_id,))
+    db.execute("DELETE FROM resource_views WHERE user_id=?", (user_id,))
+    db.execute("DELETE FROM resource_complaints WHERE user_id=?", (user_id,))
+    db.execute("DELETE FROM resource_unlocks WHERE user_id=?", (user_id,))
+    db.execute("DELETE FROM risk_candidates WHERE user_id=?", (user_id,))
+    db.execute("DELETE FROM user_restrictions WHERE user_id=?", (user_id,))
+    db.execute("DELETE FROM user_behavior_events WHERE user_id=?", (user_id,))
+    db.execute(
+        "UPDATE reservation_events SET user_id=NULL,actor_user_id=NULL "
+        "WHERE user_id=? OR actor_user_id=?",
+        (user_id, user_id),
+    )
+    db.execute("DELETE FROM reservations WHERE user_id=?", (user_id,))
+    db.execute("DELETE FROM sessions WHERE user_id=?", (user_id,))
+    db.execute("UPDATE feedback SET handled_by=NULL WHERE handled_by=?", (user_id,))
+    db.execute("UPDATE admin_audit_logs SET actor_user_id=NULL WHERE actor_user_id=?", (user_id,))
+    db.execute("DELETE FROM user_devices WHERE user_id=?", (user_id,))
+    deleted = db.execute(
+        "DELETE FROM users WHERE id=? AND role='USER' AND account_status='DELETED'",
+        (user_id,),
+    ).rowcount
+    if deleted != 1:
+        raise ApiError(409, "PURGE_TARGET_CHANGED", "账号状态已变化，请刷新后重试")
+    for image_name in image_names:
+        run_safely_delete_upload(image_name)
+    return {
+        "userCode": user["user_code"],
+        "associationCounts": association_counts,
+        "removedImages": len(image_names),
     }
 
 
@@ -1422,6 +1962,37 @@ def upsert_restriction(
             now_ms(),
         ),
     )
+
+
+def verify_release_artifact(
+    download_url: str,
+    expected_sha256: str,
+    expected_size: int,
+) -> None:
+    """Verify the exact published bytes before a production version is saved."""
+    if not RUNTIME.is_production:
+        return
+    request = urllib_request.Request(
+        download_url,
+        headers={"User-Agent": "MyChangli-ReleaseGate/1.0"},
+    )
+    digest = hashlib.sha256()
+    size = 0
+    try:
+        with urllib_request.urlopen(request, timeout=30) as response:
+            while True:
+                chunk = response.read(1024 * 1024)
+                if not chunk:
+                    break
+                digest.update(chunk)
+                size += len(chunk)
+    except (urllib_error.URLError, TimeoutError, OSError) as exc:
+        raise ApiError(409, "APK_DOWNLOAD_UNAVAILABLE", "下载地址当前无法完成发布校验") from exc
+    actual_sha256 = digest.hexdigest()
+    if size != expected_size:
+        raise ApiError(409, "APK_SIZE_MISMATCH", "下载文件大小与发布元数据不一致")
+    if actual_sha256 != expected_sha256:
+        raise ApiError(409, "APK_SHA256_MISMATCH", "下载文件 SHA-256 与发布元数据不一致")
 
 
 class ApiHandler(BaseHTTPRequestHandler):
@@ -1775,27 +2346,33 @@ class ApiHandler(BaseHTTPRequestHandler):
     def auth_device(self) -> dict[str, Any]:
         data = self.body_json()
         install_id = required_text(data, "installationId", 100)
-        username = device_username(install_id)
         with connection() as db:
-            user = db.execute("SELECT * FROM users WHERE username=?", (username,)).fetchone()
+            identity = record_device_identity(
+                db,
+                data,
+                create_anonymous_user=True,
+            )
+            user = db.execute(
+                "SELECT * FROM users WHERE id=?",
+                (identity["anonymous_user_id"],),
+            ).fetchone()
             if not user:
-                digest, salt = password_record(secrets.token_urlsafe(32))
-                user_id = str(uuid.uuid4())
-                db.execute(
-                    """INSERT INTO users(
-                           id,username,password_hash,password_salt,role,account_type,
-                           nickname,account_status,created_at
-                       ) VALUES(?,?,?,?,'USER','DEVICE',?,'ACTIVE',?)""",
-                    (user_id, username, digest, salt, DEFAULT_DEVICE_NICKNAME, now_ms()),
-                )
-                user = db.execute("SELECT * FROM users WHERE id=?", (user_id,)).fetchone()
+                raise ApiError(500, "DEVICE_IDENTITY_FAILED", "设备身份初始化失败")
             timestamp = now_ms()
             db.execute(
                 """UPDATE users SET first_login_at=COALESCE(first_login_at,?),
                    last_active_at=? WHERE id=?""",
                 (timestamp, timestamp, user["id"]),
             )
-            write_user_event(db, user["id"], "ACCOUNT", "LOGIN_SUCCESS")
+            write_user_event(
+                db,
+                user["id"],
+                "ACCOUNT",
+                "LOGIN_SUCCESS",
+                device_id=identity["device_id"],
+                installation_id=install_id,
+                client_version=str(data.get("versionName", "")).strip() or None,
+            )
             user = db.execute("SELECT * FROM users WHERE id=?", (user["id"],)).fetchone()
             return {"token": issue_token(db, user["id"]), "user": serialize_user(user)}
 
@@ -1817,16 +2394,18 @@ class ApiHandler(BaseHTTPRequestHandler):
         digest, salt = password_record(password)
         with connection() as db:
             user_id = str(uuid.uuid4())
+            created_at = now_ms()
             try:
                 db.execute(
                     """INSERT INTO users(
-                           id,username,password_hash,password_salt,role,account_type,
+                           id,username,user_code,password_hash,password_salt,role,account_type,
                            nickname,phone_hash,phone_masked,phone_encrypted,
                            account_status,created_at
-                       ) VALUES(?,?,?,?,'USER','PHONE',?,?,?,?,'ACTIVE',?)""",
+                       ) VALUES(?,?,?,?,?,'USER','PHONE',?,?,?,?,'ACTIVE',?)""",
                     (
                         user_id,
                         username,
+                        allocate_user_code(db, created_at),
                         digest,
                         salt,
                         nickname,
@@ -1841,6 +2420,11 @@ class ApiHandler(BaseHTTPRequestHandler):
             migrated = migrate_device_data(
                 db, str(data.get("installationId", "")).strip() or None, user_id
             )
+            identity = (
+                record_device_identity(db, data, user_id=user_id)
+                if str(data.get("installationId", "")).strip()
+                else {"device_id": None, "installation_id": None}
+            )
             user = db.execute("SELECT * FROM users WHERE id=?", (user_id,)).fetchone()
             timestamp = now_ms()
             # Registration returns an authenticated session. Record both the
@@ -1850,8 +2434,25 @@ class ApiHandler(BaseHTTPRequestHandler):
                 "UPDATE users SET first_login_at=?,last_active_at=? WHERE id=?",
                 (timestamp, timestamp, user_id),
             )
-            write_user_event(db, user_id, "ACCOUNT", "USER_REGISTER")
-            write_user_event(db, user_id, "ACCOUNT", "LOGIN_SUCCESS")
+            write_user_event(
+                db,
+                user_id,
+                "ACCOUNT",
+                "USER_REGISTER",
+                device_id=identity["device_id"],
+                installation_id=identity["installation_id"],
+                client_version=str(data.get("versionName", "")).strip() or None,
+            )
+            write_user_event(
+                db,
+                user_id,
+                "ACCOUNT",
+                "LOGIN_SUCCESS",
+                device_id=identity["device_id"],
+                installation_id=identity["installation_id"],
+                client_version=str(data.get("versionName", "")).strip() or None,
+            )
+            user = db.execute("SELECT * FROM users WHERE id=?", (user_id,)).fetchone()
             return {"token": issue_token(db, user_id), "user": serialize_user(user)}
 
     def auth_login(self) -> dict[str, Any]:
@@ -1919,6 +2520,15 @@ class ApiHandler(BaseHTTPRequestHandler):
                 str(data.get("installationId", "")).strip() or None,
                 user["id"],
             )
+            identity = (
+                record_device_identity(
+                    db,
+                    data,
+                    user_id=user["id"] if user["role"] == "USER" else None,
+                )
+                if str(data.get("installationId", "")).strip()
+                else {"device_id": None, "installation_id": None}
+            )
             user = db.execute("SELECT * FROM users WHERE id=?", (user["id"],)).fetchone()
             timestamp = now_ms()
             db.execute(
@@ -1929,7 +2539,15 @@ class ApiHandler(BaseHTTPRequestHandler):
             if user["role"] == "ADMIN":
                 write_audit(db, user["id"], "ADMIN_LOGIN_SUCCEEDED", "ADMIN", user["id"], {"result": "SUCCESS"})
             else:
-                write_user_event(db, user["id"], "ACCOUNT", "LOGIN_SUCCESS")
+                write_user_event(
+                    db,
+                    user["id"],
+                    "ACCOUNT",
+                    "LOGIN_SUCCESS",
+                    device_id=identity["device_id"],
+                    installation_id=identity["installation_id"],
+                    client_version=str(data.get("versionName", "")).strip() or None,
+                )
             return {
                 "token": issue_token(db, user["id"]),
                 "user": serialize_user(user),
@@ -2952,7 +3570,8 @@ class ApiHandler(BaseHTTPRequestHandler):
             row = db.execute(
                 """SELECT platform,latest_version_code,minimum_version_code,
                    latest_version_name,update_message,download_url,apk_sha256,
-                   apk_size,force_update,published_at,status
+                   apk_size,package_name,signing_certificate_sha256,metadata_verified,
+                   force_update,published_at,status
                    FROM app_versions WHERE platform='android' AND status='PUBLISHED'"""
             ).fetchone()
             if not row:
@@ -2994,7 +3613,8 @@ class ApiHandler(BaseHTTPRequestHandler):
             version = db.execute(
                 """SELECT platform,latest_version_code,minimum_version_code,
                    latest_version_name,update_message,download_url,apk_sha256,
-                   apk_size,force_update,published_at
+                   apk_size,package_name,signing_certificate_sha256,metadata_verified,
+                   force_update,published_at
                    FROM app_versions WHERE platform='android' AND status='PUBLISHED'"""
             ).fetchone()
             if version:
@@ -3264,13 +3884,23 @@ class ApiHandler(BaseHTTPRequestHandler):
                     raise ApiError(400, "WEAK_PASSWORD", "管理员密码至少 12 位")
                 digest, salt = password_record(password)
                 admin_id = str(uuid.uuid4())
+                created_at = now_ms()
                 try:
                     db.execute(
-                        """INSERT INTO users(id,username,password_hash,password_salt,role,
+                        """INSERT INTO users(id,username,user_code,password_hash,password_salt,role,
                            account_type,nickname,admin_permissions_json,admin_role,admin_enabled,
                            account_status,created_at)
-                           VALUES(?,?,?,?,'ADMIN','ADMIN',?,'[]',?,1,'ACTIVE',?)""",
-                        (admin_id, username, digest, salt, nickname, role_name, now_ms()),
+                           VALUES(?,?,?,?,?,'ADMIN','ADMIN',?,'[]',?,1,'ACTIVE',?)""",
+                        (
+                            admin_id,
+                            username,
+                            allocate_user_code(db, created_at),
+                            digest,
+                            salt,
+                            nickname,
+                            role_name,
+                            created_at,
+                        ),
                     )
                 except sqlite3.IntegrityError as exc:
                     raise ApiError(409, "ADMIN_EXISTS", "管理员用户名已存在") from exc
@@ -3388,7 +4018,7 @@ class ApiHandler(BaseHTTPRequestHandler):
                 return [
                     full_admin_user_row(row)
                     for row in db.execute(
-                        """SELECT u.id,u.account_type,u.nickname,u.phone_masked,u.phone_encrypted,
+                        """SELECT u.id,u.user_code,u.account_type,u.nickname,u.phone_masked,u.phone_encrypted,
                                   u.reservation_student_id,u.reservation_name,
                                   u.reservation_profile_consented_at,
                                   u.account_status,u.account_status_reason,
@@ -3419,7 +4049,7 @@ class ApiHandler(BaseHTTPRequestHandler):
             match = re.fullmatch(r"/api/v1/admin/users/([^/]+)/details", path)
             if method == "GET" and match:
                 user = db.execute(
-                    """SELECT id,account_type,nickname,phone_masked,phone_encrypted,
+                    """SELECT id,user_code,account_type,nickname,phone_masked,phone_encrypted,
                               reservation_student_id,reservation_name,
                               reservation_profile_consented_at,
                               reservation_profile_version,
@@ -3501,6 +4131,24 @@ class ApiHandler(BaseHTTPRequestHandler):
                            client_source,client_version,risk_flag,created_at
                            FROM user_behavior_events WHERE user_id=?
                            ORDER BY created_at DESC LIMIT 100""", (user["id"],)
+                    )],
+                    "devices": [row_dict(row) for row in db.execute(
+                        """SELECT d.id,d.first_seen_at,d.last_seen_at,
+                                  d.first_app_version_name,d.first_app_version_code,
+                                  d.last_app_version_name,d.last_app_version_code,
+                                  d.install_count,d.created_at,d.updated_at
+                           FROM devices d JOIN user_devices ud ON ud.device_id=d.id
+                          WHERE ud.user_id=? ORDER BY d.last_seen_at DESC""",
+                        (user["id"],),
+                    )],
+                    "installations": [row_dict(row) for row in db.execute(
+                        """SELECT i.installation_id,i.device_id,i.first_seen_at,
+                                  i.last_seen_at,i.last_app_version_name AS app_version_name,
+                                  i.last_app_version_code AS app_version_code,
+                                  i.legacy,i.created_at,i.updated_at
+                           FROM installations i JOIN user_devices ud ON ud.device_id=i.device_id
+                          WHERE ud.user_id=? ORDER BY i.last_seen_at DESC LIMIT 100""",
+                        (user["id"],),
                     )],
                     "restriction": row_dict(active_restriction(db, user["id"])),
                 }, 200
@@ -3615,6 +4263,67 @@ class ApiHandler(BaseHTTPRequestHandler):
                     "nickname": reservation["nickname"],
                     "verificationStatus": reservation["verification_status"],
                     "expiresInSeconds": 60,
+                }, 200
+
+            if method == "POST" and path == "/api/v1/admin/users/purge":
+                require_admin_permission(admin, "USER_PURGE")
+                if not is_super_admin(admin):
+                    raise ApiError(403, "SUPER_ADMIN_REQUIRED", "只有超级管理员可以永久清理账号")
+                data = self.body_json()
+                raw_ids = data.get("ids")
+                if not isinstance(raw_ids, list):
+                    raise ApiError(400, "VALIDATION_ERROR", "ids 必须是数组")
+                user_ids = list(dict.fromkeys(str(value) for value in raw_ids))
+                if not user_ids or len(user_ids) > 100 or any(
+                    not re.fullmatch(r"[A-Za-z0-9-]{6,80}", value)
+                    for value in user_ids
+                ):
+                    raise ApiError(400, "VALIDATION_ERROR", "永久清理对象无效或超过 100 个")
+                confirmation = str(data.get("confirmation", "")).strip()
+                expected_confirmation = f"PURGE {len(user_ids)} DELETED USERS"
+                if confirmation != expected_confirmation:
+                    raise ApiError(400, "CONFIRMATION_REQUIRED", "永久清理确认文本不匹配")
+                placeholders = ",".join("?" for _ in user_ids)
+                targets = db.execute(
+                    f"""SELECT * FROM users WHERE role='USER' AND account_status='DELETED'
+                        AND id IN ({placeholders})""",
+                    user_ids,
+                ).fetchall()
+                if len(targets) != len(user_ids):
+                    raise ApiError(
+                        409,
+                        "PURGE_TARGET_CHANGED",
+                        "只能永久清理仍处于已注销状态的普通用户，请刷新后重试",
+                    )
+                operation_id = str(uuid.uuid4())
+                db.execute("BEGIN IMMEDIATE")
+                try:
+                    results = [purge_deleted_user(db, target) for target in targets]
+                    violations = db.execute("PRAGMA foreign_key_check").fetchall()
+                    if violations:
+                        raise ApiError(409, "PURGE_FOREIGN_KEY_BLOCKED", "账号关联清理后仍存在外键关联")
+                    write_audit(
+                        db,
+                        admin["id"],
+                        "USER_PURGE_COMPLETED",
+                        "USER_PURGE",
+                        operation_id,
+                        {
+                            "operationId": operation_id,
+                            "count": len(results),
+                            "userCodes": [item["userCode"] for item in results],
+                            "result": "SUCCESS",
+                        },
+                    )
+                    db.commit()
+                except Exception:
+                    db.rollback()
+                    raise
+                return {
+                    "operationId": operation_id,
+                    "purged": len(results),
+                    "userCodes": [item["userCode"] for item in results],
+                    "results": results,
                 }, 200
 
             if method == "POST" and path == "/api/v1/admin/users/bulk-status":
@@ -3939,6 +4648,7 @@ class ApiHandler(BaseHTTPRequestHandler):
                     day_start, day_end = business_day_bounds_ms()
                     clauses.extend(
                         [
+                            "u.account_type='PHONE'",
                             "e.event_type='LOGIN_SUCCESS'",
                             "e.result='SUCCESS'",
                             "e.created_at>=?",
@@ -4026,28 +4736,69 @@ class ApiHandler(BaseHTTPRequestHandler):
                 now = now_ms()
                 def count(sql: str, params: tuple[Any, ...] = ()) -> int:
                     return int(db.execute(sql, params).fetchone()["count"])
+                def canonical_activity_count(start: int, end: int | None = None) -> int:
+                    end_clause = "" if end is None else " AND e.created_at<?"
+                    params: tuple[Any, ...] = (start,) if end is None else (start, end)
+                    return count(
+                        """SELECT COUNT(*) AS count FROM (
+                               SELECT DISTINCT 'USER:' || e.user_id AS identity_key
+                                 FROM user_behavior_events e
+                                 JOIN users u ON u.id=e.user_id
+                                WHERE u.role='USER' AND u.account_type='PHONE'
+                                  AND e.result='SUCCESS' AND e.created_at>=?"""
+                        + end_clause
+                        + """
+                               UNION
+                               SELECT DISTINCT 'DEVICE:' || COALESCE(
+                                   e.device_id,
+                                   (SELECT ud.device_id FROM user_devices ud
+                                     WHERE ud.user_id=e.user_id
+                                     ORDER BY ud.last_seen_at DESC LIMIT 1)
+                               ) AS identity_key
+                                 FROM user_behavior_events e
+                                 JOIN users u ON u.id=e.user_id
+                                WHERE u.role='USER' AND u.account_type='DEVICE'
+                                  AND COALESCE(
+                                      e.device_id,
+                                      (SELECT ud.device_id FROM user_devices ud
+                                        WHERE ud.user_id=e.user_id
+                                        ORDER BY ud.last_seen_at DESC LIMIT 1)
+                                  ) IS NOT NULL
+                                  AND e.result='SUCCESS' AND e.created_at>=?"""
+                        + end_clause
+                        + ")""",
+                        params + params,
+                    )
                 return {
-                    "registeredAccounts": count("SELECT COUNT(*) AS count FROM users WHERE role='USER'"),
-                    "activeAccounts": count("SELECT COUNT(*) AS count FROM users WHERE role='USER' AND account_status='ACTIVE'"),
-                    "limitedAccounts": count("SELECT COUNT(*) AS count FROM users WHERE role='USER' AND account_status IN ('LIMITED','SUSPENDED')"),
-                    "disabledAccounts": count("SELECT COUNT(*) AS count FROM users WHERE role='USER' AND account_status='DISABLED'"),
-                    "pendingDeletionAccounts": count("SELECT COUNT(*) AS count FROM users WHERE role='USER' AND account_status='PENDING_DELETION'"),
-                    "deletedAccounts": count("SELECT COUNT(*) AS count FROM users WHERE role='USER' AND account_status='DELETED'"),
-                    "todayRegistrations": count("SELECT COUNT(*) AS count FROM users WHERE role='USER' AND created_at>=?", (day_start,)),
-                    "active5m": count("SELECT COUNT(*) AS count FROM users WHERE role='USER' AND last_active_at>=?", (now - 5 * 60 * 1000,)),
-                    "dau": count("SELECT COUNT(*) AS count FROM users WHERE role='USER' AND last_active_at>=?", (day_start,)),
-                    "wau": count("SELECT COUNT(*) AS count FROM users WHERE role='USER' AND last_active_at>=?", (now - 7 * 86400000,)),
-                    "mau": count("SELECT COUNT(*) AS count FROM users WHERE role='USER' AND last_active_at>=?", (now - 30 * 86400000,)),
+                    "registeredAccounts": count("SELECT COUNT(*) AS count FROM users WHERE role='USER' AND account_type='PHONE'"),
+                    "activeAccounts": count("SELECT COUNT(*) AS count FROM users WHERE role='USER' AND account_type='PHONE' AND account_status='ACTIVE'"),
+                    "limitedAccounts": count("SELECT COUNT(*) AS count FROM users WHERE role='USER' AND account_type='PHONE' AND account_status IN ('LIMITED','SUSPENDED')"),
+                    "disabledAccounts": count("SELECT COUNT(*) AS count FROM users WHERE role='USER' AND account_type='PHONE' AND account_status='DISABLED'"),
+                    "pendingDeletionAccounts": count("SELECT COUNT(*) AS count FROM users WHERE role='USER' AND account_type='PHONE' AND account_status='PENDING_DELETION'"),
+                    "deletedAccounts": count("SELECT COUNT(*) AS count FROM users WHERE role='USER' AND account_type='PHONE' AND account_status='DELETED'"),
+                    "todayRegistrations": count("SELECT COUNT(*) AS count FROM users WHERE role='USER' AND account_type='PHONE' AND created_at>=? AND created_at<?", (day_start, day_end)),
+                    "active5m": canonical_activity_count(now - 5 * 60 * 1000),
+                    "dau": canonical_activity_count(day_start, day_end),
+                    "wau": canonical_activity_count(now - 7 * 86400000),
+                    "mau": canonical_activity_count(now - 30 * 86400000),
                     "todayFirstLogins": count(
                         """SELECT COUNT(DISTINCT e.user_id) AS count
                            FROM user_behavior_events e
                            JOIN users u ON u.id=e.user_id
-                           WHERE u.role='USER'
+                           WHERE u.role='USER' AND u.account_type='PHONE'
                              AND e.event_type='LOGIN_SUCCESS'
                              AND e.result='SUCCESS'
                              AND e.created_at>=? AND e.created_at<?""",
                         (day_start, day_end),
                     ),
+                    "totalDevices": count("SELECT COUNT(*) AS count FROM devices"),
+                    "todayNewDevices": count("SELECT COUNT(*) AS count FROM devices WHERE created_at>=? AND created_at<?", (day_start, day_end)),
+                    "activeDevices": count("SELECT COUNT(*) AS count FROM devices WHERE last_seen_at>=?", (now - 5 * 60 * 1000,)),
+                    "activeDevices7d": count("SELECT COUNT(*) AS count FROM devices WHERE last_seen_at>=?", (now - 7 * 86400000,)),
+                    "activeDevices30d": count("SELECT COUNT(*) AS count FROM devices WHERE last_seen_at>=?", (now - 30 * 86400000,)),
+                    "totalInstallations": count("SELECT COUNT(*) AS count FROM installations"),
+                    "todayNewInstallations": count("SELECT COUNT(*) AS count FROM installations WHERE created_at>=? AND created_at<?", (day_start, day_end)),
+                    "reinstallations": count("SELECT COALESCE(SUM(CASE WHEN install_count>1 THEN install_count-1 ELSE 0 END),0) AS count FROM devices"),
                     "activeReservations": count("SELECT COUNT(*) AS count FROM reservations WHERE status='ACTIVE'"),
                     "todayReservations": count("SELECT COUNT(*) AS count FROM reservations WHERE booking_date=? AND status='ACTIVE'", (today,)),
                     "todayCancelledReservations": count("SELECT COUNT(*) AS count FROM reservations WHERE status='CANCELLED' AND cancelled_at>=?", (day_start,)),
@@ -5118,9 +5869,25 @@ class ApiHandler(BaseHTTPRequestHandler):
                 if version:
                     version["force_update"] = bool(version["force_update"])
                     version["forceUpdate"] = version["force_update"]
+                    version["metadata_verified"] = bool(version.get("metadata_verified"))
+                available_versions = [
+                    row_dict(row)
+                    for row in db.execute(
+                        """SELECT platform,version_code,version_name,update_message,
+                                  download_url,apk_sha256,apk_size,package_name,
+                                  signing_certificate_sha256,metadata_verified,status,
+                                  published_at,created_at,updated_at
+                           FROM app_release_versions
+                          WHERE platform='android' AND status='PUBLISHED'
+                          ORDER BY version_code DESC"""
+                    )
+                ]
+                for release in available_versions:
+                    release["metadata_verified"] = bool(release["metadata_verified"])
                 return {
                     "flags": flags,
                     "version": version,
+                    "availableVersions": available_versions,
                 }, 200
 
             match = re.fullmatch(r"/api/v1/admin/flags/([^/]+)", path)
@@ -5196,6 +5963,7 @@ class ApiHandler(BaseHTTPRequestHandler):
                 status = str(data.get("status", "DRAFT")).upper()
                 if status not in {"DRAFT", "PUBLISHED", "DISABLED"}:
                     raise ApiError(400, "VALIDATION_ERROR", "版本发布状态无效")
+                latest_name = required_text(data, "latestVersionName", 40)
                 download_url = str(data.get("downloadUrl", "")).strip()[:500] or None
                 if download_url and not re.fullmatch(r"https://[^\s]+|http://127\.0\.0\.1(?::\d+)?/[^\s]+", download_url):
                     raise ApiError(400, "UNSAFE_DOWNLOAD_URL", "下载地址必须为 HTTPS、本机地址或留空")
@@ -5213,14 +5981,40 @@ class ApiHandler(BaseHTTPRequestHandler):
                 if apk_size is not None and apk_size <= 0:
                     raise ApiError(400, "INVALID_APK_SIZE", "APK 大小必须大于 0")
                 force_update = parse_boolean(data.get("forceUpdate"), "forceUpdate")
+                package_name = str(data.get("packageName", "")).strip()[:200] or None
+                certificate = str(data.get("signingCertificateSha256", "")).strip().upper() or None
+                metadata_verified = parse_boolean(
+                    data.get("metadataVerified"),
+                    "metadataVerified",
+                    default=False,
+                )
+                if certificate and not re.fullmatch(r"[0-9A-F]{64}", certificate):
+                    raise ApiError(400, "INVALID_SIGNING_CERTIFICATE", "签名证书 SHA-256 格式无效")
+                if status == "PUBLISHED":
+                    if not download_url or not sha256 or apk_size is None:
+                        raise ApiError(409, "PUBLISHED_ARTIFACT_REQUIRED", "已发布版本必须具备下载地址、SHA-256 和 APK 大小")
+                    if package_name != OFFICIAL_PACKAGE_NAME:
+                        raise ApiError(409, "PACKAGE_NAME_MISMATCH", "APK 包名不是正式包名")
+                    if certificate != OFFICIAL_SIGNING_CERTIFICATE_SHA256:
+                        raise ApiError(409, "SIGNING_CERTIFICATE_MISMATCH", "APK 签名证书不是正式证书")
+                    if not metadata_verified:
+                        raise ApiError(409, "APK_METADATA_UNVERIFIED", "APK 元数据尚未完成自动校验")
+                    if minimum != latest and not db.execute(
+                        """SELECT 1 FROM app_release_versions
+                           WHERE platform='android' AND version_code=? AND status='PUBLISHED'""",
+                        (minimum,),
+                    ).fetchone():
+                        raise ApiError(409, "MINIMUM_VERSION_NOT_PUBLISHED", "最低支持版本必须来自已发布版本记录")
+                    verify_release_artifact(download_url, sha256, apk_size)
                 timestamp = now_ms()
                 db.execute(
                     """INSERT INTO app_versions(
                            platform,latest_version_code,minimum_version_code,
                            latest_version_name,update_message,download_url,apk_sha256,
-                           apk_size,force_update,status,published_at,created_at,
-                           created_by,updated_by,updated_at
-                       ) VALUES('android',?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+                           apk_size,package_name,signing_certificate_sha256,
+                           metadata_verified,force_update,status,published_at,
+                           created_at,created_by,updated_by,updated_at
+                       ) VALUES('android',?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
                        ON CONFLICT(platform) DO UPDATE SET
                        latest_version_code=excluded.latest_version_code,
                        minimum_version_code=excluded.minimum_version_code,
@@ -5229,6 +6023,9 @@ class ApiHandler(BaseHTTPRequestHandler):
                        download_url=excluded.download_url,
                        apk_sha256=excluded.apk_sha256,
                        apk_size=excluded.apk_size,
+                       package_name=excluded.package_name,
+                       signing_certificate_sha256=excluded.signing_certificate_sha256,
+                       metadata_verified=excluded.metadata_verified,
                        force_update=excluded.force_update,
                        status=excluded.status,
                        published_at=CASE WHEN excluded.status='PUBLISHED'
@@ -5239,12 +6036,56 @@ class ApiHandler(BaseHTTPRequestHandler):
                     (
                         latest,
                         minimum,
-                        required_text(data, "latestVersionName", 40),
+                        latest_name,
                         str(data.get("updateMessage", ""))[:1000],
                         download_url,
                         sha256 or None,
                         apk_size,
+                        package_name,
+                        certificate,
+                        1 if metadata_verified else 0,
                         1 if force_update else 0,
+                        status,
+                        timestamp if status == "PUBLISHED" else None,
+                        timestamp,
+                        admin["id"],
+                        admin["id"],
+                        timestamp,
+                    ),
+                )
+                db.execute(
+                    """INSERT INTO app_release_versions(
+                           platform,version_code,version_name,update_message,
+                           download_url,apk_sha256,apk_size,package_name,
+                           signing_certificate_sha256,metadata_verified,status,
+                           published_at,created_at,created_by,updated_by,updated_at
+                       ) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+                       ON CONFLICT(platform,version_code) DO UPDATE SET
+                           version_name=excluded.version_name,
+                           update_message=excluded.update_message,
+                           download_url=excluded.download_url,
+                           apk_sha256=excluded.apk_sha256,
+                           apk_size=excluded.apk_size,
+                           package_name=excluded.package_name,
+                           signing_certificate_sha256=excluded.signing_certificate_sha256,
+                           metadata_verified=excluded.metadata_verified,
+                           status=excluded.status,
+                           published_at=CASE WHEN excluded.status='PUBLISHED'
+                               THEN COALESCE(app_release_versions.published_at,excluded.updated_at)
+                               ELSE app_release_versions.published_at END,
+                           updated_by=excluded.updated_by,
+                           updated_at=excluded.updated_at""",
+                    (
+                        "android",
+                        latest,
+                        latest_name,
+                        str(data.get("updateMessage", ""))[:1000],
+                        download_url,
+                        sha256 or None,
+                        apk_size,
+                        package_name,
+                        certificate,
+                        1 if metadata_verified else 0,
                         status,
                         timestamp if status == "PUBLISHED" else None,
                         timestamp,
@@ -5264,10 +6105,12 @@ class ApiHandler(BaseHTTPRequestHandler):
                         "minimumVersionCode": minimum,
                         "status": status,
                         "forceUpdate": force_update,
+                        "metadataVerified": metadata_verified,
                     },
                 )
                 saved = db.execute(
-                    "SELECT download_url,apk_sha256,apk_size,force_update,published_at "
+                    "SELECT download_url,apk_sha256,apk_size,package_name,"
+                    "signing_certificate_sha256,metadata_verified,force_update,published_at "
                     "FROM app_versions WHERE platform='android'"
                 ).fetchone()
                 return {
@@ -5279,6 +6122,9 @@ class ApiHandler(BaseHTTPRequestHandler):
                     "downloadUrl": saved["download_url"],
                     "apkSha256": saved["apk_sha256"],
                     "apkSize": saved["apk_size"],
+                    "packageName": saved["package_name"],
+                    "signingCertificateSha256": saved["signing_certificate_sha256"],
+                    "metadataVerified": bool(saved["metadata_verified"]),
                     "publishedAt": saved["published_at"],
                 }, 200
 

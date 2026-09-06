@@ -92,6 +92,105 @@ class ApiTest(unittest.TestCase):
             ).fetchone()
         self.assertEqual("长理同学", migrated["nickname"])
 
+    def test_stable_device_identity_deduplicates_devices_but_not_installations(self):
+        scoped_id = "a" * 64
+        first = {
+            "installationId": "trusted-installation-1-" + secrets.token_hex(4),
+            "deviceScopedId": scoped_id,
+            "versionName": "1.0.4",
+            "versionCode": 36,
+        }
+        second = {
+            **first,
+            "installationId": "trusted-installation-2-" + secrets.token_hex(4),
+        }
+        before_phone = None
+        with server.connection() as db:
+            before_phone = db.execute(
+                "SELECT COUNT(*) AS count FROM users WHERE role='USER' AND account_type='PHONE'"
+            ).fetchone()["count"]
+        first_status, first_response = self.call("POST", "/api/v1/auth/device", first)
+        second_status, second_response = self.call("POST", "/api/v1/auth/device", second)
+        self.assertEqual(200, first_status)
+        self.assertEqual(200, second_status)
+        self.assertEqual(
+            first_response["data"]["user"]["id"],
+            second_response["data"]["user"]["id"],
+        )
+        with server.connection() as db:
+            device_count = db.execute(
+                "SELECT COUNT(*) AS count FROM devices WHERE device_key_hash IS NOT NULL"
+            ).fetchone()["count"]
+            installation_count = db.execute(
+                "SELECT COUNT(*) AS count FROM installations WHERE device_id IS NOT NULL"
+            ).fetchone()["count"]
+            device = db.execute(
+                "SELECT install_count FROM devices WHERE device_key_hash=?",
+                (server.device_key_hash(scoped_id),),
+            ).fetchone()
+            phone_count = db.execute(
+                "SELECT COUNT(*) AS count FROM users WHERE role='USER' AND account_type='PHONE'"
+            ).fetchone()["count"]
+        self.assertEqual(1, device_count)
+        self.assertEqual(2, installation_count)
+        self.assertEqual(2, device["install_count"])
+        self.assertEqual(before_phone, phone_count)
+
+        with server.connection() as db:
+            before_legacy_installations = db.execute(
+                "SELECT COUNT(*) AS count FROM installations WHERE legacy=1 AND device_id IS NULL"
+            ).fetchone()["count"]
+            before_devices = db.execute("SELECT COUNT(*) AS count FROM devices").fetchone()["count"]
+        legacy_status, legacy_response = self.call(
+            "POST",
+            "/api/v1/auth/device",
+            {"installationId": "legacy-installation-" + secrets.token_hex(4)},
+        )
+        self.assertEqual(200, legacy_status)
+        self.assertEqual("DEVICE", legacy_response["data"]["user"]["accountType"])
+        with server.connection() as db:
+            self.assertEqual(
+                before_legacy_installations + 1,
+                db.execute(
+                    "SELECT COUNT(*) AS count FROM installations WHERE legacy=1 AND device_id IS NULL"
+                ).fetchone()["count"],
+            )
+            self.assertEqual(
+                before_devices,
+                db.execute("SELECT COUNT(*) AS count FROM devices").fetchone()["count"],
+            )
+
+    def test_user_codes_are_readable_searchable_and_concurrent(self):
+        _, _, _, user = self.phone_account()
+        self.assertRegex(user["userCode"], r"^\d{17}$")
+        admin = self.admin_token()
+        status, listing = self.call(
+            "GET",
+            f"/api/v1/admin/users?q={user['userCode']}",
+            token=admin,
+        )
+        self.assertEqual(200, status)
+        self.assertTrue(any(row["user_code"] == user["userCode"] for row in listing["data"]))
+
+        def register_one(_):
+            return self.call(
+                "POST",
+                "/api/v1/auth/register",
+                {
+                    "phone": "19" + "".join(str(secrets.randbelow(10)) for _ in range(9)),
+                    "password": secrets.token_urlsafe(18),
+                    "nickname": "并发编号测试",
+                },
+            )
+
+        server.RATE_LIMITER = server.RateLimiter()
+        with concurrent.futures.ThreadPoolExecutor(max_workers=8) as executor:
+            results = list(executor.map(register_one, range(8)))
+        self.assertTrue(all(status == 201 for status, _ in results))
+        codes = [response["data"]["user"]["userCode"] for _, response in results]
+        self.assertEqual(8, len(set(codes)))
+        self.assertTrue(all(code.startswith(user["userCode"][:12]) for code in codes))
+
     def phone_account(self, installation_id=None):
         phone = "19" + "".join(str(secrets.randbelow(10)) for _ in range(9))
         password = secrets.token_urlsafe(18)
@@ -126,6 +225,17 @@ class ApiTest(unittest.TestCase):
         )
         self.assertEqual(200, status)
         return login["data"]["token"]
+
+    def publish_seed_release_for_version_tests(self):
+        # The isolated test runtime seeds a draft row. Treat its seed artifact
+        # as the prior formal release so minimum-version selection exercises
+        # the same published-history contract as production.
+        with server.connection() as db:
+            db.execute(
+                "UPDATE app_release_versions SET status='PUBLISHED',published_at=COALESCE(published_at,?) "
+                "WHERE platform='android' AND version_code=31",
+                (server.now_ms(),),
+            )
 
     def test_phone_account_gate_and_device_data_migration(self):
         installation_id = "migration-" + secrets.token_hex(8)
@@ -722,30 +832,51 @@ class ApiTest(unittest.TestCase):
         )[0])
 
     def test_published_version_check_is_local_and_drafts_are_hidden(self):
+        self.publish_seed_release_for_version_tests()
         admin = self.admin_token()
         payload = {
             "latestVersionCode": 42,
-            "minimumVersionCode": 20,
+            "minimumVersionCode": 31,
             "latestVersionName": "4.2-local",
             "updateMessage": "本地版本演示",
             "downloadUrl": "https://updates.invalid/my-changli.apk",
             "apkSha256": "a" * 64,
             "apkSize": 123456,
+            "packageName": "com.mychangli.app",
+            "signingCertificateSha256": server.OFFICIAL_SIGNING_CERTIFICATE_SHA256,
+            "metadataVerified": True,
             "forceUpdate": False,
             "status": "DRAFT",
         }
-        self.assertEqual(200, self.call("PUT", "/api/v1/admin/version/android", payload, admin)[0])
+        status, response = self.call("PUT", "/api/v1/admin/version/android", payload, admin)
+        self.assertEqual(200, status, response)
         hidden = self.call("GET", "/api/v1/public/version/android?currentVersionCode=1")[1]
         self.assertFalse(hidden["data"]["updateAvailable"])
+        invalid_status, invalid_response = self.call(
+            "PUT",
+            "/api/v1/admin/version/android",
+            dict(payload, status="PUBLISHED", metadataVerified=False),
+            admin,
+        )
+        self.assertEqual(409, invalid_status)
+        self.assertEqual("APK_METADATA_UNVERIFIED", invalid_response["error"]["code"])
+        invalid_minimum_status, invalid_minimum_response = self.call(
+            "PUT",
+            "/api/v1/admin/version/android",
+            dict(payload, status="PUBLISHED", minimumVersionCode=30),
+            admin,
+        )
+        self.assertEqual(409, invalid_minimum_status)
+        self.assertEqual("MINIMUM_VERSION_NOT_PUBLISHED", invalid_minimum_response["error"]["code"])
         payload["status"] = "PUBLISHED"
         self.assertEqual(200, self.call("PUT", "/api/v1/admin/version/android", payload, admin)[0])
-        status, newer = self.call("GET", "/api/v1/public/version/android?currentVersionCode=21")
+        status, newer = self.call("GET", "/api/v1/public/version/android?currentVersionCode=31")
         self.assertEqual(200, status)
         self.assertTrue(newer["data"]["updateAvailable"])
         self.assertFalse(newer["data"]["minimumVersionViolated"])
         self.assertFalse(newer["data"]["mandatoryUpdate"])
         below_minimum = self.call(
-            "GET", "/api/v1/public/version/android?currentVersionCode=1"
+            "GET", "/api/v1/public/version/android?currentVersionCode=30"
         )[1]
         self.assertTrue(below_minimum["data"]["minimumVersionViolated"])
         self.assertTrue(below_minimum["data"]["mandatoryUpdate"])
@@ -764,7 +895,7 @@ class ApiTest(unittest.TestCase):
             self.call("PUT", "/api/v1/admin/version/android", forced_payload, admin)[0],
         )
         forced = self.call(
-            "GET", "/api/v1/public/version/android?currentVersionCode=21"
+            "GET", "/api/v1/public/version/android?currentVersionCode=31"
         )[1]
         self.assertTrue(forced["data"]["updateAvailable"])
         self.assertTrue(forced["data"]["forceUpdate"])
@@ -1116,6 +1247,7 @@ class ApiTest(unittest.TestCase):
         )
 
     def test_service_updates_aggregation_and_visibility(self):
+        self.publish_seed_release_for_version_tests()
         admin = self.admin_token()
         for feature_key in ("sports_reservation", "lost_found", "resource_library"):
             self.assertEqual(
@@ -1130,12 +1262,15 @@ class ApiTest(unittest.TestCase):
 
         version_payload = {
             "latestVersionCode": 42,
-            "minimumVersionCode": 20,
+            "minimumVersionCode": 31,
             "latestVersionName": "4.2-local",
             "updateMessage": "服务动态聚合测试版本",
             "downloadUrl": "https://updates.invalid/my-changli.apk",
             "apkSha256": "a" * 64,
             "apkSize": 123456,
+            "packageName": "com.mychangli.app",
+            "signingCertificateSha256": server.OFFICIAL_SIGNING_CERTIFICATE_SHA256,
+            "metadataVerified": True,
             "forceUpdate": False,
             "status": "DRAFT",
         }
@@ -1541,6 +1676,65 @@ class ApiTest(unittest.TestCase):
                 db.execute("SELECT COUNT(*) FROM users WHERE role='ADMIN'").fetchone()[0],
                 1,
             )
+
+    def test_deleted_user_purge_is_super_admin_only_and_foreign_key_safe(self):
+        phone, _, _, user = self.phone_account()
+        super_token = self.admin_token()
+        self.assertEqual(200, self.call(
+            "DELETE",
+            f"/api/v1/admin/users/{user['id']}",
+            {"reason": "永久清理接口测试", "confirmation": f"DELETE USER {user['id']}"},
+            super_token,
+        )[0])
+
+        operator_password = secrets.token_urlsafe(18)
+        operator_username = "purge-denied-" + secrets.token_hex(4)
+        self.assertEqual(201, self.call(
+            "POST",
+            "/api/v1/admin/admins",
+            {"username": operator_username, "nickname": "清理权限测试", "password": operator_password,
+             "adminRole": "CONTENT_OPERATOR"},
+            super_token,
+        )[0])
+        _, operator_login = self.call(
+            "POST", "/api/v1/auth/login",
+            {"username": operator_username, "password": operator_password},
+        )
+        purge_body = {
+            "ids": [user["id"]],
+            "confirmation": "PURGE 1 DELETED USERS",
+        }
+        denied_status, denied = self.call(
+            "POST", "/api/v1/admin/users/purge", purge_body, operator_login["data"]["token"]
+        )
+        self.assertEqual(403, denied_status)
+        self.assertIn(denied["error"]["code"], {"ADMIN_MODULE_FORBIDDEN", "ADMIN_PERMISSION_REQUIRED", "SUPER_ADMIN_REQUIRED"})
+
+        purged_status, purged = self.call(
+            "POST", "/api/v1/admin/users/purge", purge_body, super_token
+        )
+        self.assertEqual(200, purged_status)
+        self.assertEqual(1, purged["data"]["purged"])
+        self.assertEqual(user["userCode"], purged["data"]["userCodes"][0])
+        with server.connection() as db:
+            self.assertIsNone(db.execute("SELECT id FROM users WHERE id=?", (user["id"],)).fetchone())
+            self.assertEqual([], db.execute("PRAGMA foreign_key_check").fetchall())
+            audit = db.execute(
+                "SELECT details_json FROM admin_audit_logs WHERE action='USER_PURGE_COMPLETED' AND entity_id=?",
+                (purged["data"]["operationId"],),
+            ).fetchone()
+        self.assertIsNotNone(audit)
+        self.assertNotIn(phone, audit["details_json"])
+
+        _, _, _, active_user = self.phone_account()
+        active_status, active_error = self.call(
+            "POST",
+            "/api/v1/admin/users/purge",
+            {"ids": [active_user["id"]], "confirmation": "PURGE 1 DELETED USERS"},
+            super_token,
+        )
+        self.assertEqual(409, active_status)
+        self.assertEqual("PURGE_TARGET_CHANGED", active_error["error"]["code"])
 
     def test_admin_delete_user_scrubs_personal_data_and_allows_phone_reregistration(self):
         phone, _, token, user = self.phone_account()
