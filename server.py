@@ -780,6 +780,8 @@ def initialize_database() -> None:
         ensure_column(db, "remote_flags", "updated_by", "TEXT")
         ensure_column(db, "remote_flags", "change_note", "TEXT NOT NULL DEFAULT ''")
         ensure_column(db, "announcements", "service_visible", "INTEGER NOT NULL DEFAULT 1")
+        ensure_column(db, "announcements", "notification_enabled", "INTEGER NOT NULL DEFAULT 0")
+        ensure_column(db, "announcements", "popup_enabled", "INTEGER NOT NULL DEFAULT 0")
         ensure_column(db, "reservations", "refund_status", "TEXT NOT NULL DEFAULT 'NOT_APPLICABLE'")
         ensure_column(db, "reservations", "reservation_code", "TEXT")
         ensure_column(db, "reservations", "verification_status", "TEXT NOT NULL DEFAULT 'NOT_REQUIRED'")
@@ -4045,11 +4047,24 @@ class ApiHandler(BaseHTTPRequestHandler):
                         },
                     }
                 )
-            announcements = [
-                row_dict(row) for row in db.execute(
-                    "SELECT id,title,content,published_at AS publishedAt FROM announcements WHERE enabled=1 ORDER BY published_at DESC LIMIT 10"
+            announcements = []
+            for row in db.execute(
+                """SELECT id,title,content,
+                          notification_enabled AS notificationEnabled,
+                          popup_enabled AS popupEnabled,
+                          published_at AS publishedAt
+                     FROM announcements
+                    WHERE enabled=1
+                    ORDER BY published_at DESC
+                    LIMIT 10"""
+            ):
+                announcements.append(
+                    {
+                        **row_dict(row),
+                        "notificationEnabled": bool(row["notificationEnabled"]),
+                        "popupEnabled": bool(row["popupEnabled"]),
+                    }
                 )
-            ]
             version_row = db.execute(
                 "SELECT * FROM app_versions WHERE platform='android' AND status='PUBLISHED'"
             ).fetchone()
@@ -6185,6 +6200,8 @@ class ApiHandler(BaseHTTPRequestHandler):
                         **row_dict(row),
                         "enabled": bool(row["enabled"]),
                         "serviceVisible": bool(row["service_visible"]),
+                        "notificationEnabled": bool(row["notification_enabled"]),
+                        "popupEnabled": bool(row["popup_enabled"]),
                     }
                     for row in db.execute(
                         "SELECT * FROM announcements ORDER BY published_at DESC"
@@ -6288,16 +6305,21 @@ class ApiHandler(BaseHTTPRequestHandler):
                 announcement_id = str(uuid.uuid4())
                 timestamp = now_ms()
                 service_visible = 1 if bool(data.get("serviceVisible", True)) else 0
+                notification_enabled = 1 if bool(data.get("notificationEnabled", False)) else 0
+                popup_enabled = 1 if bool(data.get("popupEnabled", False)) else 0
                 db.execute(
                     """INSERT INTO announcements(
-                           id,title,content,enabled,service_visible,published_at,updated_at
-                       ) VALUES(?,?,?,?,?,?,?)""",
+                           id,title,content,enabled,service_visible,
+                           notification_enabled,popup_enabled,published_at,updated_at
+                       ) VALUES(?,?,?,?,?,?,?,?,?)""",
                     (
                         announcement_id,
                         required_text(data, "title", 100),
                         required_text(data, "content", 4000),
                         1 if bool(data.get("enabled", True)) else 0,
                         service_visible,
+                        notification_enabled,
+                        popup_enabled,
                         timestamp,
                         timestamp,
                     ),
@@ -6311,9 +6333,17 @@ class ApiHandler(BaseHTTPRequestHandler):
                     {
                         "enabled": bool(data.get("enabled", True)),
                         "serviceVisible": bool(service_visible),
+                        "notificationEnabled": bool(notification_enabled),
+                        "popupEnabled": bool(popup_enabled),
                     },
                 )
-                return {"id": announcement_id}, 201
+                return {
+                    "id": announcement_id,
+                    "enabled": bool(data.get("enabled", True)),
+                    "serviceVisible": bool(service_visible),
+                    "notificationEnabled": bool(notification_enabled),
+                    "popupEnabled": bool(popup_enabled),
+                }, 201
 
             match = re.fullmatch(r"/api/v1/admin/announcements/([^/]+)", path)
             if method == "PATCH" and match:
@@ -6331,13 +6361,32 @@ class ApiHandler(BaseHTTPRequestHandler):
                     if bool(data.get("serviceVisible", bool(current["service_visible"])))
                     else 0
                 )
+                notification_enabled = (
+                    1
+                    if bool(data.get("notificationEnabled", bool(current["notification_enabled"])))
+                    else 0
+                )
+                popup_enabled = (
+                    1
+                    if bool(data.get("popupEnabled", bool(current["popup_enabled"])))
+                    else 0
+                )
                 if not title or not content:
                     raise ApiError(400, "VALIDATION_ERROR", "公告标题和内容不能为空")
                 db.execute(
                     """UPDATE announcements SET title=?,content=?,enabled=?,
-                       service_visible=?,updated_at=?
+                       service_visible=?,notification_enabled=?,popup_enabled=?,updated_at=?
                        WHERE id=?""",
-                    (title, content, enabled, service_visible, now_ms(), current["id"]),
+                    (
+                        title,
+                        content,
+                        enabled,
+                        service_visible,
+                        notification_enabled,
+                        popup_enabled,
+                        now_ms(),
+                        current["id"],
+                    ),
                 )
                 write_audit(
                     db,
@@ -6345,12 +6394,19 @@ class ApiHandler(BaseHTTPRequestHandler):
                     "ANNOUNCEMENT_UPDATED",
                     "ANNOUNCEMENT",
                     current["id"],
-                    {"enabled": bool(enabled), "serviceVisible": bool(service_visible)},
+                    {
+                        "enabled": bool(enabled),
+                        "serviceVisible": bool(service_visible),
+                        "notificationEnabled": bool(notification_enabled),
+                        "popupEnabled": bool(popup_enabled),
+                    },
                 )
                 return {
                     "id": current["id"],
                     "enabled": bool(enabled),
                     "serviceVisible": bool(service_visible),
+                    "notificationEnabled": bool(notification_enabled),
+                    "popupEnabled": bool(popup_enabled),
                 }, 200
 
             if method == "DELETE" and match:

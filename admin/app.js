@@ -715,12 +715,15 @@ const renderers = {
           <label>内容<textarea name="content" maxlength="4000" required></textarea></label>
           <label class="checkbox-row"><input type="checkbox" name="enabled" checked> 发布后立即在 App 配置接口中可见</label>
           <label class="checkbox-row"><input type="checkbox" name="serviceVisible" checked> 显示在 App 服务页“服务动态”</label>
+          <label class="checkbox-row"><input type="checkbox" name="notificationEnabled"> 发送系统通知（App 同步后提醒）</label>
+          <label class="checkbox-row"><input type="checkbox" name="popupEnabled"> 首次获取时显示 App 内弹窗</label>
+          <p class="muted">系统通知和弹窗默认关闭；开启后由 App 启动或回到前台时同步生效。</p>
           <div><button class="primary">发布公告</button></div>
         </form>
       </article>
       <h3 class="section-title">公告记录</h3>
       <div class="grid">
-        ${rows.length ? rows.map((row) => `<article class="card"><div class="card-header"><div><h3>${escapeHtml(row.title)}</h3><span class="subtle">${formatTime(row.published_at)}</span></div><div>${row.enabled ? badge("OPEN") : badge("CLOSED")}${row.serviceVisible ? badge("服务页") : badge("不显示")}</div></div><p>${escapeHtml(row.content).replaceAll("\n", "<br>")}</p><div class="actions"><button class="ghost" data-action="edit-announcement" data-id="${escapeHtml(row.id)}" data-title="${escapeHtml(row.title)}" data-content="${escapeHtml(row.content)}" data-enabled="${row.enabled}" data-service-visible="${row.serviceVisible}">编辑</button><button class="${row.enabled ? "danger" : "primary"}" data-action="toggle-announcement" data-id="${escapeHtml(row.id)}" data-enabled="${row.enabled}">${row.enabled ? "撤回" : "重新发布"}</button><button class="danger" data-action="delete-announcement" data-id="${escapeHtml(row.id)}">删除</button></div></article>`).join("") : '<div class="empty">还没有公告</div>'}
+        ${rows.length ? rows.map((row) => `<article class="card"><div class="card-header"><div><h3>${escapeHtml(row.title)}</h3><span class="subtle">${formatTime(row.published_at)}</span></div><div>${row.enabled ? badge("OPEN") : badge("CLOSED")}${row.serviceVisible ? badge("服务页") : badge("不显示")}${row.notificationEnabled ? badge("通知") : ""}${row.popupEnabled ? badge("弹窗") : ""}</div></div><p>${escapeHtml(row.content).replaceAll("\n", "<br>")}</p><div class="actions"><button class="ghost" data-action="edit-announcement" data-id="${escapeHtml(row.id)}" data-title="${escapeHtml(row.title)}" data-content="${escapeHtml(row.content)}" data-enabled="${row.enabled}" data-service-visible="${row.serviceVisible}" data-notification-enabled="${row.notificationEnabled}" data-popup-enabled="${row.popupEnabled}">编辑</button><button class="${row.enabled ? "danger" : "primary"}" data-action="toggle-announcement" data-id="${escapeHtml(row.id)}" data-enabled="${row.enabled}">${row.enabled ? "撤回" : "重新发布"}</button><button class="danger" data-action="delete-announcement" data-id="${escapeHtml(row.id)}">删除</button></div></article>`).join("") : '<div class="empty">还没有公告</div>'}
       </div>`;
   },
 
@@ -1061,7 +1064,13 @@ content.addEventListener("submit", async (event) => {
     if (form.id === "announcement-form") {
       await api("/api/v1/admin/announcements", {
         method: "POST",
-        body: { ...values, enabled: form.enabled.checked, serviceVisible: form.serviceVisible.checked },
+        body: {
+          ...values,
+          enabled: form.enabled.checked,
+          serviceVisible: form.serviceVisible.checked,
+          notificationEnabled: form.notificationEnabled.checked,
+          popupEnabled: form.popupEnabled.checked,
+        },
       });
       toast("公告已发布");
       return renderers.announcements();
@@ -1522,11 +1531,18 @@ content.addEventListener("click", async (event) => {
       return renderers.announcements();
     }
     if (action === "edit-announcement") {
-      return openDialog("编辑公告", `<div class="stack"><label>标题<input name="title" value="${escapeHtml(button.dataset.title)}" required></label><label>内容<textarea name="content" required>${escapeHtml(button.dataset.content)}</textarea></label><label class="checkbox-row"><input type="checkbox" name="serviceVisible" ${button.dataset.serviceVisible === "true" ? "checked" : ""}> 显示在 App 服务页“服务动态”</label></div>`,
+      return openDialog("编辑公告", `<div class="stack"><label>标题<input name="title" value="${escapeHtml(button.dataset.title)}" required></label><label>内容<textarea name="content" required>${escapeHtml(button.dataset.content)}</textarea></label><label class="checkbox-row"><input type="checkbox" name="serviceVisible" ${button.dataset.serviceVisible === "true" ? "checked" : ""}> 显示在 App 服务页“服务动态”</label><label class="checkbox-row"><input type="checkbox" name="notificationEnabled" ${button.dataset.notificationEnabled === "true" ? "checked" : ""}> 发送系统通知（App 同步后提醒）</label><label class="checkbox-row"><input type="checkbox" name="popupEnabled" ${button.dataset.popupEnabled === "true" ? "checked" : ""}> 首次获取时显示 App 内弹窗</label><p class="muted">编辑不会因为公告 ID 不变而自动重新通知已经处理过的设备。</p></div>`,
         async (form) => {
           await api(`/api/v1/admin/announcements/${encodeURIComponent(button.dataset.id)}`, {
             method: "PATCH",
-            body: { title: form.get("title"), content: form.get("content"), enabled: button.dataset.enabled === "true", serviceVisible: form.serviceVisible.checked },
+            body: {
+              title: form.get("title"),
+              content: form.get("content"),
+              enabled: button.dataset.enabled === "true",
+              serviceVisible: form.serviceVisible.checked,
+              notificationEnabled: form.notificationEnabled.checked,
+              popupEnabled: form.popupEnabled.checked,
+            },
           });
           toast("公告已更新");
           renderers.announcements();

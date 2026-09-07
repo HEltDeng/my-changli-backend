@@ -558,6 +558,58 @@ class ApiTest(unittest.TestCase):
             row["action"] == "ANNOUNCEMENT_DELETED" for row in audits["data"]
         ))
 
+    def test_announcement_notification_flags_are_explicit_and_edit_safe(self):
+        admin = self.admin_token()
+        status, created = self.call(
+            "POST",
+            "/api/v1/admin/announcements",
+            {
+                "title": "重要服务恢复",
+                "content": "服务已经恢复，可以重新查询。",
+                "enabled": True,
+                "serviceVisible": False,
+                "notificationEnabled": True,
+                "popupEnabled": True,
+            },
+            admin,
+        )
+        self.assertEqual(201, status)
+        announcement_id = created["data"]["id"]
+        self.assertTrue(created["data"]["notificationEnabled"])
+        self.assertTrue(created["data"]["popupEnabled"])
+
+        status, bootstrap = self.call("GET", "/api/v1/public/bootstrap")
+        self.assertEqual(200, status)
+        current = next(
+            row for row in bootstrap["data"]["announcements"] if row["id"] == announcement_id
+        )
+        self.assertIs(current["notificationEnabled"], True)
+        self.assertIs(current["popupEnabled"], True)
+
+        status, edited = self.call(
+            "PATCH",
+            f"/api/v1/admin/announcements/{announcement_id}",
+            {
+                "title": "重要服务恢复（文字修正）",
+                "content": "服务已经恢复，可以重新查询。",
+                "enabled": True,
+                "serviceVisible": False,
+                "notificationEnabled": False,
+                "popupEnabled": False,
+            },
+            admin,
+        )
+        self.assertEqual(200, status)
+        self.assertFalse(edited["data"]["notificationEnabled"])
+        self.assertFalse(edited["data"]["popupEnabled"])
+        status, bootstrap = self.call("GET", "/api/v1/public/bootstrap")
+        self.assertEqual(200, status)
+        current = next(
+            row for row in bootstrap["data"]["announcements"] if row["id"] == announcement_id
+        )
+        self.assertFalse(current["notificationEnabled"])
+        self.assertFalse(current["popupEnabled"])
+
     def test_reservation_profile_rules_snapshot_and_transparency(self):
         _, _, token, user = self.phone_account()
         admin = self.admin_token()

@@ -231,6 +231,8 @@ CREATE TABLE IF NOT EXISTS announcements (
     content TEXT NOT NULL,
     enabled INTEGER NOT NULL DEFAULT 1,
     service_visible INTEGER NOT NULL DEFAULT 1,
+    notification_enabled INTEGER NOT NULL DEFAULT 0,
+    popup_enabled INTEGER NOT NULL DEFAULT 0,
     published_at INTEGER NOT NULL,
     updated_at INTEGER NOT NULL
 );
