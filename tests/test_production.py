@@ -215,12 +215,20 @@ class ProductionUnitTest(unittest.TestCase):
                 "lost_found_posts",
                 "feedback",
                 "announcements",
+                "app_update_policies",
             ):
-                self.assertEqual(0, database.execute(f"SELECT COUNT(*) FROM {table}").fetchone()[0])
+                expected = 1 if table == "app_update_policies" else 0
+                self.assertEqual(expected, database.execute(f"SELECT COUNT(*) FROM {table}").fetchone()[0])
             version = database.execute(
                 "SELECT status FROM app_versions WHERE platform='android'"
             ).fetchone()
             self.assertEqual("DRAFT", version["status"])
+            policy = database.execute(
+                "SELECT * FROM app_update_policies WHERE platform='android'"
+            ).fetchone()
+            self.assertEqual(0, policy["update_enabled"])
+            self.assertEqual(0, policy["force_update_enabled"])
+            self.assertEqual(1, policy["policy_revision"])
             self.assertEqual(5, database.execute("SELECT COUNT(*) FROM resource_items").fetchone()[0])
 
     def test_consistent_backup_verification_and_restore(self):

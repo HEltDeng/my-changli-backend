@@ -746,25 +746,34 @@ const renderers = {
       </div>`;
   },
 
-  async config() {
-    const data = await api("/api/v1/admin/config");
+  async config(prefetched = null) {
+    // navigate(page, filters) always supplies an object. Only a response that
+    // actually contains updatePolicy is an intentional post-save prefetched
+    // server readback; an empty navigation filter must still fetch the API.
+    const data = prefetched?.updatePolicy
+      ? prefetched
+      : await api("/api/v1/admin/config");
     const version = data.version || {};
+    const policy = data.updatePolicy || {};
     const availableVersions = data.availableVersions || [];
     const configuredCode = Number(version.latest_version_code || 1);
     const metadataState = version.metadata_verified ? "已自动校验" : "尚未完成自动校验";
+    const minimumCode = Number(policy.minimumSupportedVersionCode || 1);
+    const forceEnabled = Boolean(policy.forceUpdateEnabled);
+    const affectedVersions = forceEnabled
+      ? `versionCode ${Math.max(1, minimumCode - 1)} 及以下`
+      : "无（强制更新已关闭）";
     content.innerHTML = `
       <div class="grid two-columns">
         <article class="card">
-          <h3>Android 发布版本与更新策略</h3>
+          <h3>Android Release Metadata</h3>
+          <p class="muted">这里只维护已经发布的 APK 事实，不控制当前是否强制更新。</p>
           <form id="version-form" class="stack">
             <label>最新发布版本名称（给用户看的版本）<input name="latestVersionName" value="${escapeHtml(version.latest_version_name || "")}" placeholder="例如 1.0.4" required></label>
             <label>Android 内部版本号（只用于递增比较）<input type="number" min="1" name="latestVersionCode" value="${configuredCode}" required><span class="subtle">后台展示为 V${escapeHtml(version.latest_version_name || "—")}（${configuredCode}）。客户端更新只比较这个整数。</span></label>
-            <label>最低支持版本<select name="minimumVersionCode">${releaseVersionOptions(availableVersions, version.minimum_version_code || configuredCode)}</select><span class="subtle">只能选择已经存在的正式版本；保存时服务端会再次校验。</span></label>
             <label>更新说明<textarea name="updateMessage">${escapeHtml(version.update_message || "")}</textarea></label>
             <label>正式 APK 下载地址<input name="downloadUrl" value="${escapeHtml(version.download_url || "")}" placeholder="https://..." required></label>
             <label>发布状态<select name="status">${options(["DRAFT","PUBLISHED","DISABLED"], version.status || "DRAFT")}</select></label>
-            <label class="checkbox-row"><input type="checkbox" name="forceUpdate" ${version.force_update ? "checked" : ""}> 强制更新</label>
-            <p class="subtle version-policy-note">最低支持版本是硬门槛；开启强制更新后，低于最新版本的客户端必须完成更新后才能继续使用。</p>
             <label>APK SHA-256（自动读取）<input name="apkSha256" maxlength="64" value="${escapeHtml(version.apk_sha256 || "")}" readonly></label>
             <label>APK 大小（自动读取）<input type="number" min="1" name="apkSize" value="${version.apk_size || ""}" readonly></label>
             <label>正式包名（自动校验）<input name="packageName" value="${escapeHtml(version.package_name || "com.mychangli.app")}" readonly></label>
@@ -772,6 +781,26 @@ const renderers = {
             <input type="hidden" name="metadataVerified" value="${version.metadata_verified ? "true" : "false"}">
             <p class="muted">APK 元数据状态：<strong>${metadataState}</strong>。Draft 可暂缺发布材料；保存为 Published 时，服务端必须验证下载文件大小、SHA-256、包名与正式签名证书。</p>
             <button class="primary">保存并校验版本配置</button>
+          </form>
+        </article>
+        <article class="card">
+          <h3>Update Policy 实时控制</h3>
+          <p class="muted">保存后会立即重新 GET 服务器状态；页面只显示回读确认后的结果。</p>
+          <form id="update-policy-form" class="stack">
+            <div class="sub-card">
+              <strong>当前最新版本</strong>
+              <p>V${escapeHtml(version.latest_version_name || "—")} / versionCode ${configuredCode}</p>
+            </div>
+            <label class="checkbox-row"><input type="checkbox" name="updateEnabled" ${policy.updateEnabled ? "checked" : ""}> 开启更新检查</label>
+            <label class="checkbox-row"><input type="checkbox" name="forceUpdateEnabled" ${forceEnabled ? "checked" : ""}> 开启强制更新</label>
+            <label>最低支持版本<select name="minimumSupportedVersionCode">${releaseVersionOptions(availableVersions, minimumCode)}</select><span class="subtle">强制更新开启时，仅低于此 versionCode 的旧客户端会被阻止；关闭强制更新后所有更新都可跳过。</span></label>
+            <input type="hidden" name="expectedPolicyRevision" value="${Number(policy.policyRevision || 0)}">
+            <div class="sub-card">
+              <p><strong>当前策略 Revision：</strong>${Number(policy.policyRevision || 0)}</p>
+              <p><strong>最后修改时间：</strong>${formatTime(policy.updatedAt)}</p>
+              <p><strong>预计受影响版本：</strong>${escapeHtml(affectedVersions)}</p>
+            </div>
+            <button class="primary">保存并回读服务器策略</button>
           </form>
         </article>
         <article class="card">
@@ -1089,13 +1118,35 @@ content.addEventListener("submit", async (event) => {
         body: {
           ...values,
           latestVersionCode: Number(values.latestVersionCode),
-          minimumVersionCode: Number(values.minimumVersionCode),
           apkSize: values.apkSize ? Number(values.apkSize) : null,
-          forceUpdate: form.forceUpdate.checked,
         },
       });
       toast("版本配置已保存");
       return renderers.config();
+    }
+    if (form.id === "update-policy-form") {
+      const requested = {
+        updateEnabled: form.updateEnabled.checked,
+        forceUpdateEnabled: form.forceUpdateEnabled.checked,
+        minimumSupportedVersionCode: Number(values.minimumSupportedVersionCode),
+        expectedPolicyRevision: Number(values.expectedPolicyRevision),
+      };
+      const saved = await api("/api/v1/admin/update-policy/android", {
+        method: "PUT",
+        body: requested,
+      });
+      const confirmed = await api("/api/v1/admin/config");
+      const actual = confirmed.updatePolicy || {};
+      if (
+        actual.policyRevision !== saved.policyRevision ||
+        actual.updateEnabled !== requested.updateEnabled ||
+        actual.forceUpdateEnabled !== requested.forceUpdateEnabled ||
+        actual.minimumSupportedVersionCode !== requested.minimumSupportedVersionCode
+      ) {
+        throw new Error("服务器策略回读不一致，保存结果未确认");
+      }
+      toast(`更新策略已保存并回读确认（Revision ${actual.policyRevision}）`);
+      return renderers.config(confirmed);
     }
   } catch (error) {
     toast(error.message, true);

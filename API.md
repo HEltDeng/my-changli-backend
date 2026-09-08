@@ -74,7 +74,8 @@
 
 - `GET /api/v1/public/bootstrap`：公告、版本、远程开关。
 - `GET /api/v1/public/website-announcements`：官网独立公告。`data.websiteAnnouncements` 只返回网站公告的 `id`、`title`、`content`、`publishedAt`、`updatedAt`，不会读取或返回 App 公告。
-- `GET /api/v1/public/version/android?currentVersionCode=...`：只返回已发布的 Android 版本检查结果。
+- `GET /api/v1/public/update-policy/android?currentVersionCode=...`：读取当前 Android 更新策略并返回 `NONE`、`OPTIONAL` 或 `FORCE` 决策、`policyRevision`、请求时间和独立的 Release Metadata；响应禁止缓存。
+- `GET /api/v1/public/version/android?currentVersionCode=...`：历史客户端兼容入口，使用与 update-policy 相同的实时策略决策，并把最终强制结果映射到 V1.0.4 已使用的旧字段。
 - `GET /api/v1/public/service-updates`：服务页“服务动态”聚合接口。只返回用户端必要信息，按优先级稳定排序：
   - `UPDATE`：已发布且高于当前客户端的 Android 版本（版本号、版本名、更新说明、是否强制/最低版本）；
   - `MAINTENANCE` / `CLOSED`：体育预约、失物招领、资料库的维护/关闭状态（模块键、面向用户说明、可选预计恢复时间）；
@@ -115,7 +116,8 @@
 - `POST /api/v1/admin/website-announcements`
 - `PATCH /api/v1/admin/website-announcements/{id}`
 - `DELETE /api/v1/admin/website-announcements/{id}`
-- `PUT /api/v1/admin/version/android`
+- `PUT /api/v1/admin/version/android`：只维护 Release Metadata；不修改实时更新策略。
+- `PUT /api/v1/admin/update-policy/android`：超级管理员修改更新开关、强制开关和最低支持版本；必须提交 `expectedPolicyRevision`，成功后 revision 自增并写审计日志。
 - `PUT /api/v1/admin/flags/{key}`
 - `GET /api/v1/admin/feedback`
 - `PATCH /api/v1/admin/feedback/{id}`

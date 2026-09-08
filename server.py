@@ -727,6 +727,67 @@ def sync_release_history(db: sqlite3.Connection) -> None:
     )
 
 
+def update_policy_state(db: sqlite3.Connection) -> dict[str, Any]:
+    """Return the live Android update policy with release facts attached."""
+
+    release = db.execute(
+        "SELECT latest_version_code FROM app_versions "
+        "WHERE platform='android' AND status='PUBLISHED'"
+    ).fetchone()
+    policy = db.execute(
+        "SELECT * FROM app_update_policies WHERE platform='android'"
+    ).fetchone()
+    latest_version_code = int(release["latest_version_code"]) if release else 0
+    if not policy:
+        return {
+            "platform": "android",
+            "updateEnabled": False,
+            "forceUpdateEnabled": False,
+            "latestVersionCode": latest_version_code,
+            "minimumSupportedVersionCode": 1,
+            "policyRevision": 0,
+            "updatedAt": None,
+            "updatedBy": None,
+        }
+    return {
+        "platform": "android",
+        "updateEnabled": bool(policy["update_enabled"]),
+        "forceUpdateEnabled": bool(policy["force_update_enabled"]),
+        "latestVersionCode": latest_version_code,
+        "minimumSupportedVersionCode": int(
+            policy["minimum_supported_version_code"]
+        ),
+        "policyRevision": int(policy["policy_revision"]),
+        "updatedAt": policy["updated_at"],
+        "updatedBy": policy["updated_by"],
+    }
+
+
+def update_decision(
+    current_version_code: int,
+    release: sqlite3.Row | None,
+    policy: dict[str, Any],
+) -> dict[str, Any]:
+    """Evaluate update availability separately from mandatory enforcement."""
+
+    latest = int(release["latest_version_code"]) if release else 0
+    update_available = bool(policy["updateEnabled"]) and latest > current_version_code
+    minimum_violated = current_version_code < int(
+        policy["minimumSupportedVersionCode"]
+    )
+    mandatory = (
+        update_available
+        and bool(policy["forceUpdateEnabled"])
+        and minimum_violated
+    )
+    return {
+        "updateAvailable": update_available,
+        "minimumVersionViolated": minimum_violated,
+        "mandatoryUpdate": mandatory,
+        "decision": "FORCE" if mandatory else "OPTIONAL" if update_available else "NONE",
+    }
+
+
 def initialize_database() -> None:
     UPLOADS.mkdir(parents=True, exist_ok=True)
     _safe_chmod(UPLOADS, 0o750)
@@ -777,6 +838,21 @@ def initialize_database() -> None:
         ensure_column(db, "app_versions", "created_at", "INTEGER")
         ensure_column(db, "app_versions", "created_by", "TEXT")
         ensure_column(db, "app_versions", "updated_by", "TEXT")
+        # Migrate the legacy combined release/policy row exactly once. After
+        # this bootstrap, app_update_policies is the live-control authority.
+        # app_versions.force_update remains only as an old-tooling mirror.
+        db.execute(
+            """INSERT INTO app_update_policies(
+                   platform,update_enabled,force_update_enabled,
+                   minimum_supported_version_code,policy_revision,updated_at,updated_by
+               )
+               SELECT platform,
+                      CASE WHEN status='PUBLISHED' THEN 1 ELSE 0 END,
+                      force_update,minimum_version_code,1,updated_at,NULL
+                 FROM app_versions
+                WHERE platform='android'
+               ON CONFLICT(platform) DO NOTHING"""
+        )
         ensure_column(db, "remote_flags", "updated_by", "TEXT")
         ensure_column(db, "remote_flags", "change_note", "TEXT NOT NULL DEFAULT ''")
         ensure_column(db, "announcements", "service_visible", "INTEGER NOT NULL DEFAULT 1")
@@ -853,7 +929,21 @@ def initialize_database() -> None:
         # users.id in nullable audit-reference columns.  The new release
         # history table enforces those foreign keys; preserve the version row
         # while clearing only references that cannot be resolved.
-        for table_name in ("app_versions", "app_release_versions"):
+        for table_name in (
+            "app_versions",
+            "app_release_versions",
+            "app_update_policies",
+        ):
+            if table_name == "app_update_policies":
+                db.execute(
+                    """UPDATE app_update_policies SET updated_by=NULL
+                        WHERE updated_by IS NOT NULL
+                          AND NOT EXISTS (
+                              SELECT 1 FROM users
+                               WHERE users.id=app_update_policies.updated_by
+                          )"""
+                )
+                continue
             db.execute(
                 f"""UPDATE {table_name} SET created_by=NULL
                     WHERE created_by IS NOT NULL
@@ -947,6 +1037,14 @@ def initialize_database() -> None:
                VALUES('android',31,24,'2.0.9','',?,?)
                ON CONFLICT(platform) DO NOTHING""",
             (timestamp, timestamp),
+        )
+        db.execute(
+            """INSERT INTO app_update_policies(
+                   platform,update_enabled,force_update_enabled,
+                   minimum_supported_version_code,policy_revision,updated_at
+               ) VALUES('android',0,0,24,1,?)
+               ON CONFLICT(platform) DO NOTHING""",
+            (timestamp,),
         )
         sync_release_history(db)
         for key, enabled in (
@@ -1905,16 +2003,32 @@ def serialize_public_version(
     row: sqlite3.Row,
     *,
     effective_force_update: bool | None = None,
+    legacy_minimum_version_code: int | None = None,
 ) -> dict[str, Any]:
     """Keep the legacy snake_case DTO and add the direct-update contract fields."""
     version = row_dict(row) or {}
     configured_force_update = bool(version.get("force_update"))
-    version["force_update"] = configured_force_update
+    force_update = (
+        configured_force_update
+        if effective_force_update is None
+        else bool(effective_force_update)
+    )
+    minimum_version_code = (
+        version.get("minimum_version_code")
+        if legacy_minimum_version_code is None
+        else int(legacy_minimum_version_code)
+    )
+    # Android's Gson DTO declares both snake_case compatibility booleans as
+    # Boolean. SQLite integers must not leak here or the entire envelope fails
+    # deserialization before a policy reversal can be observed.
+    version["metadata_verified"] = bool(version.get("metadata_verified"))
+    version["force_update"] = force_update
+    version["minimum_version_code"] = minimum_version_code
     version.update(
         {
             "versionCode": version.get("latest_version_code"),
             "versionName": version.get("latest_version_name"),
-            "minimumSupportedVersionCode": version.get("minimum_version_code"),
+            "minimumSupportedVersionCode": minimum_version_code,
             "releaseNotes": version.get("update_message") or "",
             "downloadUrl": version.get("download_url"),
             "apkUrl": version.get("download_url"),
@@ -1924,14 +2038,28 @@ def serialize_public_version(
             "signingCertificateSha256": version.get("signing_certificate_sha256"),
             "metadataVerified": bool(version.get("metadata_verified")),
             "publishedAt": version.get("published_at"),
-            "forceUpdate": (
-                configured_force_update
-                if effective_force_update is None
-                else bool(effective_force_update)
-            ),
+            "forceUpdate": force_update,
         }
     )
     return version
+
+
+def serialize_release_metadata(row: sqlite3.Row) -> dict[str, Any]:
+    """Serialize publication facts without embedding mutable policy fields."""
+
+    return {
+        "platform": row["platform"],
+        "versionCode": row["latest_version_code"],
+        "versionName": row["latest_version_name"],
+        "apkUrl": row["download_url"],
+        "apkSha256": row["apk_sha256"],
+        "apkSize": row["apk_size"],
+        "packageName": row["package_name"],
+        "signingCertificateSha256": row["signing_certificate_sha256"],
+        "metadataVerified": bool(row["metadata_verified"]),
+        "releaseNotes": row["update_message"] or "",
+        "publishedAt": row["published_at"],
+    }
 
 
 def parse_boolean(value: Any, field: str, default: bool = False) -> bool:
@@ -2566,7 +2694,12 @@ class ApiHandler(BaseHTTPRequestHandler):
         self.send_response(status)
         self.send_header("Content-Type", content_type)
         self.send_header("Content-Length", str(len(encoded)))
-        self.send_header("Cache-Control", "no-store")
+        self.send_header(
+            "Cache-Control",
+            "no-store, no-cache, must-revalidate, max-age=0",
+        )
+        self.send_header("Pragma", "no-cache")
+        self.send_header("Expires", "0")
         self.send_header("X-Content-Type-Options", "nosniff")
         self.send_header("X-Frame-Options", "DENY")
         self.send_header("Referrer-Policy", "no-referrer")
@@ -2849,6 +2982,8 @@ class ApiHandler(BaseHTTPRequestHandler):
         if method == "GET" and path == "/api/v1/public/website-announcements":
             return self.public_website_announcements(), 200
         if method == "GET" and path == "/api/v1/public/version/android":
+            return self.public_version_check(query), 200
+        if method == "GET" and path == "/api/v1/public/update-policy/android":
             return self.public_version_check(query), 200
         if method == "GET" and path == "/api/v1/public/service-updates":
             return self.public_service_updates(), 200
@@ -4068,14 +4203,28 @@ class ApiHandler(BaseHTTPRequestHandler):
             version_row = db.execute(
                 "SELECT * FROM app_versions WHERE platform='android' AND status='PUBLISHED'"
             ).fetchone()
-            version = serialize_public_version(version_row) if version_row else None
-            if version:
-                # SQLite stores booleans as integers, while Android's Gson model
-                # correctly expects a JSON boolean.  A numeric value here makes
-                # the whole bootstrap payload fail to deserialize and leaves all
-                # remote feature gates stuck on stale cache.
-                version["force_update"] = bool(version["force_update"])
-            return {"flags": flags, "announcements": announcements, "version": version}
+            policy = update_policy_state(db)
+            # Bootstrap is not a client-version-aware policy check. Keep its
+            # legacy version object non-mandatory and expose the actual live
+            # policy separately so it can never become a second force source.
+            version = (
+                serialize_public_version(
+                    version_row,
+                    effective_force_update=False,
+                    legacy_minimum_version_code=1,
+                )
+                if version_row
+                else None
+            )
+            return {
+                "flags": flags,
+                "announcements": announcements,
+                "version": version,
+                "releaseMetadata": (
+                    serialize_release_metadata(version_row) if version_row else None
+                ),
+                "updatePolicy": policy,
+            }
 
     def public_website_announcements(self) -> dict[str, Any]:
         """Return enabled website announcements, never App announcements."""
@@ -4107,29 +4256,60 @@ class ApiHandler(BaseHTTPRequestHandler):
                    force_update,published_at,status
                    FROM app_versions WHERE platform='android' AND status='PUBLISHED'"""
             ).fetchone()
-            if not row:
-                return {
-                    "updateAvailable": False,
-                    "forceUpdate": False,
-                    "minimumVersionViolated": False,
-                    "mandatoryUpdate": False,
-                    "currentVersionCode": current,
-                    "latestVersion": None,
-                }
-            update_available = row["latest_version_code"] > current
-            minimum_violated = current < row["minimum_version_code"]
-            effective_force_update = update_available and (
-                bool(row["force_update"]) or minimum_violated
+            policy = update_policy_state(db)
+            decision = update_decision(current, row, policy)
+            # V1.0.4 reads force_update and minimum_version_code from the nested
+            # release object.  Feed it this request's effective server decision,
+            # not the historical fields stored with a published release.  When
+            # force control is off, a neutral legacy minimum prevents an old
+            # client from recreating FORCE solely from a version comparison.
+            legacy_version = None
+            if row:
+                legacy_version = serialize_public_version(
+                    row,
+                    effective_force_update=decision["mandatoryUpdate"],
+                    legacy_minimum_version_code=(
+                        policy["minimumSupportedVersionCode"]
+                        if policy["forceUpdateEnabled"]
+                        else 1
+                    ),
+                )
+                if not policy["updateEnabled"]:
+                    # V1.0.4 treats a missing latestVersion as a backend
+                    # failure and falls back to the static website manifest.
+                    # Return a request-scoped neutral version instead so the
+                    # server's explicit OFF decision wins that legacy flow.
+                    legacy_version["latest_version_code"] = current
+                    legacy_version["versionCode"] = current
+            request_timestamp = now_ms()
+            logging.getLogger("mychangli.update").info(
+                "update policy decision",
+                extra={
+                    "event": "UPDATE_POLICY_DECISION",
+                    "client_version_code": current,
+                    "latest_version_code": policy["latestVersionCode"],
+                    "update_decision": decision["decision"],
+                    "policy_revision": policy["policyRevision"],
+                },
             )
-            version = serialize_public_version(row)
             return {
-                "updateAvailable": update_available,
-                "forceUpdate": effective_force_update,
-                "minimumVersionViolated": minimum_violated,
+                **decision,
+                "forceUpdate": decision["mandatoryUpdate"],
                 # Retained as the V1 compatibility alias for existing clients.
-                "mandatoryUpdate": effective_force_update,
+                "mandatoryUpdate": decision["mandatoryUpdate"],
                 "currentVersionCode": current,
-                "latestVersion": version,
+                "latestVersion": legacy_version,
+                "releaseMetadata": serialize_release_metadata(row) if row else None,
+                "policy": policy,
+                "updateEnabled": policy["updateEnabled"],
+                "forceUpdateEnabled": policy["forceUpdateEnabled"],
+                "latestVersionCode": policy["latestVersionCode"],
+                "minimumSupportedVersionCode": policy[
+                    "minimumSupportedVersionCode"
+                ],
+                "policyRevision": policy["policyRevision"],
+                "policyUpdatedAt": policy["updatedAt"],
+                "requestTimestamp": request_timestamp,
             }
 
     def public_service_updates(self) -> list[dict[str, Any]]:
@@ -4150,8 +4330,9 @@ class ApiHandler(BaseHTTPRequestHandler):
                    force_update,published_at
                    FROM app_versions WHERE platform='android' AND status='PUBLISHED'"""
             ).fetchone()
-            if version:
-                force_update = bool(version["force_update"])
+            policy = update_policy_state(db)
+            if version and policy["updateEnabled"]:
+                force_update = bool(policy["forceUpdateEnabled"])
                 items.append(
                     {
                         "id": f"update-{version['latest_version_code']}",
@@ -4165,7 +4346,10 @@ class ApiHandler(BaseHTTPRequestHandler):
                         "versionCode": version["latest_version_code"],
                         "versionName": version["latest_version_name"],
                         "forceUpdate": force_update,
-                        "minimumVersionCode": version["minimum_version_code"],
+                        "minimumVersionCode": policy[
+                            "minimumSupportedVersionCode"
+                        ],
+                        "policyRevision": policy["policyRevision"],
                         "downloadUrl": version["download_url"],
                         "apkSha256": version["apk_sha256"],
                         "apkSize": version["apk_size"],
@@ -6437,14 +6621,19 @@ class ApiHandler(BaseHTTPRequestHandler):
                             "changeNote": row["change_note"],
                         }
                     )
-                version = row_dict(
-                    db.execute(
-                        "SELECT * FROM app_versions WHERE platform='android'"
-                    ).fetchone()
-                )
+                version_row = db.execute(
+                    "SELECT * FROM app_versions WHERE platform='android'"
+                ).fetchone()
+                version = row_dict(version_row)
+                policy = update_policy_state(db)
                 if version:
-                    version["force_update"] = bool(version["force_update"])
-                    version["forceUpdate"] = version["force_update"]
+                    # Compatibility aliases only. The policy table, returned
+                    # separately below, is the authority for these controls.
+                    version["force_update"] = policy["forceUpdateEnabled"]
+                    version["forceUpdate"] = policy["forceUpdateEnabled"]
+                    version["minimum_version_code"] = policy[
+                        "minimumSupportedVersionCode"
+                    ]
                     version["metadata_verified"] = bool(version.get("metadata_verified"))
                 available_versions = [
                     row_dict(row)
@@ -6463,6 +6652,10 @@ class ApiHandler(BaseHTTPRequestHandler):
                 return {
                     "flags": flags,
                     "version": version,
+                    "releaseMetadata": (
+                        serialize_release_metadata(version_row) if version_row else None
+                    ),
+                    "updatePolicy": policy,
                     "availableVersions": available_versions,
                 }, 200
 
@@ -6527,15 +6720,125 @@ class ApiHandler(BaseHTTPRequestHandler):
                     "changeNote": change_note,
                 }, 200
 
+            if method == "PUT" and path == "/api/v1/admin/update-policy/android":
+                require_admin_permission(admin, "*")
+                data = self.body_json()
+                update_enabled = parse_boolean(
+                    data.get("updateEnabled"), "updateEnabled"
+                )
+                force_update_enabled = parse_boolean(
+                    data.get("forceUpdateEnabled"), "forceUpdateEnabled"
+                )
+                if force_update_enabled and not update_enabled:
+                    raise ApiError(
+                        400,
+                        "INVALID_UPDATE_POLICY",
+                        "关闭更新检查时不能开启强制更新",
+                    )
+                try:
+                    minimum = int(data.get("minimumSupportedVersionCode", 0))
+                    expected_revision = int(data.get("expectedPolicyRevision", 0))
+                except (TypeError, ValueError) as exc:
+                    raise ApiError(400, "VALIDATION_ERROR", "更新策略版本号无效") from exc
+                # Take the write lock before reading revision/release state so
+                # two admins cannot both accept the same expected revision.
+                db.execute("BEGIN IMMEDIATE")
+                release = db.execute(
+                    "SELECT latest_version_code FROM app_versions "
+                    "WHERE platform='android' AND status='PUBLISHED'"
+                ).fetchone()
+                if not release:
+                    raise ApiError(409, "PUBLISHED_RELEASE_REQUIRED", "当前没有正式发布版本")
+                latest = int(release["latest_version_code"])
+                if minimum < 1 or minimum > latest:
+                    raise ApiError(400, "VALIDATION_ERROR", "最低支持版本号无效")
+                if not db.execute(
+                    """SELECT 1 FROM app_release_versions
+                       WHERE platform='android' AND version_code=? AND status='PUBLISHED'""",
+                    (minimum,),
+                ).fetchone():
+                    raise ApiError(
+                        409,
+                        "MINIMUM_VERSION_NOT_PUBLISHED",
+                        "最低支持版本必须来自已发布版本记录",
+                    )
+                previous = update_policy_state(db)
+                if expected_revision != previous["policyRevision"]:
+                    raise ApiError(
+                        409,
+                        "POLICY_REVISION_CONFLICT",
+                        "更新策略已被其他管理员修改，请刷新后重试",
+                    )
+                timestamp = now_ms()
+                revision = previous["policyRevision"] + 1
+                new_policy = {
+                    "platform": "android",
+                    "updateEnabled": update_enabled,
+                    "forceUpdateEnabled": force_update_enabled,
+                    "latestVersionCode": latest,
+                    "minimumSupportedVersionCode": minimum,
+                    "policyRevision": revision,
+                    "updatedAt": timestamp,
+                    "updatedBy": admin["id"],
+                }
+                db.execute(
+                    """INSERT INTO app_update_policies(
+                           platform,update_enabled,force_update_enabled,
+                           minimum_supported_version_code,policy_revision,
+                           updated_at,updated_by
+                       ) VALUES('android',?,?,?,?,?,?)
+                       ON CONFLICT(platform) DO UPDATE SET
+                           update_enabled=excluded.update_enabled,
+                           force_update_enabled=excluded.force_update_enabled,
+                           minimum_supported_version_code=
+                               excluded.minimum_supported_version_code,
+                           policy_revision=excluded.policy_revision,
+                           updated_at=excluded.updated_at,
+                           updated_by=excluded.updated_by""",
+                    (
+                        1 if update_enabled else 0,
+                        1 if force_update_enabled else 0,
+                        minimum,
+                        revision,
+                        timestamp,
+                        admin["id"],
+                    ),
+                )
+                write_audit(
+                    db,
+                    admin["id"],
+                    "APP_UPDATE_POLICY_UPDATED",
+                    "APP_UPDATE_POLICY",
+                    "android",
+                    {
+                        "operator": admin["id"],
+                        "oldPolicy": previous,
+                        "newPolicy": new_policy,
+                        "policyRevision": revision,
+                        "updatedAt": timestamp,
+                    },
+                )
+                db.execute("COMMIT")
+                return new_policy, 200
+
             if method == "PUT" and path == "/api/v1/admin/version/android":
+                require_admin_permission(admin, "*")
                 data = self.body_json()
                 try:
                     latest = int(data.get("latestVersionCode", 0))
-                    minimum = int(data.get("minimumVersionCode", 0))
                 except (TypeError, ValueError) as exc:
                     raise ApiError(400, "VALIDATION_ERROR", "版本号配置无效") from exc
-                if latest < 1 or minimum < 1 or minimum > latest:
+                if latest < 1:
                     raise ApiError(400, "VALIDATION_ERROR", "版本号配置无效")
+                current_policy = update_policy_state(db)
+                minimum = int(current_policy["minimumSupportedVersionCode"])
+                force_update = bool(current_policy["forceUpdateEnabled"])
+                if minimum > latest:
+                    raise ApiError(
+                        409,
+                        "UPDATE_POLICY_INCOMPATIBLE",
+                        "当前最低支持版本高于要保存的发布版本，请先调整更新策略",
+                    )
                 status = str(data.get("status", "DRAFT")).upper()
                 if status not in {"DRAFT", "PUBLISHED", "DISABLED"}:
                     raise ApiError(400, "VALIDATION_ERROR", "版本发布状态无效")
@@ -6556,7 +6859,6 @@ class ApiHandler(BaseHTTPRequestHandler):
                     apk_size = None
                 if apk_size is not None and apk_size <= 0:
                     raise ApiError(400, "INVALID_APK_SIZE", "APK 大小必须大于 0")
-                force_update = parse_boolean(data.get("forceUpdate"), "forceUpdate")
                 package_name = str(data.get("packageName", "")).strip()[:200] or None
                 certificate = str(data.get("signingCertificateSha256", "")).strip().upper() or None
                 metadata_verified = parse_boolean(

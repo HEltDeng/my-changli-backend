@@ -397,6 +397,10 @@ class ApiTest(unittest.TestCase):
                 "WHERE platform='android' AND version_code=31",
                 (server.now_ms(),),
             )
+            db.execute(
+                "UPDATE app_update_policies SET minimum_supported_version_code=31 "
+                "WHERE platform='android'"
+            )
 
     def test_phone_account_gate_and_device_data_migration(self):
         installation_id = "migration-" + secrets.token_hex(8)
@@ -1082,16 +1086,35 @@ class ApiTest(unittest.TestCase):
         )
         self.assertEqual(409, invalid_status)
         self.assertEqual("APK_METADATA_UNVERIFIED", invalid_response["error"]["code"])
-        invalid_minimum_status, invalid_minimum_response = self.call(
-            "PUT",
-            "/api/v1/admin/version/android",
-            dict(payload, status="PUBLISHED", minimumVersionCode=30),
-            admin,
-        )
-        self.assertEqual(409, invalid_minimum_status)
-        self.assertEqual("MINIMUM_VERSION_NOT_PUBLISHED", invalid_minimum_response["error"]["code"])
         payload["status"] = "PUBLISHED"
         self.assertEqual(200, self.call("PUT", "/api/v1/admin/version/android", payload, admin)[0])
+        disabled = self.call(
+            "GET", "/api/v1/public/version/android?currentVersionCode=31"
+        )[1]["data"]
+        self.assertFalse(disabled["updateAvailable"])
+        self.assertEqual("NONE", disabled["decision"])
+        # V1.0.4 falls back to latest.json when latestVersion is null. The
+        # request-scoped neutral code proves updateEnabled=false without
+        # exposing stale website policy, while releaseMetadata stays factual.
+        self.assertEqual(31, disabled["latestVersion"]["latest_version_code"])
+        self.assertEqual(42, disabled["releaseMetadata"]["versionCode"])
+        self.assertFalse(disabled["latestVersion"]["force_update"])
+        self.assertIs(type(disabled["latestVersion"]["metadata_verified"]), bool)
+        config = self.call("GET", "/api/v1/admin/config", token=admin)[1]["data"]
+        policy = config["updatePolicy"]
+        self.assertEqual(42, config["releaseMetadata"]["versionCode"])
+        self.assertNotIn("forceUpdate", config["releaseMetadata"])
+        self.assertNotIn("minimumSupportedVersionCode", config["releaseMetadata"])
+        optional_policy = {
+            "updateEnabled": True,
+            "forceUpdateEnabled": False,
+            "minimumSupportedVersionCode": 31,
+            "expectedPolicyRevision": policy["policyRevision"],
+        }
+        status, saved_policy = self.call(
+            "PUT", "/api/v1/admin/update-policy/android", optional_policy, admin
+        )
+        self.assertEqual(200, status, saved_policy)
         status, newer = self.call("GET", "/api/v1/public/version/android?currentVersionCode=31")
         self.assertEqual(200, status)
         self.assertTrue(newer["data"]["updateAvailable"])
@@ -1101,7 +1124,7 @@ class ApiTest(unittest.TestCase):
             "GET", "/api/v1/public/version/android?currentVersionCode=30"
         )[1]
         self.assertTrue(below_minimum["data"]["minimumVersionViolated"])
-        self.assertTrue(below_minimum["data"]["mandatoryUpdate"])
+        self.assertFalse(below_minimum["data"]["mandatoryUpdate"])
         self.assertEqual(42, newer["data"]["latestVersion"]["latest_version_code"])
         self.assertFalse(newer["data"]["forceUpdate"])
         self.assertEqual(42, newer["data"]["latestVersion"]["versionCode"])
@@ -1111,11 +1134,16 @@ class ApiTest(unittest.TestCase):
         )
         self.assertEqual("a" * 64, newer["data"]["latestVersion"]["apkSha256"])
         self.assertEqual(123456, newer["data"]["latestVersion"]["apkSize"])
-        forced_payload = dict(payload, forceUpdate=True)
-        self.assertEqual(
-            200,
-            self.call("PUT", "/api/v1/admin/version/android", forced_payload, admin)[0],
-        )
+        current_revision = saved_policy["data"]["policyRevision"]
+        forced_payload = {
+            "updateEnabled": True,
+            "forceUpdateEnabled": True,
+            "minimumSupportedVersionCode": 42,
+            "expectedPolicyRevision": current_revision,
+        }
+        self.assertEqual(200, self.call(
+            "PUT", "/api/v1/admin/update-policy/android", forced_payload, admin,
+        )[0])
         forced = self.call(
             "GET", "/api/v1/public/version/android?currentVersionCode=31"
         )[1]
@@ -1124,8 +1152,76 @@ class ApiTest(unittest.TestCase):
         self.assertTrue(forced["data"]["mandatoryUpdate"])
         self.assertTrue(forced["data"]["latestVersion"]["force_update"])
         config = self.call("GET", "/api/v1/admin/config", token=admin)[1]
-        self.assertTrue(config["data"]["version"]["force_update"])
-        self.assertTrue(config["data"]["version"]["forceUpdate"])
+        self.assertTrue(config["data"]["updatePolicy"]["forceUpdateEnabled"])
+        self.assertEqual(
+            forced["data"]["policyRevision"],
+            config["data"]["updatePolicy"]["policyRevision"],
+        )
+        revoked_payload = {
+            **forced_payload,
+            "forceUpdateEnabled": False,
+            "expectedPolicyRevision": forced["data"]["policyRevision"],
+        }
+        self.assertEqual(200, self.call(
+            "PUT", "/api/v1/admin/update-policy/android", revoked_payload, admin,
+        )[0])
+        revoked = self.call(
+            "GET", "/api/v1/public/version/android?currentVersionCode=31"
+        )[1]["data"]
+        self.assertTrue(revoked["updateAvailable"])
+        self.assertFalse(revoked["mandatoryUpdate"])
+        self.assertFalse(revoked["latestVersion"]["force_update"])
+        self.assertEqual(1, revoked["latestVersion"]["minimum_version_code"])
+        self.assertGreater(revoked["policyRevision"], forced["data"]["policyRevision"])
+        conflict_status, conflict = self.call(
+            "PUT",
+            "/api/v1/admin/update-policy/android",
+            {**forced_payload, "expectedPolicyRevision": forced["data"]["policyRevision"]},
+            admin,
+        )
+        self.assertEqual(409, conflict_status)
+        self.assertEqual("POLICY_REVISION_CONFLICT", conflict["error"]["code"])
+        forced_again_payload = {
+            **forced_payload,
+            "expectedPolicyRevision": revoked["policyRevision"],
+        }
+        forced_again_status, forced_again = self.call(
+            "PUT", "/api/v1/admin/update-policy/android", forced_again_payload, admin
+        )
+        self.assertEqual(200, forced_again_status)
+        self.assertGreater(
+            forced_again["data"]["policyRevision"], revoked["policyRevision"]
+        )
+        forced_again_check = self.call(
+            "GET", "/api/v1/public/update-policy/android?currentVersionCode=31"
+        )[1]["data"]
+        self.assertTrue(forced_again_check["mandatoryUpdate"])
+        self.assertEqual(
+            forced_again["data"]["policyRevision"],
+            forced_again_check["policyRevision"],
+        )
+        self.assertIsInstance(forced_again_check["requestTimestamp"], int)
+        request = urllib.request.Request(
+            self.base + "/api/v1/public/update-policy/android?currentVersionCode=31"
+        )
+        with urllib.request.urlopen(request, timeout=5) as response:
+            self.assertEqual(
+                "no-store, no-cache, must-revalidate, max-age=0",
+                response.headers["Cache-Control"],
+            )
+            self.assertEqual("no-cache", response.headers["Pragma"])
+            self.assertEqual("0", response.headers["Expires"])
+        audits = self.call("GET", "/api/v1/admin/audit-logs", token=admin)[1]["data"]
+        policy_audit = next(
+            row for row in audits if row["action"] == "APP_UPDATE_POLICY_UPDATED"
+        )
+        audit_details = json.loads(policy_audit["details_json"])
+        self.assertIn("oldPolicy", audit_details)
+        self.assertIn("newPolicy", audit_details)
+        self.assertEqual(
+            audit_details["newPolicy"]["policyRevision"],
+            audit_details["policyRevision"],
+        )
         current = self.call("GET", "/api/v1/public/version/android?currentVersionCode=42")[1]
         self.assertFalse(current["data"]["updateAvailable"])
         self.assertFalse(current["data"]["forceUpdate"])
@@ -1508,6 +1604,18 @@ class ApiTest(unittest.TestCase):
             200,
             self.call("PUT", "/api/v1/admin/version/android", version_payload, admin)[0],
         )
+        policy = self.call("GET", "/api/v1/admin/config", token=admin)[1]["data"]["updatePolicy"]
+        self.assertEqual(200, self.call(
+            "PUT",
+            "/api/v1/admin/update-policy/android",
+            {
+                "updateEnabled": True,
+                "forceUpdateEnabled": False,
+                "minimumSupportedVersionCode": 31,
+                "expectedPolicyRevision": policy["policyRevision"],
+            },
+            admin,
+        )[0])
 
         visible = self.call(
             "POST",

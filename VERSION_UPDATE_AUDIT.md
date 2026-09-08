@@ -1,43 +1,59 @@
-# Android 版本检查链路审计
+# Android 更新控制链路审计
 
-## 当前启用链路
+## 唯一实时事实源
 
-App 冷启动首页可用后，“关于与检查更新”都会调用
-`GET /api/v1/public/version/android?currentVersionCode=<code>`。服务端只读取
-`app_versions` 中 `platform='android' AND status='PUBLISHED'` 的唯一配置；`DRAFT`
-和 `DISABLED` 不对 App 可见。管理后台保存和发布、公开版本检查、启动 bootstrap
-以及服务动态卡片都使用这套版本数据，不另建版本系统。
+更新链路现在把两个概念分开保存：
 
-公开版本响应保留 Android V1 已使用的 snake_case 字段，同时增加直接更新合同字段：
-`versionCode`、`versionName`、`minimumSupportedVersionCode`、`releaseNotes`、
-`downloadUrl`、`apkSha256`、`apkSize`、`publishedAt` 和 `forceUpdate`。顶层也返回
-`updateAvailable`、`minimumVersionViolated`、`forceUpdate`；旧客户端继续读取原字段，
-新客户端可以只依赖一个 manifest 响应完成检查。
+- `app_versions` / `app_release_versions` 只描述已经发布的 APK：版本名、版本号、下载地址、SHA-256、大小、发布说明和发布时间；
+- `app_update_policies` 保存当前运营控制策略：是否检查更新、是否强制、最低支持版本、`policy_revision`、修改时间和操作人。
 
-强制策略是服务端明确计算的有效策略：当前版本号不低于最新版本时
-`updateAvailable=false` 且顶层 `forceUpdate=false`；低于最新版本时，后台配置的
-`force_update=true` 或客户端低于 `minimum_version_code`，才返回
-`forceUpdate=true`。`mandatoryUpdate` 继续作为 V1 兼容别名。最低支持版本因此是
-服务端兜底的强制更新边界，而不是仅把 checkbox 原样转发给客户端。
+管理后台的 Release Metadata 与 Update Policy 使用两个独立表单和接口。策略保存后必须重新 GET 当前配置并比对服务器返回值和 revision，页面不会把本地 checkbox 状态当作保存成功。
 
-## 旧上游链路处理
+公开更新检查的唯一实时事实源是数据库中的当前 policy。`GET /api/v1/public/update-policy/android` 是新合同；`GET /api/v1/public/version/android` 保留给 V1.0.4 等历史客户端，并返回同一个实时决策。两条接口都设置禁止缓存响应头。
 
-- 原 `AppVersionApi`、`LegacyApkApi`、`UpdateDialog` 与 `DownloadService` 代码仍因兼容和未来安全实现参考而保留；
-- `UserStore.QueryIsLastedApk` 已改为明确的本地 no-op，不再创建原上游 Retrofit 客户端，也不再回退旧接口；
-- 新入口只使用 `CAMPUS_TOOLS_API_BASE_URL`，不会访问原“长理星球”的域名、APK 地址、密钥或资源；
-- 旧下载服务没有被新检查流程调用。
+官网 `releases/latest.json` 只保留 Release Metadata，不再包含 `forceUpdate` 或 `minimumVersionCode`。静态文件即使被浏览器或 CDN 缓存，也不能再次成为强制更新事实源。
 
-## Android 端尚未闭环的部分
+## 决策规则
 
-Backend 已提供 APK 直链、SHA-256、大小、版本说明和有效强制策略；Android 端仍需在
-另一轮接入下载进度、SHA-256/包名/正式签名校验、失败文件清理、PackageInstaller
-确认、安装权限和重启。当前不能把 Backend/API/Admin 的 PASS 报告为 App 内安装
-E2E PASS，也不能静默安装或绕过用户确认。
+服务端分别计算：
 
-## 未来真实发布前
+```text
+updateAvailable = updateEnabled && latestVersionCode > currentVersionCode
+minimumVersionViolated = currentVersionCode < minimumSupportedVersionCode
+mandatoryUpdate = updateAvailable && forceUpdateEnabled && minimumVersionViolated
+```
 
-必须配置 HTTPS 下载、APK 大小与 SHA-256 双重校验、失败文件删除、同 applicationId/
-正式签名覆盖校验、未知来源权限提示和 Android 系统安装确认。没有真实设备的安装器、
-权限、升级后数据保留证据时，Release Report 必须写 `PARTIAL`。以后每次 Android
-Release 都必须在同一发布记录中同时核对 APK 元数据、官网配置与 manifest、后端公开
-版本接口、官网更新日志和线上 APK SHA-256；任意一项不一致都不能标记为发布通过。
+因此版本号较旧只说明“存在更新”；只有服务器当前 policy 同时开启强制更新且客户端低于最低支持版本时才进入强制更新。关闭 `forceUpdateEnabled` 后，即使最低支持版本仍高于客户端，下一次成功请求也返回普通更新而不是强制更新。
+
+每次策略修改都在一个事务中执行 `policy_revision + 1`，并把操作人、旧策略、新策略、revision 和修改时间写入审计日志。客户端检查日志记录客户端版本、最新版本、服务器决策和 policy revision。
+
+## V1.0.4 兼容适配
+
+V1.0.4 读取 `latestVersion.force_update`，并把 `minimum_version_code` 当成独立强制条件。兼容响应因此必须把服务器当前的最终决策同时映射到这两个旧字段：
+
+- 当前决定强制：`force_update=true`，最低版本返回当前策略值；
+- 当前决定普通更新或无更新：`force_update=false`，最低版本兼容返回 `1`。
+
+这使不可修改的 V1.0.4 在下一次成功请求后也能解除强制状态。V1.0.4 本身只在 Activity 创建时检查更新，前后台切换不会重新请求；这个二进制限制只能通过杀进程重启或未来客户端升级解决。
+
+## 新客户端状态机
+
+Android 候选客户端使用显式状态：`IDLE`、`CHECKING`、`NO_UPDATE`、`OPTIONAL_UPDATE`、`FORCE_UPDATE`、`DOWNLOADING`、`VERIFYING`、`INSTALLING`、`ERROR`。成功响应总是覆盖旧决策，允许 `FORCE_UPDATE -> OPTIONAL_UPDATE / NO_UPDATE` 反向切换。
+
+强制状态不落地保存为权威事实；冷启动、回到前台和强制更新页“重新检查”都会请求服务器。网络失败可以显示错误，但不会用旧的本地 `force=true` 永久阻止用户。下载中断恢复只保存安装文件事实，不保存强制策略。
+
+## 缓存边界
+
+更新策略 API 返回：
+
+```http
+Cache-Control: no-store, no-cache, must-revalidate, max-age=0
+Pragma: no-cache
+Expires: 0
+```
+
+生产审计没有发现 Redis、Memcached、Varnish 或 Nginx proxy cache。静态 `latest.json` 仍可以按普通发布文件缓存，但由于已经移除控制字段，不再影响强制更新撤回。
+
+## 真实发布边界
+
+本次 P0 只产生开发分支代码和内部测试候选包，不修改生产版本号、生产数据库策略、正式 `latest.json`、官网 APK 或 GitHub Release，也不部署 Backend/Website。未来部署必须在人工验收后单独执行，并重新验证 Backend 直连、Nginx、正式域名和可能存在的 CDN/Edge 四层响应。

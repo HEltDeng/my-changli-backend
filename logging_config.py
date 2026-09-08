@@ -55,7 +55,18 @@ class JsonLogFormatter(logging.Formatter):
             "logger": record.name,
             "message": redact(record.getMessage()),
         }
-        for field in ("request_id", "route", "method", "status", "latency_ms", "event"):
+        for field in (
+            "request_id",
+            "route",
+            "method",
+            "status",
+            "latency_ms",
+            "event",
+            "client_version_code",
+            "latest_version_code",
+            "update_decision",
+            "policy_revision",
+        ):
             if hasattr(record, field):
                 payload[field] = redact(getattr(record, field), field)
         if record.exc_info:

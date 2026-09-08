@@ -274,6 +274,21 @@ CREATE TABLE IF NOT EXISTS app_versions (
     updated_at INTEGER NOT NULL
 );
 
+-- Release metadata above is an immutable publication fact.  Live update
+-- controls live here so an operator can enable, disable, or revoke a forced
+-- update without rewriting the release record.
+CREATE TABLE IF NOT EXISTS app_update_policies (
+    platform TEXT PRIMARY KEY,
+    update_enabled INTEGER NOT NULL DEFAULT 0,
+    force_update_enabled INTEGER NOT NULL DEFAULT 0,
+    minimum_supported_version_code INTEGER NOT NULL DEFAULT 1,
+    policy_revision INTEGER NOT NULL DEFAULT 1,
+    updated_at INTEGER NOT NULL,
+    updated_by TEXT REFERENCES users(id) ON DELETE SET NULL,
+    CHECK (minimum_supported_version_code >= 1),
+    CHECK (policy_revision >= 1)
+);
+
 -- Published release history feeds the admin minimum-version selector. The
 -- app_versions row remains the effective policy for backward compatibility.
 CREATE TABLE IF NOT EXISTS app_release_versions (
