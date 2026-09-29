@@ -755,6 +755,9 @@ const renderers = {
       : await api("/api/v1/admin/config");
     const version = data.version || {};
     const policy = data.updatePolicy || {};
+    const appConfig = data.appConfig || {};
+    const activeAppConfig = appConfig.active || {};
+    const appConfigRevisions = appConfig.revisions || [];
     const availableVersions = data.availableVersions || [];
     const configuredCode = Number(version.latest_version_code || 1);
     const metadataState = version.metadata_verified ? "已自动校验" : "尚未完成自动校验";
@@ -819,6 +822,35 @@ const renderers = {
                 <button class="primary">保存状态</button>
               </form>`).join("")}
           </div>
+        </article>
+        <article class="card">
+          <h3>Remote Config 动态配置</h3>
+          <p class="muted">只允许发布已通过服务端白名单、URL 安全和大小限制校验的配置。App 会按 Server → Cache → Built-in Default 使用，并保留 last-known-good。</p>
+          <div class="sub-card">
+            <strong>当前生效版本</strong>
+            <p>Config V${Number(appConfig.configVersion || 0)} · Revision ${Number(appConfig.activeRevision || 0)} · ${escapeHtml(activeAppConfig.configHash || "—")}</p>
+            <p class="subtle">更新时间：${formatTime(activeAppConfig.updatedAt)} · 状态：${escapeHtml(activeAppConfig.status || "—")}</p>
+          </div>
+          <form id="app-config-draft-form" class="stack">
+            <label>配置 JSON（只填写 config 对象）<textarea name="configJson" rows="18" spellcheck="false" required>${escapeHtml(JSON.stringify(activeAppConfig.config || {}, null, 2))}</textarea></label>
+            <div class="grid two-columns">
+              <label>最低 App versionCode<input type="number" min="0" name="minAppVersionCode" value="${Number(activeAppConfig.minAppVersionCode || 0)}"></label>
+              <label>最高 App versionCode（可留空）<input type="number" min="0" name="maxAppVersionCode" value="${activeAppConfig.maxAppVersionCode ?? ""}"></label>
+            </div>
+            <label>草稿备注（可选）<input name="reason" maxlength="300" placeholder="例如：Config V2 调整首页入口顺序"></label>
+            <button class="primary">校验并保存草稿</button>
+          </form>
+          <form id="app-config-activate-form" class="stack">
+            <label>激活草稿<select name="revision" required>${appConfigRevisions.filter((row) => row.status === "DRAFT").map((row) => `<option value="${Number(row.revision)}">Config V${Number(row.configVersion)} · Revision ${Number(row.revision)}</option>`).join("") || '<option value="">暂无 DRAFT</option>'}</select></label>
+            <input type="hidden" name="expectedActiveRevision" value="${Number(appConfig.activeRevision || 0)}">
+            <button class="primary" ${appConfigRevisions.some((row) => row.status === "DRAFT") ? "" : "disabled"}>激活选中配置</button>
+          </form>
+          <form id="app-config-rollback-form" class="stack">
+            <label>回滚目标<select name="targetRevision" required>${appConfigRevisions.filter((row) => Number(row.revision) !== Number(appConfig.activeRevision)).map((row) => `<option value="${Number(row.revision)}">Config V${Number(row.configVersion)} · Revision ${Number(row.revision)} · ${escapeHtml(row.status || "")}</option>`).join("") || '<option value="">暂无可回滚版本</option>'}</select></label>
+            <input type="hidden" name="expectedActiveRevision" value="${Number(appConfig.activeRevision || 0)}">
+            <button class="danger" ${appConfigRevisions.some((row) => Number(row.revision) !== Number(appConfig.activeRevision)) ? "" : "disabled"}>回滚为新的 Config 版本</button>
+          </form>
+          <div class="sub-card"><strong>最近配置 Revision</strong><ul>${appConfigRevisions.slice(0, 8).map((row) => `<li>Revision ${Number(row.revision)} · Config V${Number(row.configVersion)} · ${escapeHtml(row.status || "")} · ${escapeHtml(row.configHash || "")}</li>`).join("") || "<li>暂无记录</li>"}</ul></div>
         </article>
       </div>`;
   },
@@ -1146,6 +1178,59 @@ content.addEventListener("submit", async (event) => {
         throw new Error("服务器策略回读不一致，保存结果未确认");
       }
       toast(`更新策略已保存并回读确认（Revision ${actual.policyRevision}）`);
+      return renderers.config(confirmed);
+    }
+    if (form.id === "app-config-draft-form") {
+      let config;
+      try {
+        config = JSON.parse(values.configJson);
+      } catch (_) {
+        throw new Error("配置 JSON 格式无效");
+      }
+      const validated = await api("/api/v1/admin/app-config/validate", {
+        method: "POST",
+        body: { config },
+      });
+      await api("/api/v1/admin/app-config/revisions", {
+        method: "POST",
+        body: {
+          config: validated.config,
+          minAppVersionCode: Number(values.minAppVersionCode || 0),
+          maxAppVersionCode: values.maxAppVersionCode ? Number(values.maxAppVersionCode) : null,
+          reason: values.reason || "",
+        },
+      });
+      toast(`Remote Config 已校验并保存（${validated.configHash}）`);
+      return renderers.config();
+    }
+    if (form.id === "app-config-activate-form") {
+      const saved = await api("/api/v1/admin/app-config/activate", {
+        method: "POST",
+        body: {
+          revision: Number(values.revision),
+          expectedActiveRevision: Number(values.expectedActiveRevision),
+        },
+      });
+      const confirmed = await api("/api/v1/admin/config");
+      if (confirmed.appConfig?.activeRevision !== saved.activeRevision) {
+        throw new Error("Remote Config 激活回读不一致，结果未确认");
+      }
+      toast(`Remote Config 已激活（Config V${confirmed.appConfig.configVersion}）`);
+      return renderers.config(confirmed);
+    }
+    if (form.id === "app-config-rollback-form") {
+      const saved = await api("/api/v1/admin/app-config/rollback", {
+        method: "POST",
+        body: {
+          targetRevision: Number(values.targetRevision),
+          expectedActiveRevision: Number(values.expectedActiveRevision),
+        },
+      });
+      const confirmed = await api("/api/v1/admin/config");
+      if (confirmed.appConfig?.activeRevision !== saved.activeRevision) {
+        throw new Error("Remote Config 回滚回读不一致，结果未确认");
+      }
+      toast(`Remote Config 已回滚为新的 Config V${confirmed.appConfig.configVersion}`);
       return renderers.config(confirmed);
     }
   } catch (error) {

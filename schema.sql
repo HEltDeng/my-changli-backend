@@ -289,6 +289,43 @@ CREATE TABLE IF NOT EXISTS app_update_policies (
     CHECK (policy_revision >= 1)
 );
 
+-- Dynamic App configuration is deliberately separate from release metadata and
+-- update policy.  A configuration revision can change the existing UI
+-- catalogue without changing the APK bytes or publishing a new release.
+CREATE TABLE IF NOT EXISTS app_config_revisions (
+    revision INTEGER PRIMARY KEY AUTOINCREMENT,
+    platform TEXT NOT NULL DEFAULT 'android',
+    schema_version INTEGER NOT NULL,
+    config_version INTEGER NOT NULL,
+    min_app_version_code INTEGER NOT NULL DEFAULT 0,
+    max_app_version_code INTEGER,
+    config_hash TEXT NOT NULL,
+    config_json TEXT NOT NULL,
+    status TEXT NOT NULL DEFAULT 'DRAFT'
+        CHECK (status IN ('DRAFT', 'ACTIVE', 'ARCHIVED')),
+    created_by TEXT REFERENCES users(id) ON DELETE SET NULL,
+    created_at INTEGER NOT NULL,
+    updated_by TEXT REFERENCES users(id) ON DELETE SET NULL,
+    updated_at INTEGER NOT NULL,
+    UNIQUE(platform, config_version),
+    CHECK (schema_version >= 1),
+    CHECK (config_version >= 1),
+    CHECK (min_app_version_code >= 0),
+    CHECK (max_app_version_code IS NULL OR max_app_version_code >= min_app_version_code)
+);
+
+CREATE INDEX IF NOT EXISTS app_config_revisions_listing
+ON app_config_revisions(platform, status, config_version DESC);
+
+CREATE TABLE IF NOT EXISTS app_config_state (
+    platform TEXT PRIMARY KEY,
+    active_revision INTEGER,
+    config_version INTEGER NOT NULL DEFAULT 0,
+    updated_by TEXT REFERENCES users(id) ON DELETE SET NULL,
+    updated_at INTEGER NOT NULL,
+    FOREIGN KEY(active_revision) REFERENCES app_config_revisions(revision)
+);
+
 -- Published release history feeds the admin minimum-version selector. The
 -- app_versions row remains the effective policy for backward compatibility.
 CREATE TABLE IF NOT EXISTS app_release_versions (

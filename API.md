@@ -73,6 +73,9 @@
 ## 公共基础能力
 
 - `GET /api/v1/public/bootstrap`：公告、版本、远程开关。
+  - `?schemaVersion=1&appVersionCode=37` additionally returns the validated
+    dynamic App Config envelope (`configVersion`/`configHash`/`config`).
+    Requests without these parameters remain legacy-compatible.
 - `GET /api/v1/public/website-announcements`：官网独立公告。`data.websiteAnnouncements` 只返回网站公告的 `id`、`title`、`content`、`publishedAt`、`updatedAt`，不会读取或返回 App 公告。
 - `GET /api/v1/public/update-policy/android?currentVersionCode=...`：读取当前 Android 更新策略并返回 `NONE`、`OPTIONAL` 或 `FORCE` 决策、`policyRevision`、请求时间和独立的 Release Metadata；响应禁止缓存。
 - `GET /api/v1/public/version/android?currentVersionCode=...`：历史客户端兼容入口，使用与 update-policy 相同的实时策略决策，并把最终强制结果映射到 V1.0.4 已使用的旧字段。
@@ -119,6 +122,12 @@
 - `PUT /api/v1/admin/version/android`：只维护 Release Metadata；不修改实时更新策略。
 - `PUT /api/v1/admin/update-policy/android`：超级管理员修改更新开关、强制开关和最低支持版本；必须提交 `expectedPolicyRevision`，成功后 revision 自增并写审计日志。
 - `PUT /api/v1/admin/flags/{key}`
+- `GET /api/v1/admin/config`：读取版本、策略、功能开关和动态配置当前指针/历史。
+- `POST /api/v1/admin/app-config/validate`：只校验配置，不改变 active 状态。
+- `POST /api/v1/admin/app-config/revisions`：创建待发布的动态配置草稿。
+- `POST /api/v1/admin/app-config/activate`：带 `expectedActiveRevision` 激活草稿。
+- `POST /api/v1/admin/app-config/rollback`：把历史配置复制为更高
+  `configVersion` 后激活，不降低版本号。
 - `GET /api/v1/admin/feedback`
 - `PATCH /api/v1/admin/feedback/{id}`
 - `GET /api/v1/admin/audit-logs`

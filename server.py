@@ -100,6 +100,51 @@ OFFICIAL_SIGNING_CERTIFICATE_SHA256 = (
     "2C3B934931C26719C1A55FA707760A41E18BA15B00561F97691FE1D452F4BF3D"
 )
 
+# App-config is a deliberately small, allow-listed control plane.  It can
+# select existing native routes and official-site URLs, but cannot introduce
+# code, arbitrary intents, JavaScript, or new business capabilities.
+APP_CONFIG_SCHEMA_VERSION = 1
+APP_CONFIG_MAX_BYTES = 256 * 1024
+APP_CONFIG_MAX_NAVIGATION = 100
+APP_CONFIG_MAX_CARDS = 50
+APP_CONFIG_MAX_REMOTE_PAGES = 30
+APP_CONFIG_MAX_RESOURCES = 200
+APP_CONFIG_NATIVE_ACTIONS = {
+    "schedule",
+    "grade",
+    "classroom",
+    "homework",
+    "electric",
+    "exam",
+    "calendar",
+    "cet",
+    "lost_found",
+    "account",
+    "document",
+    "mandarin",
+    "official_web",
+}
+APP_CONFIG_ICON_KEYS = {
+    "calendar",
+    "assessment",
+    "meeting_room",
+    "assignment",
+    "electric",
+    "event_note",
+    "language",
+    "find_in_page",
+    "wallet",
+    "folder",
+    "record_voice_over",
+    "globe",
+}
+APP_CONFIG_SECTIONS = {"learning", "life", "primary", "secondary"}
+APP_CONFIG_FEATURE_KEYS = {
+    "lost_found",
+    "resource_library",
+}
+OFFICIAL_WEBSITE_CONFIG_HOST = "mychangliapp.cn"
+
 # A canonical product user is either a PHONE account or an otherwise-unlinked
 # app identity.  Trusted devices are stable across installations; legacy
 # DEVICE rows are retained as the best available anonymous identity when the
@@ -788,6 +833,364 @@ def update_decision(
     }
 
 
+def default_app_config() -> dict[str, Any]:
+    """Return the V1.0.4-equivalent dynamic catalogue used for Config V1."""
+
+    navigation = [
+        ("schedule", "schedule", "课表", "calendar", 10, "learning", None, None),
+        ("grade", "grade", "成绩查询", "assessment", 20, "learning", None, None),
+        ("classroom", "classroom", "空教室", "meeting_room", 30, "learning", None, None),
+        ("homework", "homework", "作业", "assignment", 40, "learning", None, None),
+        ("electric", "electric", "电费查询", "electric", 50, "life", None, None),
+        ("exam", "exam", "考试安排", "event_note", 60, "learning", None, None),
+        ("cet", "cet", "四六级", "language", 70, "learning", None, None),
+        ("lost_found", "lost_found", "失物招领", "find_in_page", 80, "life", "lost_found", None),
+        ("document", "document", "资料库", "folder", 90, "learning", "resource_library", None),
+        ("mandarin", "mandarin", "普通话测试", "record_voice_over", 100, "learning", None, None),
+    ]
+    return {
+        "navigation": [
+            {
+                "id": item_id,
+                "actionId": action_id,
+                "title": title,
+                "iconKey": icon_key,
+                "order": order,
+                "section": section,
+                "visible": True,
+                "featureKey": feature_key,
+                "url": url,
+            }
+            for item_id, action_id, title, icon_key, order, section, feature_key, url in navigation
+        ],
+        "cards": [],
+        "remotePages": [],
+        "resources": [
+            {
+                "id": "official_home",
+                "title": "我的长理官网",
+                "description": "产品官网与公开说明",
+                "url": "https://mychangliapp.cn/",
+                "visible": True,
+                "order": 10,
+            },
+            {
+                "id": "official_features",
+                "title": "功能说明",
+                "description": "查看公开功能说明",
+                "url": "https://mychangliapp.cn/features.html",
+                "visible": True,
+                "order": 20,
+            },
+            {
+                "id": "official_guides",
+                "title": "使用指南",
+                "description": "查看公开使用指南",
+                "url": "https://mychangliapp.cn/guides.html",
+                "visible": True,
+                "order": 30,
+            },
+            {
+                "id": "official_privacy",
+                "title": "隐私说明",
+                "description": "查看公开隐私说明",
+                "url": "https://mychangliapp.cn/privacy.html",
+                "visible": True,
+                "order": 40,
+            },
+            {
+                "id": "official_updates",
+                "title": "更新记录",
+                "description": "查看公开更新记录",
+                "url": "https://mychangliapp.cn/updates.html",
+                "visible": True,
+                "order": 50,
+            },
+        ],
+    }
+
+
+def canonical_app_config_json(config: dict[str, Any]) -> str:
+    try:
+        return json.dumps(
+            config,
+            ensure_ascii=False,
+            sort_keys=True,
+            separators=(",", ":"),
+            allow_nan=False,
+        )
+    except (TypeError, ValueError) as exc:
+        raise ApiError(422, "INVALID_APP_CONFIG", "配置必须是可规范化的 JSON 对象") from exc
+
+
+def app_config_hash(config: dict[str, Any]) -> str:
+    canonical = canonical_app_config_json(config).encode("utf-8")
+    return hashlib.sha256(canonical).hexdigest().upper()
+
+
+def _config_text(value: Any, field: str, maximum: int, *, required: bool = False) -> str:
+    if not isinstance(value, str):
+        raise ApiError(422, "INVALID_APP_CONFIG", f"{field} 必须是字符串")
+    value = value.strip()
+    if required and not value:
+        raise ApiError(422, "INVALID_APP_CONFIG", f"{field} 不能为空")
+    if len(value) > maximum:
+        raise ApiError(422, "INVALID_APP_CONFIG", f"{field} 长度不能超过 {maximum} 个字符")
+    return value
+
+
+def validate_official_config_url(value: Any, field: str) -> str | None:
+    if value in (None, ""):
+        return None
+    url = _config_text(value, field, 2048, required=True)
+    parsed = urlparse(url)
+    try:
+        port = parsed.port
+    except ValueError as exc:
+        raise ApiError(422, "UNSAFE_APP_CONFIG_URL", f"{field} 端口无效") from exc
+    hostname = (parsed.hostname or "").lower()
+    if (
+        parsed.scheme.lower() != "https"
+        or hostname != OFFICIAL_WEBSITE_CONFIG_HOST
+        or parsed.username is not None
+        or parsed.password is not None
+        or port not in (None, 443)
+        or not parsed.path.startswith("/")
+        or parsed.path.startswith("//")
+    ):
+        raise ApiError(
+            422,
+            "UNSAFE_APP_CONFIG_URL",
+            f"{field} 只能使用官方 HTTPS 域名路径",
+        )
+    return url
+
+
+def _config_int(value: Any, field: str, minimum: int = 0) -> int:
+    if isinstance(value, bool) or not isinstance(value, int) or value < minimum:
+        raise ApiError(422, "INVALID_APP_CONFIG", f"{field} 必须是大于等于 {minimum} 的整数")
+    return value
+
+
+def _config_bool(value: Any, field: str, default: bool = True) -> bool:
+    if value is None:
+        return default
+    if not isinstance(value, bool):
+        raise ApiError(422, "INVALID_APP_CONFIG", f"{field} 必须是布尔值")
+    return value
+
+
+def validate_app_config(raw: Any) -> dict[str, Any]:
+    """Validate and normalize the safe, finite V1 dynamic-config surface."""
+
+    if not isinstance(raw, dict):
+        raise ApiError(422, "INVALID_APP_CONFIG", "config 必须是对象")
+    allowed_root = {"navigation", "cards", "remotePages", "resources"}
+    unknown_root = sorted(set(raw) - allowed_root)
+    if unknown_root:
+        raise ApiError(422, "INVALID_APP_CONFIG", f"config 包含未知字段：{','.join(unknown_root)}")
+
+    navigation_raw = raw.get("navigation", [])
+    if not isinstance(navigation_raw, list) or len(navigation_raw) > APP_CONFIG_MAX_NAVIGATION:
+        raise ApiError(422, "INVALID_APP_CONFIG", "navigation 数量超出限制")
+    navigation: list[dict[str, Any]] = []
+    ids: set[str] = set()
+    for index, item in enumerate(navigation_raw):
+        if not isinstance(item, dict):
+            raise ApiError(422, "INVALID_APP_CONFIG", f"navigation[{index}] 必须是对象")
+        item_id = _config_text(item.get("id"), f"navigation[{index}].id", 64, required=True)
+        if item_id in ids:
+            raise ApiError(422, "INVALID_APP_CONFIG", f"navigation[{index}].id 重复")
+        ids.add(item_id)
+        action_id = _config_text(item.get("actionId"), f"navigation[{index}].actionId", 64, required=True)
+        if action_id not in APP_CONFIG_NATIVE_ACTIONS:
+            raise ApiError(422, "INVALID_APP_CONFIG", f"navigation[{index}].actionId 未注册")
+        icon_key = _config_text(item.get("iconKey"), f"navigation[{index}].iconKey", 64, required=True)
+        if icon_key not in APP_CONFIG_ICON_KEYS:
+            raise ApiError(422, "INVALID_APP_CONFIG", f"navigation[{index}].iconKey 未注册")
+        section = _config_text(item.get("section", "learning"), f"navigation[{index}].section", 32, required=True)
+        if section not in APP_CONFIG_SECTIONS:
+            raise ApiError(422, "INVALID_APP_CONFIG", f"navigation[{index}].section 未注册")
+        feature_key = item.get("featureKey")
+        if feature_key is not None:
+            feature_key = _config_text(feature_key, f"navigation[{index}].featureKey", 64, required=True)
+            if feature_key not in APP_CONFIG_FEATURE_KEYS:
+                raise ApiError(422, "INVALID_APP_CONFIG", f"navigation[{index}].featureKey 不允许从配置开启")
+        navigation.append(
+            {
+                "id": item_id,
+                "actionId": action_id,
+                "title": _config_text(item.get("title"), f"navigation[{index}].title", 40, required=True),
+                "iconKey": icon_key,
+                "order": _config_int(item.get("order", index), f"navigation[{index}].order"),
+                "section": section,
+                "visible": _config_bool(item.get("visible"), f"navigation[{index}].visible"),
+                "featureKey": feature_key,
+                "url": validate_official_config_url(item.get("url"), f"navigation[{index}].url"),
+            }
+        )
+    if "schedule" not in ids:
+        raise ApiError(422, "INVALID_APP_CONFIG", "navigation 必须保留课表入口")
+
+    cards_raw = raw.get("cards", [])
+    if not isinstance(cards_raw, list) or len(cards_raw) > APP_CONFIG_MAX_CARDS:
+        raise ApiError(422, "INVALID_APP_CONFIG", "cards 数量超出限制")
+    cards: list[dict[str, Any]] = []
+    card_ids: set[str] = set()
+    for index, item in enumerate(cards_raw):
+        if not isinstance(item, dict):
+            raise ApiError(422, "INVALID_APP_CONFIG", f"cards[{index}] 必须是对象")
+        item_id = _config_text(item.get("id"), f"cards[{index}].id", 64, required=True)
+        if item_id in card_ids:
+            raise ApiError(422, "INVALID_APP_CONFIG", f"cards[{index}].id 重复")
+        card_ids.add(item_id)
+        card_type = _config_text(item.get("cardType", "notice"), f"cards[{index}].cardType", 32, required=True)
+        if card_type not in {"notice", "link", "announcement", "remote_page"}:
+            raise ApiError(422, "INVALID_APP_CONFIG", f"cards[{index}].cardType 未注册")
+        cards.append(
+            {
+                "id": item_id,
+                "cardType": card_type,
+                "title": _config_text(item.get("title", ""), f"cards[{index}].title", 40),
+                "description": _config_text(item.get("description", ""), f"cards[{index}].description", 500),
+                "order": _config_int(item.get("order", index), f"cards[{index}].order"),
+                "visible": _config_bool(item.get("visible"), f"cards[{index}].visible"),
+                "actionId": _config_text(item.get("actionId", ""), f"cards[{index}].actionId", 64),
+                "url": validate_official_config_url(item.get("url"), f"cards[{index}].url"),
+            }
+        )
+
+    def normalize_link_list(raw_items: Any, field: str, maximum: int) -> list[dict[str, Any]]:
+        if not isinstance(raw_items, list) or len(raw_items) > maximum:
+            raise ApiError(422, "INVALID_APP_CONFIG", f"{field} 数量超出限制")
+        result: list[dict[str, Any]] = []
+        item_ids: set[str] = set()
+        for index, item in enumerate(raw_items):
+            if not isinstance(item, dict):
+                raise ApiError(422, "INVALID_APP_CONFIG", f"{field}[{index}] 必须是对象")
+            item_id = _config_text(item.get("id"), f"{field}[{index}].id", 64, required=True)
+            if item_id in item_ids:
+                raise ApiError(422, "INVALID_APP_CONFIG", f"{field}[{index}].id 重复")
+            item_ids.add(item_id)
+            result.append(
+                {
+                    "id": item_id,
+                    "title": _config_text(item.get("title"), f"{field}[{index}].title", 40, required=True),
+                    "description": _config_text(item.get("description", ""), f"{field}[{index}].description", 500),
+                    "url": validate_official_config_url(item.get("url"), f"{field}[{index}].url"),
+                    "visible": _config_bool(item.get("visible"), f"{field}[{index}].visible"),
+                    "order": _config_int(item.get("order", index), f"{field}[{index}].order"),
+                }
+            )
+        return result
+
+    normalized = {
+        "navigation": navigation,
+        "cards": cards,
+        "remotePages": normalize_link_list(raw.get("remotePages", []), "remotePages", APP_CONFIG_MAX_REMOTE_PAGES),
+        "resources": normalize_link_list(raw.get("resources", []), "resources", APP_CONFIG_MAX_RESOURCES),
+    }
+    if len(canonical_app_config_json(normalized).encode("utf-8")) > APP_CONFIG_MAX_BYTES:
+        raise ApiError(422, "APP_CONFIG_TOO_LARGE", "配置解压后不能超过 256 KiB")
+    return normalized
+
+
+def serialize_app_config_revision(row: sqlite3.Row | None) -> dict[str, Any] | None:
+    if row is None:
+        return None
+    config = json.loads(row["config_json"])
+    return {
+        "revision": int(row["revision"]),
+        "platform": row["platform"],
+        "schemaVersion": int(row["schema_version"]),
+        "configVersion": int(row["config_version"]),
+        "minAppVersionCode": int(row["min_app_version_code"]),
+        "maxAppVersionCode": row["max_app_version_code"],
+        "configHash": row["config_hash"],
+        "config": config,
+        "status": row["status"],
+        "createdBy": row["created_by"],
+        "createdAt": row["created_at"],
+        "updatedBy": row["updated_by"],
+        "updatedAt": row["updated_at"],
+    }
+
+
+def ensure_default_app_config(db: sqlite3.Connection) -> None:
+    """Seed Config V1 exactly once in a local/empty database."""
+
+    state = db.execute(
+        "SELECT platform FROM app_config_state WHERE platform='android'"
+    ).fetchone()
+    if state:
+        return
+    active = db.execute(
+        "SELECT * FROM app_config_revisions WHERE platform='android' AND status='ACTIVE' "
+        "ORDER BY config_version DESC LIMIT 1"
+    ).fetchone()
+    timestamp = now_ms()
+    if active:
+        db.execute(
+            "INSERT INTO app_config_state(platform,active_revision,config_version,updated_at) VALUES('android',?,?,?)",
+            (active["revision"], active["config_version"], timestamp),
+        )
+        return
+    config = validate_app_config(default_app_config())
+    config_hash = app_config_hash(config)
+    cursor = db.execute(
+        """INSERT INTO app_config_revisions(
+               platform,schema_version,config_version,min_app_version_code,
+               max_app_version_code,config_hash,config_json,status,created_at,updated_at
+           ) VALUES('android',?,?,?,?,?,?,'ACTIVE',?,?)""",
+        (
+            APP_CONFIG_SCHEMA_VERSION,
+            1,
+            0,
+            None,
+            config_hash,
+            canonical_app_config_json(config),
+            timestamp,
+            timestamp,
+        ),
+    )
+    db.execute(
+        "INSERT INTO app_config_state(platform,active_revision,config_version,updated_at) VALUES('android',?,?,?)",
+        (cursor.lastrowid, 1, timestamp),
+    )
+
+
+def active_app_config(db: sqlite3.Connection) -> sqlite3.Row | None:
+    state = db.execute(
+        "SELECT active_revision FROM app_config_state WHERE platform='android'"
+    ).fetchone()
+    if not state or state["active_revision"] is None:
+        return None
+    return db.execute(
+        "SELECT * FROM app_config_revisions WHERE revision=? AND platform='android'",
+        (state["active_revision"],),
+    ).fetchone()
+
+
+def admin_app_config_state(db: sqlite3.Connection) -> dict[str, Any]:
+    active = active_app_config(db)
+    state = db.execute(
+        "SELECT * FROM app_config_state WHERE platform='android'"
+    ).fetchone()
+    revisions = [
+        serialize_app_config_revision(row)
+        for row in db.execute(
+            "SELECT * FROM app_config_revisions WHERE platform='android' "
+            "ORDER BY config_version DESC LIMIT 50"
+        )
+    ]
+    return {
+        "activeRevision": int(state["active_revision"]) if state and state["active_revision"] else None,
+        "configVersion": int(state["config_version"]) if state else 0,
+        "active": serialize_app_config_revision(active),
+        "revisions": revisions,
+    }
+
+
 def initialize_database() -> None:
     UPLOADS.mkdir(parents=True, exist_ok=True)
     _safe_chmod(UPLOADS, 0o750)
@@ -796,6 +1199,7 @@ def initialize_database() -> None:
         if str(journal_mode).lower() != "wal":
             raise RuntimeError("SQLite WAL mode could not be enabled")
         db.executescript((ROOT / "schema.sql").read_text(encoding="utf-8"))
+        ensure_default_app_config(db)
         ensure_column(db, "venues", "operating_status", "TEXT NOT NULL DEFAULT 'OPEN'")
         ensure_column(db, "venues", "maintenance_note", "TEXT NOT NULL DEFAULT ''")
         ensure_column(db, "venues", "expected_restore_at", "INTEGER")
@@ -2978,7 +3382,7 @@ class ApiHandler(BaseHTTPRequestHandler):
         if match and method == "POST":
             return self.library_complaint(match.group(1)), 201
         if method == "GET" and path == "/api/v1/public/bootstrap":
-            return self.public_bootstrap(), 200
+            return self.public_bootstrap(query), 200
         if method == "GET" and path == "/api/v1/public/website-announcements":
             return self.public_website_announcements(), 200
         if method == "GET" and path == "/api/v1/public/version/android":
@@ -4165,7 +4569,12 @@ class ApiHandler(BaseHTTPRequestHandler):
             write_user_event(db, user["id"], "RESOURCE_LIBRARY", "RESOURCE_COMPLAINT_SUBMITTED", "SUCCESS", "RESOURCE", resource_id, risk_flag="CONTENT_REPORT")
             return {"id": complaint_id, "status": "OPEN"}
 
-    def public_bootstrap(self) -> dict[str, Any]:
+    def public_bootstrap(self, query: dict[str, str] | None = None) -> dict[str, Any]:
+        query = query or {}
+        wants_dynamic_config = (
+            str(query.get("schemaVersion", "")) == str(APP_CONFIG_SCHEMA_VERSION)
+            and str(query.get("appVersionCode", "")).isdigit()
+        )
         with connection() as db:
             flags = []
             for row in db.execute("SELECT key FROM remote_flags ORDER BY key"):
@@ -4216,7 +4625,7 @@ class ApiHandler(BaseHTTPRequestHandler):
                 if version_row
                 else None
             )
-            return {
+            payload = {
                 "flags": flags,
                 "announcements": announcements,
                 "version": version,
@@ -4225,6 +4634,29 @@ class ApiHandler(BaseHTTPRequestHandler):
                 ),
                 "updatePolicy": policy,
             }
+            if wants_dynamic_config:
+                config_row = active_app_config(db)
+                if config_row:
+                    app_version = int(query["appVersionCode"])
+                    min_code = int(config_row["min_app_version_code"])
+                    max_code = config_row["max_app_version_code"]
+                    compatible = app_version >= min_code and (
+                        max_code is None or app_version <= int(max_code)
+                    )
+                    if compatible:
+                        payload.update(
+                            {
+                                "schemaVersion": int(config_row["schema_version"]),
+                                "configVersion": int(config_row["config_version"]),
+                                "minAppVersionCode": min_code,
+                                "maxAppVersionCode": max_code,
+                                "issuedAt": int(config_row["updated_at"]),
+                                "expiresAt": None,
+                                "configHash": config_row["config_hash"],
+                                "config": json.loads(config_row["config_json"]),
+                            }
+                        )
+            return payload
 
     def public_website_announcements(self) -> dict[str, Any]:
         """Return enabled website announcements, never App announcements."""
@@ -6656,8 +7088,208 @@ class ApiHandler(BaseHTTPRequestHandler):
                         serialize_release_metadata(version_row) if version_row else None
                     ),
                     "updatePolicy": policy,
+                    "appConfig": admin_app_config_state(db),
                     "availableVersions": available_versions,
                 }, 200
+
+            if method == "POST" and path == "/api/v1/admin/app-config/validate":
+                require_admin_permission(admin, "*")
+                data = self.body_json()
+                config = validate_app_config(data.get("config", data))
+                canonical = canonical_app_config_json(config)
+                return {
+                    "schemaVersion": APP_CONFIG_SCHEMA_VERSION,
+                    "configHash": app_config_hash(config),
+                    "configBytes": len(canonical.encode("utf-8")),
+                    "config": config,
+                }, 200
+
+            if method == "POST" and path == "/api/v1/admin/app-config/revisions":
+                require_admin_permission(admin, "*")
+                data = self.body_json()
+                config = validate_app_config(data.get("config", {}))
+                try:
+                    min_code = int(data.get("minAppVersionCode", 0))
+                    max_raw = data.get("maxAppVersionCode")
+                    max_code = None if max_raw in (None, "") else int(max_raw)
+                except (TypeError, ValueError) as exc:
+                    raise ApiError(422, "INVALID_APP_CONFIG", "配置兼容版本范围无效") from exc
+                if min_code < 0 or (max_code is not None and max_code < min_code):
+                    raise ApiError(422, "INVALID_APP_CONFIG", "配置兼容版本范围无效")
+                config_json = canonical_app_config_json(config)
+                config_hash = app_config_hash(config)
+                db.execute("BEGIN IMMEDIATE")
+                current = db.execute(
+                    "SELECT COALESCE(MAX(config_version),0) AS config_version "
+                    "FROM app_config_revisions WHERE platform='android'"
+                ).fetchone()
+                config_version = int(current["config_version"]) + 1
+                timestamp = now_ms()
+                try:
+                    cursor = db.execute(
+                        """INSERT INTO app_config_revisions(
+                               platform,schema_version,config_version,min_app_version_code,
+                               max_app_version_code,config_hash,config_json,status,
+                               created_by,created_at,updated_by,updated_at
+                           ) VALUES('android',?,?,?,?,?,?, 'DRAFT',?,?,?,?)""",
+                        (
+                            APP_CONFIG_SCHEMA_VERSION,
+                            config_version,
+                            min_code,
+                            max_code,
+                            config_hash,
+                            config_json,
+                            admin["id"],
+                            timestamp,
+                            admin["id"],
+                            timestamp,
+                        ),
+                    )
+                except sqlite3.IntegrityError as exc:
+                    raise ApiError(409, "APP_CONFIG_REVISION_CONFLICT", "配置版本生成冲突，请重试") from exc
+                revision = db.execute(
+                    "SELECT * FROM app_config_revisions WHERE revision=?",
+                    (cursor.lastrowid,),
+                ).fetchone()
+                write_audit(
+                    db,
+                    admin["id"],
+                    "APP_CONFIG_DRAFT_CREATED",
+                    "APP_CONFIG",
+                    str(cursor.lastrowid),
+                    {
+                        "configVersion": config_version,
+                        "configHash": config_hash,
+                        "reasonLength": len(str(data.get("reason", ""))[:300]),
+                    },
+                )
+                db.execute("COMMIT")
+                return serialize_app_config_revision(revision), 201
+
+            if method == "POST" and path == "/api/v1/admin/app-config/activate":
+                require_admin_permission(admin, "*")
+                data = self.body_json()
+                try:
+                    revision_id = int(data.get("revision", 0))
+                    expected_active = int(data.get("expectedActiveRevision", 0))
+                except (TypeError, ValueError) as exc:
+                    raise ApiError(422, "INVALID_APP_CONFIG", "配置 Revision 无效") from exc
+                db.execute("BEGIN IMMEDIATE")
+                state = db.execute(
+                    "SELECT * FROM app_config_state WHERE platform='android'"
+                ).fetchone()
+                actual_active = int(state["active_revision"]) if state and state["active_revision"] else 0
+                if expected_active != actual_active:
+                    raise ApiError(409, "APP_CONFIG_REVISION_CONFLICT", "配置已被其他管理员修改，请刷新后重试")
+                revision = db.execute(
+                    "SELECT * FROM app_config_revisions WHERE revision=? AND platform='android'",
+                    (revision_id,),
+                ).fetchone()
+                if not revision:
+                    raise ApiError(404, "APP_CONFIG_REVISION_NOT_FOUND", "配置 Revision 不存在")
+                if revision["status"] != "DRAFT":
+                    raise ApiError(409, "APP_CONFIG_NOT_DRAFT", "只有草稿配置可以激活")
+                if int(revision["config_version"]) <= int(state["config_version"]):
+                    raise ApiError(409, "APP_CONFIG_VERSION_NOT_MONOTONIC", "配置版本必须单调增加")
+                timestamp = now_ms()
+                db.execute(
+                    "UPDATE app_config_revisions SET status='ARCHIVED',updated_by=?,updated_at=? "
+                    "WHERE platform='android' AND status='ACTIVE'",
+                    (admin["id"], timestamp),
+                )
+                db.execute(
+                    "UPDATE app_config_revisions SET status='ACTIVE',updated_by=?,updated_at=? WHERE revision=?",
+                    (admin["id"], timestamp, revision_id),
+                )
+                db.execute(
+                    """UPDATE app_config_state
+                       SET active_revision=?,config_version=?,updated_by=?,updated_at=?
+                       WHERE platform='android'""",
+                    (revision_id, revision["config_version"], admin["id"], timestamp),
+                )
+                write_audit(
+                    db,
+                    admin["id"],
+                    "APP_CONFIG_ACTIVATED",
+                    "APP_CONFIG",
+                    str(revision_id),
+                    {
+                        "configVersion": revision["config_version"],
+                        "configHash": revision["config_hash"],
+                    },
+                )
+                db.execute("COMMIT")
+                return admin_app_config_state(db), 200
+
+            if method == "POST" and path == "/api/v1/admin/app-config/rollback":
+                require_admin_permission(admin, "*")
+                data = self.body_json()
+                try:
+                    target_revision = int(data.get("targetRevision", 0))
+                    expected_active = int(data.get("expectedActiveRevision", 0))
+                except (TypeError, ValueError) as exc:
+                    raise ApiError(422, "INVALID_APP_CONFIG", "回滚 Revision 无效") from exc
+                db.execute("BEGIN IMMEDIATE")
+                state = db.execute(
+                    "SELECT * FROM app_config_state WHERE platform='android'"
+                ).fetchone()
+                actual_active = int(state["active_revision"]) if state and state["active_revision"] else 0
+                if expected_active != actual_active:
+                    raise ApiError(409, "APP_CONFIG_REVISION_CONFLICT", "配置已被其他管理员修改，请刷新后重试")
+                target = db.execute(
+                    "SELECT * FROM app_config_revisions WHERE revision=? AND platform='android'",
+                    (target_revision,),
+                ).fetchone()
+                if not target:
+                    raise ApiError(404, "APP_CONFIG_REVISION_NOT_FOUND", "回滚目标不存在")
+                next_version = db.execute(
+                    "SELECT COALESCE(MAX(config_version),0) AS config_version "
+                    "FROM app_config_revisions WHERE platform='android'"
+                ).fetchone()["config_version"] + 1
+                timestamp = now_ms()
+                cursor = db.execute(
+                    """INSERT INTO app_config_revisions(
+                           platform,schema_version,config_version,min_app_version_code,
+                           max_app_version_code,config_hash,config_json,status,
+                           created_by,created_at,updated_by,updated_at
+                       ) VALUES('android',?,?,?,?,?,?, 'ACTIVE',?,?,?,?)""",
+                    (
+                        target["schema_version"],
+                        next_version,
+                        target["min_app_version_code"],
+                        target["max_app_version_code"],
+                        target["config_hash"],
+                        target["config_json"],
+                        admin["id"],
+                        timestamp,
+                        admin["id"],
+                        timestamp,
+                    ),
+                )
+                db.execute(
+                    "UPDATE app_config_revisions SET status='ARCHIVED',updated_by=?,updated_at=? "
+                    "WHERE platform='android' AND status='ACTIVE'",
+                    (admin["id"], timestamp),
+                )
+                db.execute(
+                    "UPDATE app_config_state SET active_revision=?,config_version=?,updated_by=?,updated_at=? "
+                    "WHERE platform='android'",
+                    (cursor.lastrowid, next_version, admin["id"], timestamp),
+                )
+                write_audit(
+                    db,
+                    admin["id"],
+                    "APP_CONFIG_ROLLED_BACK",
+                    "APP_CONFIG",
+                    str(cursor.lastrowid),
+                    {
+                        "targetRevision": target_revision,
+                        "configVersion": next_version,
+                        "configHash": target["config_hash"],
+                    },
+                )
+                db.execute("COMMIT")
+                return admin_app_config_state(db), 200
 
             match = re.fullmatch(r"/api/v1/admin/flags/([^/]+)", path)
             if method == "PUT" and match:

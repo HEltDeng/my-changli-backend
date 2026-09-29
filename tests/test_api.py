@@ -2707,5 +2707,162 @@ class EmptyDailyLoginContractTest(unittest.TestCase):
         self.assertEqual([], details["data"]["items"])
 
 
+class AppConfigContractTest(unittest.TestCase):
+    """Exercise the local Config V1 -> V2 -> rollback control plane."""
+
+    @classmethod
+    def setUpClass(cls):
+        cls.temp = tempfile.TemporaryDirectory()
+        cls.database = Path(cls.temp.name) / "app-config.db"
+        core.configure_test_runtime(cls.database)
+        server.DB_PATH = cls.database
+        server.UPLOADS = Path(cls.temp.name) / "uploads"
+        server.initialize_database()
+        cls.admin_id = "config-admin"
+        digest, salt = server.password_record(secrets.token_urlsafe(24))
+        with server.connection() as db:
+            db.execute(
+                """INSERT INTO users(
+                       id,username,password_hash,password_salt,role,account_type,nickname,
+                       admin_permissions_json,admin_role,admin_enabled,account_status,created_at
+                   ) VALUES(?,?,?,?, 'ADMIN','ADMIN','配置管理员','[\"*\"]','SUPER_ADMIN',1,'ACTIVE',?)""",
+                (cls.admin_id, "config-admin", digest, salt, server.now_ms()),
+            )
+            cls.admin_token = server.issue_token(db, cls.admin_id)
+        cls.httpd = server.ThreadingHTTPServer(("127.0.0.1", 0), server.ApiHandler)
+        cls.base = f"http://127.0.0.1:{cls.httpd.server_port}"
+        cls.thread = threading.Thread(target=cls.httpd.serve_forever, daemon=True)
+        cls.thread.start()
+
+    @classmethod
+    def tearDownClass(cls):
+        cls.httpd.shutdown()
+        cls.httpd.server_close()
+        cls.thread.join(timeout=3)
+        with server.connection() as db:
+            db.execute("PRAGMA wal_checkpoint(TRUNCATE)")
+        cls.temp.cleanup()
+
+    def call(self, method, path, data=None, token=None):
+        body = json.dumps(data).encode() if data is not None else None
+        headers = {"Content-Type": "application/json"}
+        if token:
+            headers["Authorization"] = f"Bearer {token}"
+        parts = urllib.parse.urlsplit(path)
+        target = urllib.parse.quote(parts.path)
+        if parts.query:
+            target += "?" + urllib.parse.quote(parts.query, safe="=&")
+        request = urllib.request.Request(
+            self.base + target,
+            data=body,
+            headers=headers,
+            method=method,
+        )
+        try:
+            with urllib.request.urlopen(request, timeout=5) as response:
+                return response.status, json.loads(response.read())
+        except urllib.error.HTTPError as error:
+            return error.code, json.loads(error.read())
+
+    def public_config(self):
+        status, payload = self.call(
+            "GET",
+            "/api/v1/public/bootstrap?schemaVersion=1&appVersionCode=37",
+        )
+        self.assertEqual(200, status)
+        return payload["data"]
+
+    def test_config_v1_v2_rollback_is_monotonic_and_legacy_safe(self):
+        legacy = self.call("GET", "/api/v1/public/bootstrap")
+        self.assertEqual(200, legacy[0])
+        self.assertNotIn("config", legacy[1]["data"])
+
+        first = self.public_config()
+        self.assertEqual(1, first["schemaVersion"])
+        self.assertEqual(1, first["configVersion"])
+        v1_title = first["config"]["navigation"][0]["title"]
+        v2 = json.loads(json.dumps(first["config"], ensure_ascii=False))
+        v2["navigation"][0]["title"] = "课表（动态 V2）"
+        v2["navigation"][0]["order"] = 999
+        v2["navigation"][-1]["visible"] = False
+        v2["navigation"][8]["url"] = "https://mychangliapp.cn/guides.html"
+
+        status, validation = self.call(
+            "POST",
+            "/api/v1/admin/app-config/validate",
+            {"config": v2},
+            self.admin_token,
+        )
+        self.assertEqual(200, status)
+        self.assertNotEqual(first["configHash"], validation["data"]["configHash"])
+
+        status, draft = self.call(
+            "POST",
+            "/api/v1/admin/app-config/revisions",
+            {"config": v2, "reason": "P0 local V2"},
+            self.admin_token,
+        )
+        self.assertEqual(201, status)
+        self.assertEqual(2, draft["data"]["configVersion"])
+
+        status, activated = self.call(
+            "POST",
+            "/api/v1/admin/app-config/activate",
+            {
+                "revision": draft["data"]["revision"],
+                "expectedActiveRevision": first["configVersion"],
+            },
+            self.admin_token,
+        )
+        self.assertEqual(200, status)
+        self.assertEqual(2, activated["data"]["configVersion"])
+
+        second = self.public_config()
+        self.assertEqual(2, second["configVersion"])
+        self.assertEqual("课表（动态 V2）", second["config"]["navigation"][0]["title"])
+        self.assertFalse(second["config"]["navigation"][-1]["visible"])
+        self.assertEqual("https://mychangliapp.cn/guides.html", second["config"]["navigation"][8]["url"])
+
+        status, rolled_back = self.call(
+            "POST",
+            "/api/v1/admin/app-config/rollback",
+            {
+                "targetRevision": first["configVersion"],
+                "expectedActiveRevision": activated["data"]["activeRevision"],
+            },
+            self.admin_token,
+        )
+        self.assertEqual(200, status)
+        self.assertEqual(3, rolled_back["data"]["configVersion"])
+        self.assertEqual(first["configHash"], rolled_back["data"]["active"]["configHash"])
+
+        restored = self.public_config()
+        self.assertEqual(3, restored["configVersion"])
+        self.assertEqual(v1_title, restored["config"]["navigation"][0]["title"])
+        self.assertEqual(first["configHash"], restored["configHash"])
+
+    def test_invalid_or_stale_config_cannot_be_published(self):
+        current = self.public_config()
+        bad = json.loads(json.dumps(current["config"], ensure_ascii=False))
+        bad["navigation"][0]["actionId"] = "execute_arbitrary_intent"
+        status, response = self.call(
+            "POST",
+            "/api/v1/admin/app-config/revisions",
+            {"config": bad},
+            self.admin_token,
+        )
+        self.assertEqual(422, status)
+        self.assertEqual("INVALID_APP_CONFIG", response["error"]["code"])
+        self.assertEqual(current["configVersion"], self.public_config()["configVersion"])
+
+        status, response = self.call(
+            "POST",
+            "/api/v1/admin/app-config/activate",
+            {"revision": 999999, "expectedActiveRevision": 1},
+            self.admin_token,
+        )
+        self.assertIn(status, (404, 409))
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)
