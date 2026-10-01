@@ -1,3 +1,6 @@
+> 当前入口（2026-10-01 第二阶段整理）：Android `D:\Codex\01_App-应用开发\001_MyChangLi-我的长理\01_Source-当前源码\01_Android`；Backend/Admin `D:\Codex\01_App-应用开发\001_MyChangLi-我的长理\01_Source-当前源码\02_Backend-Admin`；Website `D:\Codex\01_App-应用开发\001_MyChangLi-我的长理\01_Source-当前源码\03_Website`。
+> 以项目根目录 SOURCE_OF_TRUTH.md 与 04_Tools/source-identity.json 为现行导航。下文旧路径、候选状态、V1.0.4/2.0.9 环境验证属于历史记录，不得作为新的开发起点。
+
 # 我的长理后端
 
 这是体育预约、独立失物招领、资料库及管理后台后端。`server.py` 继续服务本机/USB 开发；Production 使用 Nginx、Waitress、显式安全配置和独立持久目录。

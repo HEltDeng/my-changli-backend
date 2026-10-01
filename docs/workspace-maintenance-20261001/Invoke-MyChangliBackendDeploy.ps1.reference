@@ -1,0 +1,144 @@
+﻿#requires -Version 5.1
+
+[CmdletBinding()]
+param(
+    [ValidateSet("Inspect", "DryRun", "Deploy", "Rollback")]
+    [string]$Action = "Inspect",
+    [string]$BackendRoot = "D:\Codex\01_App-应用开发\001_MyChangLi-我的长理\01_Source-当前源码\02_Backend-Admin",
+    [string]$TargetSha = "",
+    [string]$BackupDir = "",
+    [string]$ApiBaseUrl = "https://api.mychangliapp.cn",
+    [string]$RuntimeRoot = "",
+    [switch]$SkipLocalTests,
+    [switch]$AllowNonMainBranch
+)
+
+$ErrorActionPreference = "Stop"
+Set-StrictMode -Version Latest
+
+if ([string]::IsNullOrWhiteSpace($RuntimeRoot)) {
+    $RuntimeRoot = Join-Path -Path $PSScriptRoot -ChildPath "runtime\backend-password-runtime"
+}
+$resolvedBackend = (Resolve-Path -LiteralPath $BackendRoot).Path
+if (-not (Test-Path -LiteralPath (Join-Path $resolvedBackend ".git") -PathType Container)) {
+    throw "Backend Git repository is missing: $resolvedBackend"
+}
+
+function Convert-SecureValueToPlainText {
+    param([Parameter(Mandatory = $true)][object]$Value)
+
+    if ($Value -is [System.Management.Automation.PSCredential]) {
+        return $Value.GetNetworkCredential().Password
+    }
+    if ($Value -is [System.Security.SecureString]) {
+        $pointer = [System.IntPtr]::Zero
+        try {
+            $pointer = [System.Runtime.InteropServices.Marshal]::SecureStringToBSTR($Value)
+            return [System.Runtime.InteropServices.Marshal]::PtrToStringBSTR($pointer)
+        } finally {
+            if ($pointer -ne [System.IntPtr]::Zero) {
+                [System.Runtime.InteropServices.Marshal]::ZeroFreeBSTR($pointer)
+            }
+        }
+    }
+    throw "Backend credential record is invalid."
+}
+
+$recordPath = Join-Path $env:LOCALAPPDATA "MyChangli\Secrets\backend-key-sudo.clixml"
+if (-not (Test-Path -LiteralPath $recordPath -PathType Leaf)) {
+    throw "Backend key/sudo record is missing. Run Register-MyChangliBackendKeySudo.ps1 first."
+}
+$record = Import-Clixml -LiteralPath $recordPath
+foreach ($propertyName in @("HostName", "Port", "UserName", "IdentityFile", "ServiceName", "KeyPassphrase", "SudoPassword")) {
+    if (-not $record.PSObject.Properties[$propertyName]) {
+        throw "Backend key/sudo record is missing '$propertyName'."
+    }
+}
+if (-not (Test-Path -LiteralPath ([string]$record.IdentityFile) -PathType Leaf)) {
+    throw "SSH private key file was not found: $($record.IdentityFile)"
+}
+
+$python = Join-Path $RuntimeRoot "venv\Scripts\python.exe"
+$pythonScript = Join-Path $PSScriptRoot "backend_deploy.py"
+if (-not (Test-Path -LiteralPath $python -PathType Leaf)) {
+    throw "Backend password runtime is missing. Run Install-MyChangliBackendPasswordRuntime.ps1 first."
+}
+if (-not (Test-Path -LiteralPath $pythonScript -PathType Leaf)) {
+    throw "Backend deployment helper is missing: $pythonScript"
+}
+
+$localPython = Join-Path $resolvedBackend ".venv\Scripts\python.exe"
+if (($Action -eq "Deploy") -and -not (Test-Path -LiteralPath $localPython -PathType Leaf)) {
+    throw "Project backend venv is missing: $localPython"
+}
+
+Write-Host ("Backend deployment target: {0}:{1} as {2}" -f $record.HostName, $record.Port, $record.UserName) -ForegroundColor DarkGray
+Write-Host ("Action: {0}" -f $Action) -ForegroundColor DarkGray
+Write-Host ("Backend root: {0}" -f $resolvedBackend) -ForegroundColor DarkGray
+
+$envNames = @(
+    "MY_CHANGLI_BACKEND_HOST",
+    "MY_CHANGLI_BACKEND_PORT",
+    "MY_CHANGLI_BACKEND_USER",
+    "MY_CHANGLI_BACKEND_IDENTITY_FILE",
+    "MY_CHANGLI_BACKEND_KEY_PASSPHRASE",
+    "MY_CHANGLI_BACKEND_SUDO_PASSWORD"
+)
+$previous = @{}
+foreach ($name in $envNames) {
+    $previous[$name] = [Environment]::GetEnvironmentVariable($name, "Process")
+}
+$exitCode = 0
+try {
+    $env:MY_CHANGLI_BACKEND_HOST = [string]$record.HostName
+    $env:MY_CHANGLI_BACKEND_PORT = [string]$record.Port
+    $env:MY_CHANGLI_BACKEND_USER = [string]$record.UserName
+    $env:MY_CHANGLI_BACKEND_IDENTITY_FILE = [string]$record.IdentityFile
+    $env:MY_CHANGLI_BACKEND_KEY_PASSPHRASE = Convert-SecureValueToPlainText -Value $record.KeyPassphrase
+    $env:MY_CHANGLI_BACKEND_SUDO_PASSWORD = Convert-SecureValueToPlainText -Value $record.SudoPassword
+
+    $pythonAction = switch ($Action) {
+        "Inspect" { "inspect"; break }
+        "DryRun" { "dry-run"; break }
+        "Deploy" { "deploy"; break }
+        "Rollback" { "rollback"; break }
+        default { throw "Unsupported deployment action: $Action" }
+    }
+    $arguments = @(
+        $pythonScript,
+        "--action", $pythonAction,
+        "--repo", $resolvedBackend,
+        "--service-name", [string]$record.ServiceName,
+        "--api-base-url", $ApiBaseUrl
+    )
+    if (-not [string]::IsNullOrWhiteSpace($TargetSha)) {
+        $arguments += @("--target-sha", $TargetSha)
+    }
+    if (-not [string]::IsNullOrWhiteSpace($BackupDir)) {
+        $arguments += @("--backup-dir", $BackupDir)
+    }
+    if (Test-Path -LiteralPath $localPython -PathType Leaf) {
+        $arguments += @("--local-python", $localPython)
+    }
+    if ($SkipLocalTests) {
+        $arguments += "--skip-local-tests"
+    }
+    if ($AllowNonMainBranch) {
+        $arguments += "--allow-non-main-branch"
+    }
+
+    & $python @arguments
+    $exitCode = $LASTEXITCODE
+} finally {
+    foreach ($name in $envNames) {
+        if ($null -eq $previous[$name]) {
+            Remove-Item "Env:$name" -ErrorAction SilentlyContinue
+        } else {
+            [Environment]::SetEnvironmentVariable($name, $previous[$name], "Process")
+        }
+    }
+}
+
+if ($exitCode -ne 0) {
+    exit $exitCode
+}
