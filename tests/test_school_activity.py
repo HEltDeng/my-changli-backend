@@ -17,6 +17,30 @@ class SchoolActivityTest(existing.IdentityStatisticsTest):
     def bind(self,data,token=None):
         return self.call('POST','/api/v1/school-binding',data,token)
 
+    def test_candidate_collection_accepts_test_package_only(self):
+        auth,event,token=self.installation()
+        with patch.dict('os.environ', {'MY_CHANGLI_CANDIDATE_ONLY':'1'}):
+            self.assertEqual(422,self.report(event,token)[0])
+            self.assertEqual(200,self.report({**event,'packageName':'com.mychangli.app.candidate'},token)[0])
+
+    def test_anonymous_school_links_installation_then_verified_account(self):
+        auth,event,guest=self.installation(secrets.token_hex(32));self.report(event,guest)
+        student='00'+secrets.token_hex(5)
+        data=self.school(auth,student)
+        self.assertEqual(200,self.bind(data)[0])
+        row=self.rows('devices',q=student)['items'][0]
+        self.assertEqual(student,row['bound_student_id'])
+        self.assertEqual([],row['associated_accounts'])
+        self.assertIsNone(row['school_bindings'][0]['user_id'])
+        with server.connection() as db:
+            before=db.execute('SELECT count(*) FROM installations').fetchone()[0]
+        _,account=self.account(auth)
+        self.assertEqual(200,self.bind(self.school(auth,student),account['token'])[0])
+        self.assertEqual(student,self.rows('accounts',uuid=account['user']['id'])['items'][0]['bound_student_id'])
+        with server.connection() as db:
+            self.assertEqual(before,db.execute('SELECT count(*) FROM installations').fetchone()[0])
+        self.assertEqual(403,self.bind(self.school(auth,student))[0])
+
     def test_school_proof_consent_leading_zero_and_credential_rejection(self):
         auth,event,guest=self.installation(secrets.token_hex(32));self.report(event,guest)
         _,a=self.account(auth);data=self.school(auth)
@@ -31,6 +55,20 @@ class SchoolActivityTest(existing.IdentityStatisticsTest):
         self.assertEqual(1,self.rows('devices',q='001234567')['total'])
         self.assertEqual(1,self.rows('students',q='001234567')['total'])
         self.assertNotIn('password',str(row).lower())
+
+    def test_account_display_prefers_recent_binding_and_retains_other_installations(self):
+        auth,e,t=self.installation(secrets.token_hex(32));self.report(e,t)
+        credentials,a=self.account(auth)
+        self.assertEqual(200,self.bind(self.school(auth,'001OLD'),a['token'])[0])
+        with server.connection() as db:
+            db.execute('UPDATE school_bindings SET received_at=received_at-1000 WHERE installation_id=?',(auth['installationId'],))
+        other,e2,t2=self.installation(secrets.token_hex(32));self.report(e2,t2)
+        status,login=self.call('POST','/api/v1/auth/login',{**other,'phone':credentials['phone'],'password':credentials['password']})
+        self.assertEqual(200,status)
+        self.assertEqual(200,self.bind(self.school(other,'002NEW'),login['data']['token'])[0])
+        row=self.rows('accounts',uuid=a['user']['id'])['items'][0]
+        self.assertEqual('002NEW',row['bound_student_id'])
+        self.assertEqual({'001OLD','002NEW'},{b['student_id'] for b in row['school_bindings']})
 
     def test_unbind_retry_does_not_end_a_later_binding(self):
         auth,event,guest=self.installation(secrets.token_hex(32));self.report(event,guest)

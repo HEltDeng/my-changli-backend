@@ -1,0 +1,26 @@
+[Unit]
+Description=MyChangli isolated candidate acceptance service
+After=network.target
+[Service]
+Type=simple
+DynamicUser=yes
+StateDirectory=mychangli-candidate
+StateDirectoryMode=0700
+WorkingDirectory=/opt/mychangli-candidate/current
+EnvironmentFile=/etc/mychangli-candidate/runtime.env
+Environment=PYTHONDONTWRITEBYTECODE=1
+ExecStart=/opt/mychangli-candidate/venv/bin/python candidate_runtime.py
+Restart=on-failure
+RestartSec=5
+NoNewPrivileges=yes
+PrivateTmp=yes
+ProtectSystem=strict
+ProtectHome=yes
+InaccessiblePaths=-/var/lib/mychangli -/etc/mychangli -/opt/mychangli/backend -/var/www/mychangliapp
+ReadWritePaths=/var/lib/mychangli-candidate
+MemoryMax=256M
+CPUQuota=25%
+TasksMax=32
+UMask=0077
+[Install]
+WantedBy=multi-user.target

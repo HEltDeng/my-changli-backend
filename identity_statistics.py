@@ -3,6 +3,7 @@
 All dates are epoch milliseconds; calendar windows use the existing UTC+8 business
 timezone. Legacy events establish links only when they name an installation.
 """
+import os
 import hashlib
 import hmac
 import json
@@ -156,7 +157,7 @@ def receive(db,data,user,device_key_hash):
     eid=str(data.get("eventId") or "")
     if not re.fullmatch(r"[a-zA-Z0-9-]{16,80}",eid):
         raise ApiError(422,"INVALID_EVENT_ID","事件编号无效")
-    packages={"com.mychangli.app"} if RUNTIME.is_production else {"com.mychangli.app","com.mychangli.app.debug"}
+    packages=({"com.mychangli.app.candidate", "com.mychangli.app.debug"} if os.environ.get("MY_CHANGLI_CANDIDATE_ONLY") == "1" else ({"com.mychangli.app"} if RUNTIME.is_production else {"com.mychangli.app","com.mychangli.app.debug"}))
     if data.get("protocolVersion") not in {2,3} or data.get("packageName") not in packages:
         raise ApiError(422,"INVALID_PROTOCOL","上报协议无效")
     iid=data["installationId"]
@@ -389,6 +390,14 @@ def query_rows(db,q):
         row["associated_accounts"]=associations
         current_bindings=[b for a in associations for b in a["school_bindings"] if b["current"] or (scope=="accounts" and b["status"]=="ACTIVE")]
         row["school_bindings"]=[b for a in associations for b in a["school_bindings"]]
+        if scope != "accounts":
+            anonymous = [dict(b, current=b["status"]=="ACTIVE", conflict=len({(x["user_id"] or x["installation_id"]) for x in bindings if x["school_id"]==b["school_id"] and x["student_id"]==b["student_id"] and x["status"]=="ACTIVE"})>1) for b in bindings if b["user_id"] is None and b["installation_id"] in ids]
+            row["school_bindings"].extend(anonymous)
+            current_bindings.extend(b for b in anonymous if b["current"])
+
+        # Multiple current installations can carry different school identities. Show
+        # the most recently evidenced one without hiding the other associations.
+        current_bindings.sort(key=lambda b:(b["received_at"],b["id"]), reverse=True)
         row["bound_student_id"]=row.get("bound_student_id") or (current_bindings[0]["student_id"] if current_bindings else None)
         row["school_id"]=row.get("school_id") or (current_bindings[0]["school_id"] if current_bindings else None)
         row["platform_label"]=" / ".join(a["nickname"]+" · "+(a["user_code"] or "") for a in associations)

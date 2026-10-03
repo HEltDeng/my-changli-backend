@@ -1,3 +1,15 @@
+// Environment labels are presentation only; API authentication remains server-enforced.
+const isolatedCandidate = ["127.0.0.1", "localhost", "candidate.mychangliapp.cn"].includes(location.hostname);
+if (isolatedCandidate) {
+  document.title = "我的长理 · 隔离测试后台";
+  document.querySelector("#login-view h1").textContent = "隔离测试后台";
+  document.querySelector("#login-view .muted").textContent = "仅使用专用测试账号与合成资料，不连接生产数据库。";
+  document.querySelector(".brand-row span").textContent = "隔离测试后台";
+  document.querySelector(".topbar .eyebrow").textContent = "ISOLATED CANDIDATE";
+}
+
+document.querySelector(".local-pill").textContent = location.protocol === "https:" ? "HTTPS" : "本机 HTTP · 隔离测试";
+
 const state = {
   token: sessionStorage.getItem("myChangliAdminToken") || "",
   page: "overview",
@@ -458,8 +470,8 @@ const renderers = {
       <div class="grid metric-grid">${[["今日活跃但设备未识别","activeUnidentified"],["游客记录（安装）","guests"],["仅有安装标识","unidentified"],["历史匿名资料","legacy"],["今日首次激活","todayFirst"]].map(([label,key])=>`<button class="card metric metric-link" data-action="metric-nav" data-page="users" data-filter="${escapeHtml(JSON.stringify(stats.metrics[key].filters))}"><span>${label}</span><strong>${stats.metrics[key].count}</strong></button>`).join("")}</div></details>
       ${identityHelp}
       <article class="card section-title">
-        <h3>生产运行说明</h3>
-        <p class="muted">这里的修改会通过生产 API 写入生产数据库。App 刷新对应页面后即可看到最新状态。</p>
+        <h3>${isolatedCandidate ? "隔离测试说明" : "生产运行说明"}</h3>
+        <p class="muted">${isolatedCandidate ? "本页使用独立测试 API 与测试资料，不代表生产统计。" : "这里的修改会通过生产 API 写入生产数据库。App 刷新对应页面后即可看到最新状态。"}</p>
       </article>`;
   },
 
