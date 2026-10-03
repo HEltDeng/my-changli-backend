@@ -160,3 +160,19 @@ dialog::backdrop { background: rgba(13,21,35,.48); }
   .ghost { background: #2a3548; color: var(--ink); }
   .inventory-cell.blocked { background: #42272d; border-color: #6b343e; }
 }
+
+.identity-help { margin-top: 18px; color: #59657a; line-height: 1.7; }
+.identity-help summary, #identity-filter summary { cursor: pointer; font-weight: 600; }
+.identity-table table { min-width: 850px; }
+.identity-table td { padding: 16px 12px; line-height: 1.7; }
+.identity-table th:first-child { width: 20%; }
+.identity-table .actions { min-width: 100px; }
+.identity-tabs { margin-bottom: 20px; }
+#identity-filter .toolbar label { min-width: 110px; }
+#identity-filter .toolbar label:first-child { flex: 2; min-width: 210px; }
+#identity-filter .actions { margin-top: 14px; }
+.technical { overflow-wrap: anywhere; }
+@media(max-width: 1280px) { .content { padding: 22px; } .topbar { padding: 20px 22px; } }
+
+.identity-table th { white-space: nowrap; }
+.identity-table td { line-height: 1.5; }

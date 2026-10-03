@@ -270,7 +270,9 @@ class ApiTest(unittest.TestCase):
         self.assertEqual(before_register["guestUsers"] - 1, after_register["guestUsers"])
         self.assertEqual(before_register["totalDevices"], after_register["totalDevices"])
         self.assertEqual(before_register["totalInstallations"], after_register["totalInstallations"])
-        self.assertEqual(before_register["todayNewUsers"], after_register["todayNewUsers"])
+        # Legacy canonical cohort used to transfer device-wide timestamps. It is no longer
+        # the product metric; unproven legacy guest data is retained, not merged.
+        self.assertEqual(before_register["todayNewUsers"]+1, after_register["todayNewUsers"])
         self.assertEqual(before_register["todayNewRegistrations"] + 1, after_register["todayNewRegistrations"])
 
         # The same PHONE user signing in from a second device adds one device
@@ -352,7 +354,7 @@ class ApiTest(unittest.TestCase):
         self.assertEqual(8, len(set(codes)))
         self.assertTrue(all(code.startswith(user["userCode"][:12]) for code in codes))
 
-    def phone_account(self, installation_id=None):
+    def phone_account(self, installation_id=None, installation_secret=None):
         phone = "19" + "".join(str(secrets.randbelow(10)) for _ in range(9))
         password = secrets.token_urlsafe(18)
         payload = {
@@ -362,6 +364,7 @@ class ApiTest(unittest.TestCase):
         }
         if installation_id:
             payload["installationId"] = installation_id
+        if installation_secret: payload["installationSecret"]=installation_secret
         status, response = self.call("POST", "/api/v1/auth/register", payload)
         self.assertEqual(201, status)
         return phone, password, response["data"]["token"], response["data"]["user"]
@@ -404,7 +407,10 @@ class ApiTest(unittest.TestCase):
 
     def test_phone_account_gate_and_device_data_migration(self):
         installation_id = "migration-" + secrets.token_hex(8)
-        device = self.device_token(installation_id)
+        installation_secret=secrets.token_hex(32)
+        status,identity=self.call("POST","/api/v1/auth/device",{"installationId":installation_id,"installationSecret":installation_secret})
+        self.assertEqual(200,status)
+        device=identity["data"]["token"]
         payload = {
             "clientLocalId": "migrated-" + secrets.token_hex(8),
             "type": "LOST",
@@ -414,7 +420,7 @@ class ApiTest(unittest.TestCase):
             "eventDate": date.today().isoformat(),
         }
         self.assertEqual(201, self.call("POST", "/api/v1/lost-found", payload, device)[0])
-        phone, password, token, user = self.phone_account(installation_id)
+        phone, password, token, user = self.phone_account(installation_id,installation_secret)
         self.assertEqual("PHONE", user["accountType"])
         self.assertNotIn(phone, json.dumps(user, ensure_ascii=False))
         self.assertEqual(401, self.call("GET", "/api/v1/auth/me", token=device)[0])
@@ -2449,7 +2455,7 @@ class ApiTest(unittest.TestCase):
         with urllib.request.urlopen(self.base + "/admin/app.js", timeout=5) as response:
             javascript = response.read().decode("utf-8")
             self.assertIn("生产运行说明", javascript)
-            self.assertIn('DEVICE: "未登录用户"', javascript)
+            self.assertIn('DEVICE: "匿名服务资料"', javascript)
             self.assertNotIn('DEVICE: "测试设备"', javascript)
             self.assertIn("lost-details", javascript)
             self.assertIn("bulk-delete-lost", javascript)
@@ -2458,17 +2464,17 @@ class ApiTest(unittest.TestCase):
             self.assertIn("批量限制访问", javascript)
             self.assertIn("批量恢复权限", javascript)
             self.assertIn("delete-user-account", javascript)
-            self.assertIn("默认隐藏已注销用户", javascript)
+            self.assertIn("默认排除已注销账号", javascript)
             self.assertIn("恢复账号", javascript)
-            self.assertIn("已注销，可重新注册", javascript)
+            self.assertIn("已删除的数据不会恢复", javascript)
             self.assertIn("网站公告", javascript)
             self.assertIn("website-announcements", javascript)
             self.assertNotIn("本地运行说明", javascript)
-            self.assertIn("用户概况", javascript)
-            self.assertIn("累计用户量", javascript)
-            self.assertIn("我的长理注册用户", javascript)
-            self.assertIn("未注册 / 游客用户", javascript)
-            self.assertIn("今日首次使用用户", javascript)
+            self.assertIn("用户与设备", javascript)
+            self.assertIn("累计激活安装", javascript)
+            self.assertIn("注册账号", javascript)
+            self.assertIn("游客记录（安装）", javascript)
+            self.assertIn("今日首次激活", javascript)
             for removed_note in (
                 "累计用户量按 canonical identity 去重",
                 "DAU / WAU / MAU 按 canonical identity 去重",
@@ -2477,10 +2483,10 @@ class ApiTest(unittest.TestCase):
             ):
                 self.assertNotIn(removed_note, javascript)
             self.assertNotIn(", null, {}", javascript)
-            self.assertIn('"canonicalUsers"', javascript)
+            self.assertIn("renderers.canonicalUsers", javascript)
             self.assertIn('"devices"', javascript)
             self.assertIn('"installations"', javascript)
-            self.assertIn('data-action="back-overview"', javascript)
+            self.assertIn('data-identity-scope', javascript)
             self.assertNotIn("账号概况（仅 PHONE 注册账号）", javascript)
 
     def test_dashboard_drilldown_filters_counts_privacy_and_permissions(self):

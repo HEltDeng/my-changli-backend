@@ -50,6 +50,7 @@ from core import (
     row_dict,
 )
 from runtime_config import RUNTIME
+import identity_statistics as identities
 from security import RateLimiter
 
 ROOT = Path(__file__).resolve().parent
@@ -1199,6 +1200,7 @@ def initialize_database() -> None:
         if str(journal_mode).lower() != "wal":
             raise RuntimeError("SQLite WAL mode could not be enabled")
         db.executescript((ROOT / "schema.sql").read_text(encoding="utf-8"))
+        identities.migrate(db)
         ensure_default_app_config(db)
         ensure_column(db, "venues", "operating_status", "TEXT NOT NULL DEFAULT 'OPEN'")
         ensure_column(db, "venues", "maintenance_note", "TEXT NOT NULL DEFAULT ''")
@@ -1716,8 +1718,11 @@ def record_device_identity(
     scoped_id = normalize_device_scoped_id(data.get("deviceScopedId"))
     version_name, version_code = _client_version(data)
     timestamp = now_ms()
-    db.execute("BEGIN IMMEDIATE")
+    identities.validate_identity(db, data)
+    outer_transaction = db.in_transaction
+    db.execute("SAVEPOINT record_identity" if outer_transaction else "BEGIN IMMEDIATE")
     try:
+        identities.validate_identity(db,data)
         trusted_device_id: str | None = None
         if scoped_id:
             key_hash = device_key_hash(scoped_id)
@@ -1816,7 +1821,24 @@ def record_device_identity(
 
         anonymous_user_id: str | None = None
         if create_anonymous_user:
-            if trusted_device_id:
+            if data.get("installationSecret"):
+                # A physical-device hint is never a credential or a guest-data owner.
+                exact = db.execute("SELECT anonymous_user_id FROM installations WHERE installation_id=?", (installation_id,)).fetchone()
+                row = db.execute("SELECT * FROM users WHERE id=? AND account_status!='DELETED'",
+                    (exact["anonymous_user_id"],)).fetchone() if exact and exact["anonymous_user_id"] else None
+                if not row:
+                    anonymous_user_id = str(uuid.uuid4())
+                    digest, salt = password_record(secrets.token_urlsafe(32))
+                    db.execute("""INSERT INTO users(id,username,user_code,password_hash,password_salt,
+                        role,account_type,nickname,account_status,created_at)
+                        VALUES(?,?,?,?,?,'USER','DEVICE',?,'ACTIVE',?)""",
+                        (anonymous_user_id,"install_"+uuid.uuid4().hex,allocate_user_code(db,timestamp),
+                        digest,salt,DEFAULT_DEVICE_NICKNAME,timestamp))
+                else:
+                    anonymous_user_id = row["id"]
+                db.execute("UPDATE installations SET anonymous_user_id=? WHERE installation_id=?",
+                    (anonymous_user_id,installation_id))
+            elif trusted_device_id:
                 row = db.execute(
                     """SELECT u.* FROM users u JOIN user_devices ud ON ud.user_id=u.id
                        WHERE ud.device_id=? AND u.role='USER' AND u.account_type='DEVICE'
@@ -1893,7 +1915,16 @@ def record_device_identity(
                    last_seen_at=excluded.last_seen_at""",
                 (user_id, trusted_device_id, timestamp, timestamp),
             )
-        db.commit()
+        if not data.get("installationSecret"):
+            db.execute("""UPDATE installations SET activation_at=COALESCE(activation_at,?),
+                activation_source=CASE WHEN activation_at IS NULL THEN 'LEGACY_REPORT' ELSE activation_source END,
+                first_received_at=COALESCE(first_received_at,?),first_evidence_at=COALESCE(first_evidence_at,?)
+                WHERE installation_id=?""",(timestamp,timestamp,timestamp,installation_id))
+        identities.protect_identity(db,data)
+        if user_id:
+            identities.associate(db,installation_id,user_id,timestamp)
+        if outer_transaction: db.execute("RELEASE record_identity")
+        else: db.commit()
         return {
             "installation_id": installation_id,
             "device_id": trusted_device_id,
@@ -1901,7 +1932,10 @@ def record_device_identity(
             "trusted": bool(trusted_device_id),
         }
     except Exception:
-        db.rollback()
+        if outer_transaction:
+            db.execute("ROLLBACK TO record_identity")
+            db.execute("RELEASE record_identity")
+        else: db.rollback()
         raise
 
 
@@ -1983,7 +2017,9 @@ def mask_reservation_name(value: Any) -> str | None:
 
 def mask_admin_user_row(row: sqlite3.Row | dict[str, Any]) -> dict[str, Any]:
     data = dict(row)
-    data.pop("phone_encrypted", None)
+    for key in ("phone_encrypted","password_hash","password_salt","phone_hash","username",
+                "reservation_student_id_hash","reservation_name_hash","admin_permissions_json"):
+        data.pop(key,None)
     if "reservation_student_id" in data:
         data["reservation_student_id"] = mask_reservation_student_id(
             data["reservation_student_id"]
@@ -1997,6 +2033,9 @@ def full_admin_user_row(row: sqlite3.Row | dict[str, Any]) -> dict[str, Any]:
     """SUPER_ADMIN view: complete business profile, never credentials."""
     data = dict(row)
     encrypted = data.pop("phone_encrypted", None)
+    for key in ("password_hash","password_salt","phone_hash","username",
+                "reservation_student_id_hash","reservation_name_hash","admin_permissions_json"):
+        data.pop(key,None)
     data["phone"] = decrypt_phone(encrypted) if encrypted else None
     return data
 
@@ -2268,20 +2307,12 @@ def migrate_device_data(
 ) -> bool:
     if not installation_id:
         return False
-    source = db.execute(
-        "SELECT * FROM users WHERE username=? AND account_type='DEVICE'",
-        (device_username(installation_id),),
-    ).fetchone()
-    if not source:
-        source = db.execute(
-            """SELECT u.* FROM users u
-               JOIN user_devices ud ON ud.user_id=u.id
-               JOIN installations i ON i.device_id=ud.device_id
-               WHERE i.installation_id=? AND u.account_type='DEVICE'
-                 AND u.account_status!='DELETED'
-               ORDER BY ud.first_seen_at ASC LIMIT 1""",
-            (installation_id,),
-        ).fetchone()
+    exact = db.execute("SELECT anonymous_user_id,identity_secret_hash FROM installations WHERE installation_id=?",
+        (installation_id,)).fetchone()
+    if not exact or not exact["identity_secret_hash"] or not exact["anonymous_user_id"]:
+        return False
+    source = db.execute("SELECT * FROM users WHERE id=? AND account_type='DEVICE' AND account_status!='DELETED'",
+        (exact["anonymous_user_id"],)).fetchone()
     if not source or source["id"] == target_user_id:
         return False
     source_id = source["id"]
@@ -2630,6 +2661,7 @@ def delete_user_account_data(
 
     user_id = user["id"]
     timestamp = now_ms()
+    identities.forget_account(db,user_id)
     normalized_reason = reason.strip()[:300] or "账号删除"
     image_names = [
         row["image_name"]
@@ -2684,7 +2716,7 @@ def delete_user_account_data(
            reservation_student_id=NULL,reservation_name=NULL,
            reservation_profile_consented_at=NULL,reservation_student_id_hash=NULL,
            reservation_name_hash=NULL,reservation_profile_version=0,
-           reservation_profile_updated_at=?,last_active_at=NULL,first_login_at=NULL
+           reservation_profile_updated_at=?,admin_note='',phone_verified_at=NULL,last_active_at=NULL,first_login_at=NULL
            WHERE id=? AND role='USER'""",
         (
             anonymous_username,
@@ -2781,6 +2813,8 @@ def purge_deleted_user(
     db.execute("DELETE FROM sessions WHERE user_id=?", (user_id,))
     db.execute("UPDATE feedback SET handled_by=NULL WHERE handled_by=?", (user_id,))
     db.execute("UPDATE admin_audit_logs SET actor_user_id=NULL WHERE actor_user_id=?", (user_id,))
+    db.execute("DELETE FROM installation_accounts WHERE user_id=?", (user_id,))
+    db.execute("UPDATE installations SET current_user_id=NULL WHERE current_user_id=?", (user_id,))
     db.execute("DELETE FROM user_devices WHERE user_id=?", (user_id,))
     deleted = db.execute(
         "DELETE FROM users WHERE id=? AND role='USER' AND account_status='DELETED'",
@@ -3147,14 +3181,6 @@ class ApiHandler(BaseHTTPRequestHandler):
             raise ApiError(403, "ADMIN_ROLE_INVALID", "管理员角色配置无效")
         if role and user["role"] != role:
             raise ApiError(403, "FORBIDDEN", "权限不足")
-        timestamp = now_ms()
-        last_active = user["last_active_at"] or 0
-        if user["role"] == "USER" and timestamp - last_active >= 5 * 60 * 1000:
-            db.execute("UPDATE users SET last_active_at=? WHERE id=?", (timestamp, user["id"]))
-            write_user_event(
-                db, user["id"], "PLATFORM", "APP_ACTIVE", "SUCCESS",
-                client_version=self.headers.get("X-App-Version", "")[:40] or None,
-            )
         return user
 
     def optional_user(self, db: sqlite3.Connection) -> sqlite3.Row | None:
@@ -3398,6 +3424,13 @@ class ApiHandler(BaseHTTPRequestHandler):
         match = re.fullmatch(r"/api/v1/feedback/([^/]+)", path)
         if method == "GET" and match:
             return self.feedback_get(match.group(1)), 200
+        if method == "POST" and path == "/api/v1/installation-events":
+            data=self.body_json()
+            with connection() as db:
+                user=self.optional_user(db)
+                if user and user["role"]!="USER":
+                    raise ApiError(403,"FORBIDDEN","管理员会话不可上报安装")
+                return identities.receive(db,data,user,device_key_hash),200
         if path.startswith("/api/v1/admin/"):
             return self.admin_route(method, path, query)
         raise ApiError(404, "NOT_FOUND", "接口不存在")
@@ -3433,7 +3466,9 @@ class ApiHandler(BaseHTTPRequestHandler):
                 client_version=str(data.get("versionName", "")).strip() or None,
             )
             user = db.execute("SELECT * FROM users WHERE id=?", (user["id"],)).fetchone()
-            return {"token": issue_token(db, user["id"]), "user": serialize_user(user)}
+            token = issue_token(db, user["id"])
+            identities.bind_session(db,token,install_id)
+            return {"token": token, "user": serialize_user(user)}
 
     def auth_register(self) -> dict[str, Any]:
         data = self.body_json()
@@ -3452,6 +3487,8 @@ class ApiHandler(BaseHTTPRequestHandler):
         username = "phone_" + digest_phone[:32]
         digest, salt = password_record(password)
         with connection() as db:
+            if data.get("installationId"): identities.validate_identity(db,data)
+            db.execute("BEGIN IMMEDIATE")
             user_id = str(uuid.uuid4())
             created_at = now_ms()
             try:
@@ -3512,7 +3549,9 @@ class ApiHandler(BaseHTTPRequestHandler):
                 client_version=str(data.get("versionName", "")).strip() or None,
             )
             user = db.execute("SELECT * FROM users WHERE id=?", (user_id,)).fetchone()
-            return {"token": issue_token(db, user_id), "user": serialize_user(user)}
+            token = issue_token(db,user_id)
+            identities.bind_session(db,token,data.get("installationId"))
+            return {"token": token, "user": serialize_user(user)}
 
     def auth_login(self) -> dict[str, Any]:
         data = self.body_json()
@@ -3525,6 +3564,7 @@ class ApiHandler(BaseHTTPRequestHandler):
             300,
         )
         with connection() as db:
+            if data.get("installationId"): identities.validate_identity(db,data)
             if str(data.get("phone", "")).strip():
                 phone = normalize_phone(data.get("phone"))
                 user = db.execute(
@@ -3574,6 +3614,7 @@ class ApiHandler(BaseHTTPRequestHandler):
                     {"result": "DENIED", "reason": "ADMIN_ROLE_INVALID"},
                 )
                 raise ApiError(403, "ADMIN_ROLE_INVALID", "管理员角色配置无效")
+            db.execute("BEGIN IMMEDIATE")
             migrated = migrate_device_data(
                 db,
                 str(data.get("installationId", "")).strip() or None,
@@ -3607,8 +3648,10 @@ class ApiHandler(BaseHTTPRequestHandler):
                     installation_id=identity["installation_id"],
                     client_version=str(data.get("versionName", "")).strip() or None,
                 )
+            token = issue_token(db,user["id"])
+            identities.bind_session(db,token,data.get("installationId"))
             return {
-                "token": issue_token(db, user["id"]),
+                "token": token,
                 "user": serialize_user(user),
                 "migratedDeviceData": migrated,
             }
@@ -3619,9 +3662,12 @@ class ApiHandler(BaseHTTPRequestHandler):
             token_hash = hashlib.sha256(header[7:].strip().encode()).hexdigest()
             with connection() as db:
                 session = db.execute(
-                    "SELECT user_id FROM sessions WHERE token_hash=?", (token_hash,)
+                    "SELECT user_id,installation_id FROM sessions WHERE token_hash=?", (token_hash,)
                 ).fetchone()
                 if session:
+                    if session["installation_id"]:
+                        db.execute("UPDATE installations SET current_user_id=NULL WHERE installation_id=? AND current_user_id=?",
+                            (session["installation_id"],session["user_id"]))
                     user = db.execute("SELECT role FROM users WHERE id=?", (session["user_id"],)).fetchone()
                     if user and user["role"] == "USER":
                         write_user_event(db, session["user_id"], "ACCOUNT", "LOGOUT")
@@ -5021,6 +5067,40 @@ class ApiHandler(BaseHTTPRequestHandler):
                     for row in db.execute("SELECT * FROM users WHERE role='ADMIN' ORDER BY created_at")
                 ], 200
 
+            if method == "GET" and path == "/api/v1/admin/identity-statistics":
+                db.execute("BEGIN")
+                result=identities.snapshot(db,admin["id"])
+                db.commit()
+                return result,200
+            if method == "GET" and path == "/api/v1/admin/identity-records":
+                db.execute("BEGIN")
+                result=identities.listing(db,{**query,"_admin":admin["id"]},decrypt_phone)
+                db.commit()
+                if query.get("export")=="true":
+                    write_audit(db,admin["id"],"IDENTITY_EXPORT","STATISTICS",query.get("scope","accounts"),
+                        {"count":result["total"]})
+                return result,200
+            device_match=re.fullmatch(r"/api/v1/admin/identity-devices/([^/]+)",path)
+            if method=="PATCH" and device_match:
+                data=self.body_json()
+                if set(data)-{"displayModel","mappingSource","adminNote"}:
+                    raise ApiError(422,"INVALID_FIELDS","只能修改设备显示名、映射来源和备注")
+                if not db.execute("SELECT 1 FROM devices WHERE id=?",(device_match.group(1),)).fetchone():
+                    raise ApiError(404,"DEVICE_NOT_FOUND","设备不存在")
+                label=str(data.get("displayModel") or "").strip()
+                source=str(data.get("mappingSource") or "").strip()
+                note=str(data.get("adminNote") or "").strip()
+                if len(label)>100 or len(source)>500 or len(note)>1000 or (label and not source):
+                    raise ApiError(422,"INVALID_MAPPING","显示名需填写可靠来源，长度不得超出限制")
+                db.execute("BEGIN IMMEDIATE")
+                db.execute("UPDATE devices SET display_model=?,model_mapping_source=?,admin_note=? WHERE id=?",
+                    (label or None,source or None,note or None,device_match.group(1)))
+                write_audit(db,admin["id"],"DEVICE_DISPLAY_UPDATED","DEVICE",device_match.group(1),
+                    {"fields":["displayModel","mappingSource","adminNote"]})
+                db.commit()
+                identities.invalidate_snapshots()
+                return {"updated":True},200
+
             if method == "GET" and path == "/api/v1/admin/canonical-users":
                 return canonical_identity_listing(db, query), 200
 
@@ -5221,6 +5301,52 @@ class ApiHandler(BaseHTTPRequestHandler):
                 )
                 return paginated_response(rows, total, limit, offset), 200
 
+            profile_match = re.fullmatch(r"/api/v1/admin/users/([^/]+)/business-profile",path)
+            if method == "PATCH" and profile_match:
+                data=self.body_json()
+                allowed={"nickname","adminNote","reservationName","reservationStudentId","phone"}
+                if set(data)-allowed: raise ApiError(422,"INVALID_FIELDS","存在不可编辑字段")
+                target=db.execute("SELECT * FROM users WHERE id=? AND role='USER' AND account_status!='DELETED'",
+                    (profile_match.group(1),)).fetchone()
+                if not target: raise ApiError(404,"USER_NOT_FOUND","用户不存在")
+                updates={};changed=[]
+                for key,column,limit in (("nickname","nickname",40),("adminNote","admin_note",1000),
+                    ("reservationName","reservation_name",40),("reservationStudentId","reservation_student_id",32)):
+                    if key in data:
+                        val=str(data[key] or "").strip()
+                        if len(val)>limit or (key=="nickname" and not val):
+                            raise ApiError(422,"INVALID_PROFILE","资料长度或内容无效")
+                        updates[column]=val
+                        if val!=(target[column] or ""): changed.append(key)
+                if "phone" in data and str(data["phone"] or "").strip()!=(decrypt_phone(target["phone_encrypted"]) or ""):
+                    if target["account_type"]!="PHONE": raise ApiError(422,"INVALID_ACCOUNT","匿名资料不能直接改为注册账号")
+                    phone=normalize_phone(data["phone"]);digest=phone_digest(phone)
+                    if db.execute("SELECT 1 FROM users WHERE phone_hash=? AND id!=?",(digest,target["id"])).fetchone():
+                        raise ApiError(409,"PHONE_EXISTS","手机号已被其他账号使用")
+                    updates.update(phone_hash=digest,phone_masked=phone_mask(phone),phone_encrypted=encrypt_phone(phone),
+                        phone_verified_at=None,username="phone_"+digest[:32])
+                    changed.append("phone")
+                if any(x in changed for x in ("reservationName","reservationStudentId")):
+                    # Preserve provenance without fabricating the user's confirmation of edited values.
+                    updates.update(reservation_profile_consented_at=None,reservation_profile_updated_at=now_ms())
+                    for key,column in (("reservationName","reservation_name"),("reservationStudentId","reservation_student_id")):
+                        val=updates.get(column,target[column]) or ""
+                        updates[column+"_hash"]=reservation_pii_digest("real-name" if key=="reservationName" else "student-id",val)
+                db.execute("BEGIN IMMEDIATE")
+                try:
+                    if updates:
+                        db.execute("UPDATE users SET "+",".join(k+"=?" for k in updates)+" WHERE id=?",
+                            [*updates.values(),target["id"]])
+                    if "phone" in changed:
+                        db.execute("DELETE FROM sessions WHERE user_id=?",(target["id"],))
+                    write_audit(db,admin["id"],"USER_BUSINESS_PROFILE_UPDATED","USER",target["id"],{"fields":changed})
+                    db.commit()
+                    identities.invalidate_snapshots()
+                except sqlite3.IntegrityError as exc:
+                    db.rollback()
+                    raise ApiError(409,"PHONE_EXISTS","手机号已被其他账号使用") from exc
+                return {"id":target["id"],"updatedFields":changed},200
+
             match = re.fullmatch(r"/api/v1/admin/users/([^/]+)/details", path)
             if method == "GET" and match:
                 user = db.execute(
@@ -5231,7 +5357,8 @@ class ApiHandler(BaseHTTPRequestHandler):
                               reservation_profile_updated_at,
                               account_status,account_status_reason,
                               account_status_changed_at,account_status_expires_at,
-                              last_active_at,first_login_at,created_at
+                              last_active_at,first_login_at,created_at,admin_note,phone_verified_at,
+                              student_id,real_name,campus_verified
                        FROM users WHERE id=? AND role='USER'""",
                     (match.group(1),),
                 ).fetchone()
@@ -5239,6 +5366,9 @@ class ApiHandler(BaseHTTPRequestHandler):
                     raise ApiError(404, "USER_NOT_FOUND", "用户不存在")
                 return {
                     "user": full_admin_user_row(user),
+                    "identityInstallations": identities.listing(db,{"scope":"installations","userId":user["id"]},decrypt_phone)["items"],
+                    "managementEvents": [dict(r) for r in db.execute(
+                        "SELECT a.action,a.created_at,a.details_json,u.nickname AS actor_name FROM admin_audit_logs a LEFT JOIN users u ON u.id=a.actor_user_id WHERE a.entity_id=? ORDER BY a.created_at DESC LIMIT 50",(user["id"],))],
                     "reservations": [
                         mask_admin_reservation_row(row)
                         for row in db.execute(
@@ -5321,8 +5451,8 @@ class ApiHandler(BaseHTTPRequestHandler):
                                   i.last_seen_at,i.last_app_version_name AS app_version_name,
                                   i.last_app_version_code AS app_version_code,
                                   i.legacy,i.created_at,i.updated_at
-                           FROM installations i JOIN user_devices ud ON ud.device_id=i.device_id
-                          WHERE ud.user_id=? ORDER BY i.last_seen_at DESC LIMIT 100""",
+                           FROM installations i JOIN installation_accounts ia ON ia.installation_id=i.installation_id
+                          WHERE ia.user_id=? ORDER BY i.last_seen_at DESC LIMIT 100""",
                         (user["id"],),
                     )],
                     "restriction": row_dict(active_restriction(db, user["id"])),
@@ -5696,6 +5826,7 @@ class ApiHandler(BaseHTTPRequestHandler):
                     },
                 )
                 write_user_event(db, user["id"], "ACCOUNT", "ACCOUNT_STATUS_CHANGED", "SUCCESS", "USER", user["id"])
+                identities.invalidate_snapshots()
                 return mask_admin_user_row(
                     db.execute("SELECT * FROM users WHERE id=?", (user["id"],)).fetchone()
                 ), 200
