@@ -364,9 +364,13 @@ def listing(db,q,decrypt_phone):
     advanced=str(q.get("uuid") or "").strip()
     items=[]
     for row in rows:
+        # Legacy GUEST aliases remain searchable for support; never merge by this display code.
+        identifiers=[row.get("device_id"),row.get("anonymous_user_id")]
+        if row.get("account_type")=="DEVICE": identifiers.append(row["id"])
+        row["legacy_guest_codes"]=list(dict.fromkeys("GUEST-"+hashlib.sha256(str(v).encode()).hexdigest()[:10].upper() for v in identifiers if v))
         row["phone"]=decrypt_phone(row.pop("phone_encrypted",None))
         if needle and needle not in " ".join(str(row.get(k) or "") for k in
-            ("display_name","short_code","phone","reservation_name","reservation_student_id","brand","model_raw","real_name","student_id")).lower(): continue
+            ("display_name","short_code","phone","reservation_name","reservation_student_id","brand","model_raw","real_name","student_id","legacy_guest_codes")).lower(): continue
         if advanced and advanced!=row["id"]: continue
         # Never serialize installation proof hashes or raw device keys.
         for key in ("identity_secret_hash","device_key_hash"): row.pop(key,None)

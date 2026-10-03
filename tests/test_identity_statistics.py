@@ -218,6 +218,15 @@ class IdentityStatisticsTest(unittest.TestCase):
         self.assertEqual(200,self.report({**e,"eventId":str(uuid.uuid4()),"kind":"WITHDRAW"},t)[0])
         self.assertEqual(409,self.report({**e,"eventId":str(uuid.uuid4())},t)[0])
 
+    def test_legacy_guest_alias_search_preserves_installation_identity(self):
+        a,e,t=self.installation(secrets.token_hex(32));self.report(e,t)
+        row=self.rows("guests",uuid=a["installationId"])["items"][0]
+        alias=server._short_business_code("GUEST",row["device_id"])
+        self.assertIn(alias,row["legacy_guest_codes"])
+        found=self.rows("guests",q=alias)
+        self.assertEqual(1,found["total"])
+        self.assertEqual(a["installationId"],found["items"][0]["id"])
+
     def test_retention_removes_old_events_without_new_client_traffic(self):
         a,e,t=self.installation();self.report(e,t)
         with server.connection() as db:

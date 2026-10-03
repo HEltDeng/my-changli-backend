@@ -1318,7 +1318,7 @@ content.addEventListener("click", async (event) => {
           <label>处理原因<input name="reason" maxlength="300" placeholder="变更状态时必须填写"></label>
           <label>暂停时长<select name="suspensionDuration"><option value="7_DAYS">7 天</option><option value="30_DAYS">30 天</option><option value="PERMANENT">永久</option></select></label>
           <p class="muted">账号状态选择“受限”时应用暂停时长；选择“正常”即可恢复。受限账号仍可登录并使用本地功能，但失物招领、资料库及其他需服务端授权的功能会被拒绝。</p>
-          <p class="muted">预约姓名和学号只能由用户本人确认并保存。管理员可在详情页按权限受控查看，但不能代替用户填写或伪造同意记录。</p>
+          <p class="muted">预约资料可在“编辑资料”中纠正；纠正后需用户重新确认，管理员操作不会伪造用户同意记录。</p>
         </div>`,
         async (form) => {
           await api(`/api/v1/admin/users/${encodeURIComponent(user.id)}`, {
@@ -1720,7 +1720,13 @@ async function renderIdentityRecords(filters={}){
  const scope=filters.scope||"accounts";
  state.filters={...filters,scope};state.page="users";
  const params=new URLSearchParams(Object.entries(state.filters).filter(([k,v])=>v!==""&&v!=null&&k!=="title"));
- const result=await api("/api/v1/admin/identity-records?"+params);
+ let result;
+ try { result=await api("/api/v1/admin/identity-records?"+params); }
+ catch(error) {
+  if(error.code!=="SNAPSHOT_EXPIRED" || !state.filters.snapshot) throw error;
+  delete state.filters.snapshot; delete state.filters.asOf;
+  return renderIdentityRecords(state.filters);
+ }
  state.filters.asOf=String(result.asOf); state.filters.snapshot=result.snapshot;
  const f=state.filters,account=scope==="accounts"||scope==="legacy";
  const fields=[["q","搜索","昵称、手机号、编号、姓名、学号"],["brand","品牌","全部"],["model","型号","全部"],["android","Android","全部"],["app","App 版本","全部"]];
@@ -1797,7 +1803,7 @@ content.addEventListener("click",async event=>{
    <p>Android ${escapeHtml(r.android_version||"未上报")} / API ${escapeHtml(r.sdk_int||"未上报")} · App ${escapeHtml(r.last_app_version_name||"未上报")} (${escapeHtml(r.last_app_version_code||"—")})</p>
    <h4>活动与来源</h4><p>首次有证据使用：${formatTime(r.first_evidence_at)}</p><p>首次收到上报：${formatTime(r.first_received_at)}</p><p>最近前台活跃：${formatTime(r.foreground_at)}</p><p>资料更新：${formatTime(r.profile_updated_at)}</p><p>${escapeHtml(sourceLabels[r.activation_source]||"历史未确认")} · ${r.withdrawn_at?"已撤回统计":"协议 "+r.protocol_version}</p>
    <h4>管理备注</h4><p>${escapeHtml(r.device_note||"未填写")}</p>
-   <details><summary>技术信息</summary><p class="technical">安装标识：${escapeHtml(r.installation_id||"—")}<br>设备内部编号：${escapeHtml(r.device_id||"未识别")}<br>型号映射：${escapeHtml(r.model_mapping_source||"原始上报；未猜测营销名称")}</p></details></div>`,async()=>{},"关闭");
+   <details><summary>技术信息</summary><p class="technical">安装标识：${escapeHtml(r.installation_id||"—")}<br>设备内部编号：${escapeHtml(r.device_id||"未识别")}<br>历史查询编号：${escapeHtml((r.legacy_guest_codes||[]).join("、")||"无")}<br>型号映射：${escapeHtml(r.model_mapping_source||"原始上报；未猜测营销名称")}</p></details></div>`,async()=>{},"关闭");
   }
  }catch(e){toast(e.message,true)}
 });
