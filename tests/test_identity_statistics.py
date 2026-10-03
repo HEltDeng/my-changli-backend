@@ -218,6 +218,15 @@ class IdentityStatisticsTest(unittest.TestCase):
         self.assertEqual(200,self.report({**e,"eventId":str(uuid.uuid4()),"kind":"WITHDRAW"},t)[0])
         self.assertEqual(409,self.report({**e,"eventId":str(uuid.uuid4())},t)[0])
 
+    def test_retention_removes_old_events_without_new_client_traffic(self):
+        a,e,t=self.installation();self.report(e,t)
+        with server.connection() as db:
+            db.execute("UPDATE installation_events SET received_at=? WHERE installation_id=?",
+                (server.now_ms()-181*identities.DAY,a["installationId"]))
+            self.assertEqual(1,identities.purge_expired_events(db))
+            self.assertEqual(0,identities.purge_expired_events(db))
+            self.assertIsNotNone(db.execute("SELECT activation_at FROM installations WHERE installation_id=?",(a["installationId"],)).fetchone()[0])
+
     def test_deleted_account_optional_data_is_not_recovered_by_device_key(self):
         a,e,t=self.installation(secrets.token_hex(32));self.report(e,t);creds,user=self.account(a)
         self.assertEqual(200,self.call("DELETE","/api/v1/auth/account",

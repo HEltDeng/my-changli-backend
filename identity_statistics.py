@@ -23,6 +23,10 @@ def invalidate_snapshots():
     with _snapshot_lock:
         _snapshots.clear()
 
+def purge_expired_events(db):
+    """Global retention also runs without a new client event."""
+    return db.execute("DELETE FROM installation_events WHERE received_at<?",(now_ms()-180*DAY,)).rowcount
+
 def forget_account(db, user_id):
     """Remove optional observations when an associated account is deleted."""
     invalidate_snapshots()
@@ -247,7 +251,7 @@ def receive(db,data,user,device_key_hash):
             if user and user["account_type"]=="PHONE": associate(db,iid,user["id"],received,"VERIFIED_EVENT")
         db.execute("INSERT INTO installation_events VALUES(?,?,?,?,?,?,?,2)",
             (iid,eid,kind,client,received,effective,"VALID" if effective is not None else "CLOCK_INVALID"))
-        db.execute("DELETE FROM installation_events WHERE received_at<?",(received-180*DAY,))
+        purge_expired_events(db)
         db.commit()
         return {"accepted":True,"duplicate":False,"timeQuality":"VALID" if effective is not None else "CLOCK_INVALID"}
     except Exception:

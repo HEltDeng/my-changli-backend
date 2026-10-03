@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import logging
+import atexit
+import threading
 
 from waitress import serve
 
@@ -10,6 +12,20 @@ import server
 from logging_config import configure_logging
 from runtime_config import RUNTIME
 from wsgi import application
+
+def start_statistics_retention() -> None:
+    """Run the disclosed retention independently of client traffic, once per hour."""
+    stop = threading.Event()
+    atexit.register(stop.set)
+    def clean() -> None:
+        while not stop.is_set():
+            try:
+                with server.connection() as db:
+                    server.identities.purge_expired_events(db)
+            except Exception:
+                logging.getLogger("mychangli.runtime").exception("Statistics retention failed")
+            stop.wait(3600)
+    threading.Thread(target=clean,name="statistics-retention",daemon=True).start()
 
 
 def prepare_runtime() -> None:
@@ -24,6 +40,7 @@ def prepare_runtime() -> None:
 
 def main() -> None:
     prepare_runtime()
+    start_statistics_retention()
     logging.getLogger("mychangli.runtime").info(
         "production runtime starting",
         extra={"event": "RUNTIME_START"},
