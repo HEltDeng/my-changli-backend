@@ -9,6 +9,8 @@ import json
 import re
 import threading
 import uuid
+import copy
+import school_bindings
 from collections import OrderedDict
 from datetime import datetime
 from core import ApiError, now_ms, BUSINESS_TIMEZONE, business_day_bounds_ms, parse_pagination, paginated_response
@@ -30,6 +32,8 @@ def purge_expired_events(db):
 def forget_account(db, user_id):
     """Remove optional observations when an associated account is deleted."""
     invalidate_snapshots()
+    db.execute('DELETE FROM school_bindings WHERE user_id=?',(user_id,))
+    db.execute('UPDATE installation_events SET event_user_id=NULL WHERE event_user_id=?',(user_id,))
     rows=list(db.execute("SELECT i.installation_id,i.device_id FROM installations i JOIN installation_accounts a ON a.installation_id=i.installation_id WHERE a.user_id=?",(user_id,)))
     for row in rows:
         db.execute("""UPDATE installations SET manufacturer=NULL,brand=NULL,model_raw=NULL,
@@ -62,6 +66,7 @@ def migrate(db):
             "anonymous_user_id":"TEXT REFERENCES users(id) ON DELETE SET NULL",
             "is_test":"INTEGER NOT NULL DEFAULT 0",
             "device_identity_state":"TEXT NOT NULL DEFAULT 'UNCONFIRMED'",
+            "school_sync_ended_at":"INTEGER",
         }.items(): add("installations",name,definition)
         for name in ("display_model", "model_mapping_source", "admin_note"):
             add("devices",name,"TEXT")
@@ -78,6 +83,9 @@ def migrate(db):
             event_id TEXT NOT NULL,kind TEXT NOT NULL,client_at INTEGER NOT NULL,
             received_at INTEGER NOT NULL,effective_at INTEGER,time_quality TEXT NOT NULL,
             protocol_version INTEGER NOT NULL,PRIMARY KEY(installation_id,event_id))""")
+        add("installation_events","event_user_id","TEXT REFERENCES users(id) ON DELETE SET NULL")
+        add("installation_events","event_device_id","TEXT")
+        school_bindings.migrate(db)
         db.execute("CREATE INDEX IF NOT EXISTS installation_events_time ON installation_events(effective_at,kind)")
         db.execute("CREATE INDEX IF NOT EXISTS installation_accounts_user ON installation_accounts(user_id)")
         db.execute("CREATE TABLE IF NOT EXISTS identity_migrations(version INTEGER PRIMARY KEY,applied_at INTEGER NOT NULL)")
@@ -149,7 +157,7 @@ def receive(db,data,user,device_key_hash):
     if not re.fullmatch(r"[a-zA-Z0-9-]{16,80}",eid):
         raise ApiError(422,"INVALID_EVENT_ID","事件编号无效")
     packages={"com.mychangli.app"} if RUNTIME.is_production else {"com.mychangli.app","com.mychangli.app.debug"}
-    if data.get("protocolVersion")!=PROTOCOL or data.get("packageName") not in packages:
+    if data.get("protocolVersion") not in {2,3} or data.get("packageName") not in packages:
         raise ApiError(422,"INVALID_PROTOCOL","上报协议无效")
     iid=data["installationId"]
     received=now_ms()
@@ -177,6 +185,9 @@ def receive(db,data,user,device_key_hash):
         scoped=data.get("deviceScopedId")
         if scoped and not re.fullmatch("[0-9a-f]{64}",str(scoped)):
             raise ApiError(422,"INVALID_DEVICE_KEY","设备辅助标识无效")
+    if data.get("protocolVersion")==3 and data.get("accountIdAtEvent") != (user["id"] if user and user["account_type"]=="PHONE" else None):
+        # A delayed event from account A must never become activity of account B.
+        user=None
     db.execute("BEGIN IMMEDIATE")
     try:
         previous=validate_identity(db,data,required=True)
@@ -198,7 +209,10 @@ def receive(db,data,user,device_key_hash):
             if device and not db.execute("SELECT 1 FROM installations WHERE device_id=?",(device,)).fetchone():
                 db.execute("DELETE FROM devices WHERE id=?",(device,))
         else:
-            if previous["withdrawn_at"] and client<=previous["withdrawn_at"]:
+            acknowledged_withdrawal = data.get("afterWithdrawalEventId") and db.execute(
+                "SELECT 1 FROM installation_events WHERE installation_id=? AND event_id=? AND kind='WITHDRAW' AND received_at=?",
+                (iid,data.get("afterWithdrawalEventId"),previous["withdrawn_at"])).fetchone()
+            if previous["withdrawn_at"] and client<=previous["withdrawn_at"] and not (kind=="ACTIVATE" and acknowledged_withdrawal):
                 raise ApiError(409,"CONSENT_WITHDRAWN","撤回前的事件不能恢复采集")
             if previous["withdrawn_at"] and kind!="ACTIVATE":
                 raise ApiError(409,"CONSENT_WITHDRAWN","需要重新同意后激活")
@@ -239,9 +253,9 @@ def receive(db,data,user,device_key_hash):
                      profile["sdkInt"],profile["appVersionName"],profile["appVersionCode"],profile_at,iid))
             db.execute("""UPDATE installations SET device_id=?,legacy=?,activation_at=COALESCE(activation_at,?),
                 activation_source=?,first_received_at=COALESCE(first_received_at,?),
-                first_evidence_at=COALESCE(first_evidence_at,?),protocol_version=2,
+                first_evidence_at=COALESCE(first_evidence_at,?),protocol_version=MAX(protocol_version,?),
                 consent_version=1,withdrawn_at=NULL WHERE installation_id=?""",
-                (device_id,0 if device_id else 1,received,source,received,effective,iid))
+                (device_id,0 if device_id else 1,received,source,received,effective,data['protocolVersion'],iid))
             if kind in {"ACTIVATE","FOREGROUND"} and effective is not None:
                 db.execute("UPDATE installations SET foreground_at=MAX(COALESCE(foreground_at,0),?) WHERE installation_id=?",(effective,iid))
             if device_id:
@@ -249,8 +263,11 @@ def receive(db,data,user,device_key_hash):
                     last_app_version_name=?,last_app_version_code=?,updated_at=? WHERE id=?""",
                     (device_id,profile["appVersionName"],profile["appVersionCode"],received,device_id))
             if user and user["account_type"]=="PHONE": associate(db,iid,user["id"],received,"VERIFIED_EVENT")
-        db.execute("INSERT INTO installation_events VALUES(?,?,?,?,?,?,?,2)",
-            (iid,eid,kind,client,received,effective,"VALID" if effective is not None else "CLOCK_INVALID"))
+        db.execute("""INSERT INTO installation_events(installation_id,event_id,kind,client_at,received_at,effective_at,time_quality,protocol_version,event_user_id,event_device_id)
+            VALUES(?,?,?,?,?,?,?,?,?,?)""",
+            (iid,eid,kind,client,received,effective,"VALID" if effective is not None else "CLOCK_INVALID",data["protocolVersion"],
+             user["id"] if data["protocolVersion"]==3 and user and user["account_type"]=="PHONE" else None,
+             device_id if kind!="WITHDRAW" else None))
         purge_expired_events(db)
         db.commit()
         return {"accepted":True,"duplicate":False,"timeQuality":"VALID" if effective is not None else "CLOCK_INVALID"}
@@ -268,12 +285,12 @@ def code(prefix,value):
 def query_rows(db,q):
     """One selection pipeline feeds cards, pages, and exports."""
     scope=q.get("scope","accounts")
-    if scope not in {"accounts","guests","installations","devices","legacy"}:
+    if scope not in {"accounts","guests","installations","devices","legacy","students"}:
         raise ApiError(422,"INVALID_SCOPE","统计范围无效")
     try: as_of=int(q.get("asOf") or now_ms())
     except (TypeError,ValueError): raise ApiError(422,"INVALID_TIME","统计时间无效")
     if as_of>now_ms()+300000 or as_of<0: raise ApiError(422,"INVALID_TIME","统计时间无效")
-    if q.get("activity","") not in {"","today","30d"}: raise ApiError(422,"INVALID_FILTER","活跃范围无效")
+    if q.get("activity","") not in {"","5m","today","7d","30d","month","day"}: raise ApiError(422,"INVALID_FILTER","活跃范围无效")
     start,end=business_day_bounds_ms(datetime.fromtimestamp(as_of/1000,BUSINESS_TIMEZONE).date())
     rows=[]
     installs=[dict(r) for r in db.execute("""SELECT i.*,d.display_model,d.model_mapping_source,d.admin_note AS device_note
@@ -288,7 +305,21 @@ def query_rows(db,q):
         WHERE kind IN ('ACTIVATE','FOREGROUND') AND effective_at<=? AND received_at<=?
         GROUP BY installation_id""",(as_of,as_of)):
         active[r["installation_id"]]=r["at"]
+    events=[dict(r) for r in db.execute("""SELECT e.* FROM installation_events e JOIN installations i ON i.installation_id=e.installation_id
+        WHERE kind IN ('ACTIVATE','FOREGROUND') AND effective_at<=? AND received_at<=? AND i.is_test=0""",(as_of,as_of))]
+    event_times={}
+    account_times={}
+    device_times={}
+    for e in events:
+        event_times.setdefault(e["installation_id"],[]).append(e["effective_at"])
+        if e["event_user_id"]: account_times.setdefault(e["event_user_id"],[]).append(e["effective_at"])
+        did=e["event_device_id"]
+        if not did and e["protocol_version"]==2:
+            # Existing v2 device identity is usable; no account identity is inferred.
+            did=next((i["device_id"] for i in installs if i["installation_id"]==e["installation_id"]),None)
+        if did: device_times.setdefault(did,[]).append(e["effective_at"])
     for i in installs:
+        i["_activity"]=event_times.get(i["installation_id"],[])
         i["foreground_at"]=active.get(i["installation_id"])
         i["model_label"]=model_label(i)
     if scope in {"accounts","legacy"}:
@@ -303,7 +334,8 @@ def query_rows(db,q):
             row.update({k:newest.get(k) for k in ("brand","model_raw","model_label","android_version","last_app_version_name","last_app_version_code")})
             row.update(id=u["id"],display_name=u["nickname"] if scope=="accounts" else "游客 · 型号未上报",
                 short_code=u["user_code"],first_evidence_at=min([i["first_evidence_at"] for i in associated if i["first_evidence_at"]],default=None),
-                foreground_at=max([i["foreground_at"] or 0 for i in associated],default=0) or None,
+                foreground_at=max(account_times.get(u["id"],[]),default=None), _activity=account_times.get(u["id"],[]),
+                _installation_ids=[i["installation_id"] for i in associated],
                 installation_count=len(associated),device_count=len({i["device_id"] for i in associated if i["device_id"]}),
                 association_state="已验证安装关联" if associated else "历史关联未确认")
             rows.append(row)
@@ -316,14 +348,55 @@ def query_rows(db,q):
             newest=max(items,key=lambda i:i["profile_updated_at"] or 0)
             rows.append({**newest,"id":did,"short_code":code("D",did),"display_name":model_label(newest),
                 "installation_count":len(items),"first_evidence_at":min(i["first_evidence_at"] or i["first_seen_at"] for i in items),
-                "foreground_at":max((i["foreground_at"] or 0 for i in items),default=0) or None})
-    else:
+                "foreground_at":max(device_times.get(did,[]),default=None),"_activity":device_times.get(did,[]),
+                "_installation_ids":[i["installation_id"] for i in items]})
+    elif scope!="students":
         for i in installs:
             if not i["activation_at"] or i["activation_at"]>as_of: continue
             if scope=="guests" and i["ever_registered"]: continue
             rows.append({**i,"id":i["installation_id"],"short_code":code("I",i["installation_id"]),
                 "display_name":"游客 · "+model_label(i) if not i["ever_registered"] else model_label(i),
                 "association_state":"曾关联注册账号" if i["ever_registered"] else "未关联注册账号"})
+    # Enrich every row from exact installation-account links, never model/IP matches.
+    users={r["id"]:dict(r) for r in db.execute("SELECT id,nickname,user_code,phone_encrypted,account_status FROM users WHERE role='USER' AND account_type='PHONE'")}
+    bindings=[dict(r) for r in db.execute("SELECT b.* FROM school_bindings b JOIN installations i ON i.installation_id=b.installation_id WHERE b.received_at<=? AND i.is_test=0",(as_of,))]
+    if scope=="students":
+        grouped={}
+        for b in bindings:
+            if b["status"]=="ACTIVE" and users.get(b["user_id"],{}).get("account_status")!="DELETED":
+                grouped.setdefault((b["school_id"],b["student_id"]),[]).append(b)
+        for (school,student),bs in grouped.items():
+            rows.append({"id":school+":"+student,"display_name":student,"short_code":school,
+                "school_id":school,"bound_student_id":student,"_installation_ids":[b["installation_id"] for b in bs],
+                "_activity":[],"first_evidence_at":min(b["received_at"] for b in bs)})
+    for row in rows:
+        ids=row.get("_installation_ids") or ([row["installation_id"]] if row.get("installation_id") else [])
+        row["_installation_ids"]=ids
+        associations=[]
+        for uid,iids in links.items():
+            if uid not in users or users[uid]["account_status"]=="DELETED" or not set(ids).intersection(iids): continue
+            assoc=dict(users[uid])
+            assoc["current"]=any(i["installation_id"] in ids and i["current_user_id"]==uid for i in installs)
+            related=[dict(b) for b in bindings if b["user_id"]==uid and b["installation_id"] in ids]
+            for b in related:
+                b["current"]=b["status"]=="ACTIVE" and any(i["installation_id"]==b["installation_id"] and i["current_user_id"]==uid for i in installs)
+                b["conflict"]=len({x["user_id"] for x in bindings if x["school_id"]==b["school_id"] and x["student_id"]==b["student_id"] and x["status"]=="ACTIVE"})>1
+            assoc["school_bindings"]=related
+            associations.append(assoc)
+        if scope=="accounts":
+            # Keep only this account's school details in its row.
+            associations=[a for a in associations if a["id"]==row["id"]]
+        row["associated_accounts"]=associations
+        current_bindings=[b for a in associations for b in a["school_bindings"] if b["current"] or (scope=="accounts" and b["status"]=="ACTIVE")]
+        row["school_bindings"]=[b for a in associations for b in a["school_bindings"]]
+        row["bound_student_id"]=row.get("bound_student_id") or (current_bindings[0]["student_id"] if current_bindings else None)
+        row["school_id"]=row.get("school_id") or (current_bindings[0]["school_id"] if current_bindings else None)
+        row["platform_label"]=" / ".join(a["nickname"]+" · "+(a["user_code"] or "") for a in associations)
+        if row["bound_student_id"]: row["display_name"]=row["bound_student_id"]
+        elif scope not in {"accounts","legacy","students"}:
+            current=next((a for a in associations if a["current"]),None)
+            if current: row["display_name"]=current["nickname"]
+            elif not associations and scope=="devices": row["display_name"]="游客 · "+model_label(row)
     if q.get("snapshot"):
         with _snapshot_lock:
             cached=_snapshots.get(q["snapshot"])
@@ -331,10 +404,12 @@ def query_rows(db,q):
                 raise ApiError(409,"SNAPSHOT_EXPIRED","统计快照已失效，请刷新")
             if cached["owner"]!=q.get("_admin"):
                 raise ApiError(403,"FORBIDDEN","统计快照不属于当前管理员")
-            rows=[dict(r) for r in cached["rows"][scope]]
+            rows=copy.deepcopy(cached["rows"][scope])
             as_of=cached["asOf"]
+            start,end=business_day_bounds_ms(datetime.fromtimestamp(as_of/1000,BUSINESS_TIMEZONE).date())
     selected=[]
     for row in rows:
+        if q.get("userId") and q["userId"] not in [a["id"] for a in row.get("associated_accounts",[])]: continue
         status=q.get("status","")
         if status and row.get("account_status")!=status: continue
         if not status and not q.get("_allStatuses") and row.get("account_status")=="DELETED": continue
@@ -344,8 +419,8 @@ def query_rows(db,q):
             row.get("activation_source")=="NEW_INSTALL" and start<=(row.get("activation_at") or 0)<end): continue
         activity=q.get("activity")
         if activity:
-            threshold=start if activity=="today" else as_of-30*DAY
-            if not threshold<=(row.get("foreground_at") or 0)<=as_of: continue
+            threshold,until=activity_window(activity,as_of,q.get("day"))
+            if not any(threshold<=t<=until for t in row.get("_activity",[])): continue
         if q.get("profile")=="complete" and not (row.get("reservation_name") and row.get("reservation_student_id")): continue
         if q.get("profile")=="missing" and row.get("reservation_name") and row.get("reservation_student_id"): continue
         if any(q.get(key) and q[key].lower() not in str(row.get(field) or "").lower() for key,field in
@@ -369,11 +444,15 @@ def listing(db,q,decrypt_phone):
         if row.get("account_type")=="DEVICE": identifiers.append(row["id"])
         row["legacy_guest_codes"]=list(dict.fromkeys("GUEST-"+hashlib.sha256(str(v).encode()).hexdigest()[:10].upper() for v in identifiers if v))
         row["phone"]=decrypt_phone(row.pop("phone_encrypted",None))
+        for a in row.get("associated_accounts",[]):
+            a["phone"]=decrypt_phone(a.pop("phone_encrypted",None))
         if needle and needle not in " ".join(str(row.get(k) or "") for k in
-            ("display_name","short_code","phone","reservation_name","reservation_student_id","brand","model_raw","real_name","student_id","legacy_guest_codes")).lower(): continue
+            ("display_name","short_code","phone","reservation_name","reservation_student_id","brand","model_raw","real_name","student_id","legacy_guest_codes","bound_student_id","school_id","platform_label","associated_accounts")).lower(): continue
         if advanced and advanced!=row["id"]: continue
         # Never serialize installation proof hashes or raw device keys.
         for key in ("identity_secret_hash","device_key_hash"): row.pop(key,None)
+        for k in list(row):
+            if k.startswith("_"): row.pop(k)
         items.append(row)
     items.sort(key=lambda r:(r.get("first_evidence_at") or 0,r["id"]),reverse=True)
     limit,offset=parse_pagination(q,default_limit=50,max_limit=200)
@@ -385,23 +464,65 @@ def listing(db,q,decrypt_phone):
     result["timezone"]="Asia/Shanghai"
     return result
 
+def activity_window(activity,at,day=None):
+    date=datetime.fromtimestamp(at/1000,BUSINESS_TIMEZONE).date()
+    start,end=business_day_bounds_ms(date)
+    if activity=="day":
+        try: return business_day_bounds_ms(datetime.strptime(day,"%Y-%m-%d").date())[0],min(business_day_bounds_ms(datetime.strptime(day,"%Y-%m-%d").date())[1]-1,at)
+        except (TypeError,ValueError): raise ApiError(422,"INVALID_DAY","日期格式无效")
+    if activity=="month": start=business_day_bounds_ms(date.replace(day=1))[0]
+    elif activity=="7d": start-=6*DAY
+    elif activity=="30d": start-=29*DAY
+    elif activity=="5m": start=at-300000
+    return start,at
+
 def snapshot(db, owner=""):
-    at=now_ms()
-    definitions={
-        "activated":{"scope":"installations"},"devices":{"scope":"devices"},
-        "registered":{"scope":"accounts"},"guests":{"scope":"guests"},
-        "unidentified":{"scope":"installations","unidentified":"true"},
-        "todayActive":{"scope":"installations","activity":"today"},
-        "monthActive":{"scope":"installations","activity":"30d"},
-        "todayFirst":{"scope":"installations","firstActivation":"today"},
-        "legacy":{"scope":"legacy"},
-    }
-    key=uuid.uuid4().hex
-    with _snapshot_lock:
-        _snapshots[key]={"owner":owner,"asOf":at,"expires":at+600000,"rows":{
-            scope:query_rows(db,{"scope":scope,"asOf":str(at),"_allStatuses":True})[0]
-            for scope in ("accounts","guests","installations","devices","legacy")}}
-        while len(_snapshots)>16: _snapshots.popitem(last=False)
-    return {"asOf":at,"timezone":"Asia/Shanghai","metrics":{
-        name:{"count":len(query_rows(db,{**q,"asOf":str(at)})[0]),"filters":{**q,"asOf":str(at),"snapshot":key}}
-        for name,q in definitions.items()}}
+    # Own a read transaction when called outside an HTTP transaction.
+    own=not db.in_transaction
+    if own: db.execute("BEGIN")
+    try:
+        # Establish SQLite's snapshot before taking its timestamp.
+        db.execute("SELECT count(*) FROM installations").fetchone()
+        at=now_ms()
+        scopes=("accounts","guests","installations","devices","legacy","students")
+        captured={scope:query_rows(db,{"scope":scope,"asOf":str(at),"_allStatuses":True})[0] for scope in scopes}
+        coverage=db.execute("SELECT MIN(effective_at) FROM installation_events WHERE kind IN ('ACTIVATE','FOREGROUND')").fetchone()[0]
+        definitions={
+            "activated":{"scope":"installations"},"devices":{"scope":"devices"},
+            "activatedDevices":{"scope":"devices"},"registered":{"scope":"accounts"},
+            "boundStudents":{"scope":"students"},"guests":{"scope":"guests"},
+            "unidentified":{"scope":"installations","unidentified":"true"},
+            "todayActive":{"scope":"installations","activity":"today"},
+            "monthActive":{"scope":"installations","activity":"30d"},
+            "todayFirst":{"scope":"installations","firstActivation":"today"},"legacy":{"scope":"legacy"},
+        }
+        for scope,prefix in (("devices","device"),("accounts","account")):
+            for name,window in (("Recent","5m"),("Today","today"),("Week","7d"),("Month","30d"),("CalendarMonth","month")):
+                definitions[prefix+name]={"scope":scope,"activity":window}
+        definitions["activeUnidentified"]={"scope":"installations","activity":"today","unidentified":"true"}
+        key=uuid.uuid4().hex
+        with _snapshot_lock:
+            _snapshots[key]={"owner":owner,"asOf":at,"expires":at+600000,"rows":captured}
+            while len(_snapshots)>16: _snapshots.popitem(last=False)
+        metrics={}
+        for name,q in definitions.items():
+            filters={**q,"asOf":str(at),"snapshot":key}
+            metrics[name]={"count":len(query_rows(db,{**filters,"_admin":owner})[0]),"filters":filters}
+        account_coverage=db.execute("SELECT MIN(effective_at) FROM installation_events WHERE protocol_version>=3 AND kind IN ('ACTIVATE','FOREGROUND')").fetchone()[0]
+        trend=[]
+        start,_=business_day_bounds_ms(datetime.fromtimestamp(at/1000,BUSINESS_TIMEZONE).date())
+        for offset in range(29,-1,-1):
+            begin=start-offset*DAY;end=min(begin+DAY,at+1)
+            day=datetime.fromtimestamp(begin/1000,BUSINESS_TIMEZONE).strftime("%Y-%m-%d")
+            covered=coverage is not None and coverage<end
+            counts={scope:sum(any(begin<=t<end for t in row.get("_activity",[])) for row in captured[scope]
+                if row.get("account_status")!="DELETED") for scope in ("devices","accounts")}
+            trend.append({"day":day,"devices":counts["devices"] if covered else None,
+                "accounts":counts["accounts"] if account_coverage is not None and account_coverage<end else None,
+                "unidentified":sum(not r.get("device_id") and any(begin<=t<end for t in r.get("_activity",[])) for r in captured["installations"]) if covered else None,
+                "filters":{"scope":"devices","activity":"day","day":day,"asOf":str(at),"snapshot":key}})
+        return {"asOf":at,"timezone":"Asia/Shanghai","metrics":metrics,"trend":trend,
+            "coverage":{"firstTrustedEventAt":coverage,"firstAccountProtocolEventAt":account_coverage,"accountAttribution":"仅事件发生时可验证账号；旧事件不反推",
+                        "note":"仅覆盖已同意且成功收到的前台使用；未收到不代表无人使用。近30日按含今日的30个北京时间日。"}}
+    finally:
+        if own: db.commit()

@@ -420,17 +420,23 @@ const renderers = {
     const asOf = String(data.asOf || Date.now());
     const stats = await api("/api/v1/admin/identity-statistics");
     const groups = [
-      ["用户与设备", [
-        ["累计激活安装",stats.metrics.activated.count,"users",stats.metrics.activated.filters],
-        ["可识别设备",stats.metrics.devices.count,"users",stats.metrics.devices.filters],
-        ["注册账号",stats.metrics.registered.count,"users",stats.metrics.registered.filters],
-        ["游客记录（安装）",stats.metrics.guests.count,"users",stats.metrics.guests.filters],
-        ["仅有安装标识",stats.metrics.unidentified.count,"users",stats.metrics.unidentified.filters],
+      ["使用情况 · 按设备统计", [
+        ["今日活跃",stats.metrics.deviceToday.count,"users",stats.metrics.deviceToday.filters],
+        ["近 7 日活跃",stats.metrics.deviceWeek.count,"users",stats.metrics.deviceWeek.filters],
+        ["近 30 日活跃",stats.metrics.deviceMonth.count,"users",stats.metrics.deviceMonth.filters],
+        ["最近 5 分钟活跃",stats.metrics.deviceRecent.count,"users",stats.metrics.deviceRecent.filters],
       ]],
-      ["前台使用", [
-        ["今日活跃安装",stats.metrics.todayActive.count,"users",stats.metrics.todayActive.filters],
-        ["近 30 天活跃安装",stats.metrics.monthActive.count,"users",stats.metrics.monthActive.filters],
-        ["今日首次激活",stats.metrics.todayFirst.count,"users",stats.metrics.todayFirst.filters],
+      ["平台注册账号活跃", [
+        ["今日活跃账号",stats.metrics.accountToday.count,"users",stats.metrics.accountToday.filters],
+        ["近 7 日活跃账号",stats.metrics.accountWeek.count,"users",stats.metrics.accountWeek.filters],
+        ["近 30 日活跃账号",stats.metrics.accountMonth.count,"users",stats.metrics.accountMonth.filters],
+        ["本自然月活跃账号",stats.metrics.accountCalendarMonth.count,"users",stats.metrics.accountCalendarMonth.filters],
+      ]],
+      ["规模与身份", [
+        ["累计成功上报安装",stats.metrics.activated.count,"users",stats.metrics.activated.filters],
+        ["累计激活设备 / 可识别设备",stats.metrics.devices.count,"users",stats.metrics.devices.filters],
+        ["平台注册账号",stats.metrics.registered.count,"users",stats.metrics.registered.filters],
+        ["已绑定学校学号",stats.metrics.boundStudents.count,"users",stats.metrics.boundStudents.filters],
       ]],
       ["业务与处理", [
         ["体育预约 · 当前有效预约", data.activeReservations, "reservations", {status:"ACTIVE"}], ["体育预约 · 今日有效预约", data.todayReservations, "reservations", {date:new Date().toISOString().slice(0,10),status:"ACTIVE"}],
@@ -445,9 +451,11 @@ const renderers = {
       ]],
     ];
     content.innerHTML = `
-      ${groups.map(([title, metrics]) => `<h3 class="section-title">${title}</h3><div class="grid metric-grid">
+      ${groups.map(([title, metrics]) => `${title==="规模与身份"?renderUsageTrend(stats):""}<h3 class="section-title">${title}</h3><div class="grid metric-grid">
         ${metrics.map(([label, value, page, filter]) => page ? `<button class="card metric metric-link" data-action="metric-nav" data-page="${page}" data-filter="${escapeHtml(JSON.stringify(filter))}"><span>${label}</span><strong>${value}</strong></button>` : `<div class="card metric"><span>${label}</span><strong>${value}</strong></div>`).join("")}
       </div>`).join("")}
+      <details class="card identity-help"><summary>统计覆盖与排障</summary><p>可信前台事件覆盖起点：${formatTime(stats.coverage.firstTrustedEventAt)}。${escapeHtml(stats.coverage.note)}</p>
+      <div class="grid metric-grid">${[["今日活跃但设备未识别","activeUnidentified"],["游客记录（安装）","guests"],["仅有安装标识","unidentified"],["历史匿名资料","legacy"],["今日首次激活","todayFirst"]].map(([label,key])=>`<button class="card metric metric-link" data-action="metric-nav" data-page="users" data-filter="${escapeHtml(JSON.stringify(stats.metrics[key].filters))}"><span>${label}</span><strong>${stats.metrics[key].count}</strong></button>`).join("")}</div></details>
       ${identityHelp}
       <article class="card section-title">
         <h3>生产运行说明</h3>
@@ -1713,9 +1721,28 @@ $("#dialog-content").addEventListener("click", async (event) => {
 });
 
 
-const identityScopes={accounts:"注册账号",guests:"游客记录",installations:"安装实例",devices:"可识别设备",legacy:"历史匿名资料"};
+function identityRelations(r){
+ const accounts=r.associated_accounts||[];
+ return `<h4>学校与平台账号</h4>${accounts.length?accounts.map(a=>`<section class="relation-card"><strong>${escapeHtml(a.nickname)}</strong> · ${escapeHtml(a.user_code||"")} · ${a.current?"当前关联":"历史关联"}<p>${escapeHtml(a.phone||"手机号未填写")}</p>
+ ${(a.school_bindings||[]).length?a.school_bindings.map(b=>`<p><strong>学号 ${escapeHtml(b.student_id)}</strong> · 长沙理工大学 · ${b.current?"当前有效":b.status==="ACTIVE"?"有效绑定（当前未登录）":"历史 / 已解绑"}${b.conflict?' <span class="badge bad">多账号冲突待核实</span>':""}<br><span class="subtle">客户端${b.source==="CLIENT_EXISTING_BINDING"?"已有绑定确认":"学校登录成功"} · ${formatTime(b.received_at)}；非后台官方实名认证</span></p>`).join(""):'<p class="subtle">学校绑定未同步；预约填写的学号不作为学校绑定。</p>'}
+ <button type="button" class="ghost" data-identity-nav="${escapeHtml(JSON.stringify({scope:"accounts",uuid:a.id}))}">查看平台账号</button>
+ <button type="button" class="ghost" data-identity-nav="${escapeHtml(JSON.stringify({scope:"installations",userId:a.id}))}">该账号的安装与设备</button></section>`).join(""):'<p class="muted">尚无经过验证的平台账号关联。</p>'}
+ ${r.device_id?`<button type="button" class="ghost" data-identity-nav="${escapeHtml(JSON.stringify({scope:"devices",deviceId:r.device_id}))}">查看关联设备</button>`:""}`;
+}
+document.addEventListener("click",event=>{
+ const b=event.target.closest("[data-identity-nav]");if(!b)return;
+ const dialog=document.querySelector("#dialog");if(dialog?.open)dialog.close();
+ navigate("users",JSON.parse(b.dataset.identityNav)).catch(e=>toast(e.message,true));
+});
+function renderUsageTrend(stats){
+ const max=Math.max(1,...stats.trend.flatMap(d=>[d.devices||0,d.accounts||0]));
+ return `<article class="card usage-trend"><h3>近期日活趋势</h3><p class="muted">蓝色：设备 · 浅蓝：平台注册账号。灰色为缺数据，空白高度为该口径未收到事件。点击日期柱下钻。</p><div class="trend-days">
+ ${stats.trend.map(d=>`<div class="trend-day"><div class="trend-bars">${["devices","accounts"].map((kind,index)=>`<button class="trend-bar ${index?"account":""} ${d[kind]===null?"missing":""}" style="--bar:${d[kind]===null?12:Math.max(3,100*d[kind]/max)}%" data-action="metric-nav" data-page="users" data-filter="${escapeHtml(JSON.stringify({...d.filters,scope:kind}))}" title="${d.day} · ${kind==="devices"?"设备":"账号"}：${d[kind]===null?"缺数据":d[kind]}"><span>${d[kind]===null?"—":d[kind]}</span></button>`).join("")}</div><small>${d.day.slice(5)}</small></div>`).join("")}</div>
+ <p class="subtle">截至 ${formatTime(stats.asOf)} · 北京时间；近 30 日与本自然月分别统计。${escapeHtml(stats.coverage.note)} 账号事件覆盖起点：${formatTime(stats.coverage.firstAccountProtocolEventAt)}；尚未收到新版账号事件时，0 表示未观测到，不代表无人使用。</p></article>`;
+}
+const identityScopes={accounts:"注册账号",guests:"游客记录",installations:"安装实例",devices:"可识别设备",legacy:"历史匿名资料",students:"学校学号"};
 const sourceLabels={NEW_INSTALL:"首次激活",UPGRADE_BACKFILL:"升级补登记",LEGACY_REPORT:"历史上报",SERVICE_ONLY:"业务服务身份"};
-const identityHelp='<details class="card identity-help"><summary>统计口径</summary><p>累计激活安装按成功上报的稳定安装标识去重，包含历史上报；不是下载量或人数。游客记录是从未关联注册账号的已激活安装，退出登录不改变注册事实。可识别设备限应用签名、系统用户和设备范围，不能保证永久识别物理手机。</p><p>活跃按同意统计后的前台事件去重安装。今日首次激活不含升级补登记和历史迁移。日期统一为北京时间 UTC+8；默认排除已注销账号和测试安装。型号未上报与设备未识别分别保留。历史匿名资料不计入注册账号或游客安装。</p><p>查询按显示的截止时间筛选；注销、撤回和资料纠错可能影响可追溯明细。已删除的数据不会恢复成虚构明细。</p></details>';
+const identityHelp='<details class="card identity-help"><summary>统计口径</summary><p>累计激活安装按成功上报的稳定安装标识去重，包含历史上报；不是下载量或人数。游客记录是从未关联注册账号的已激活安装，退出登录不改变注册事实。可识别设备限应用签名、系统用户和设备范围，不能保证永久识别物理手机。</p><p>主要活跃按同意后的前台事件去重设备，账号活跃只归属事件发生时可验证的账号。未知设备的活跃安装单列，不按型号合并。累计激活设备与可识别设备目前是同一集合，合并展示，不凑不同数字。学校学号按有效学校标识＋学号去重，不是全国唯一编号。今日首次激活不含升级补登记和历史迁移。日期统一为北京时间 UTC+8；默认排除已注销账号和测试安装。型号未上报与设备未识别分别保留。历史匿名资料不计入注册账号或游客安装。</p><p>查询按显示的截止时间筛选；注销、撤回和资料纠错可能影响可追溯明细。已删除的数据不会恢复成虚构明细。</p></details>';
 async function renderIdentityRecords(filters={}){
  const scope=filters.scope||"accounts";
  state.filters={...filters,scope};state.page="users";
@@ -1736,18 +1763,18 @@ async function renderIdentityRecords(filters={}){
  <div class="toolbar">${fields.map(([key,label,hint])=>`<label>${label}<input name="${key}" value="${escapeHtml(f[key]||"")}" placeholder="${hint}"></label>`).join("")}</div>
  <details><summary>高级筛选</summary><div class="toolbar">
  ${account?`<label>账号状态<select name="status">${accountStatusFilterOptions(f.status)}</select></label><label>预约资料<select name="profile"><option value="">全部</option><option value="complete" ${f.profile==="complete"?"selected":""}>已填写</option><option value="missing" ${f.profile==="missing"?"selected":""}>未完整填写</option></select></label>`:""}
- <label>前台活跃<select name="activity"><option value="">不限</option><option value="today" ${f.activity==="today"?"selected":""}>今日</option><option value="30d" ${f.activity==="30d"?"selected":""}>近 30 天</option></select></label>
+ <label>前台活跃<select name="activity"><option value="">不限</option><option value="today" ${f.activity==="today"?"selected":""}>今日</option><option value="7d" ${f.activity==="7d"?"selected":""}>近 7 日</option><option value="30d" ${f.activity==="30d"?"selected":""}>近 30 日</option><option value="month" ${f.activity==="month"?"selected":""}>本自然月</option></select></label>
  <label>完整标识（排障）<input name="uuid" value="${escapeHtml(f.uuid||"")}"></label>
  <label>首次激活<select name="firstActivation"><option value="">不限</option><option value="today" ${f.firstActivation==="today"?"selected":""}>今日首次激活</option></select></label>
  <label>设备识别<select name="unidentified"><option value="">全部</option><option value="true" ${f.unidentified==="true"?"selected":""}>仅有安装标识</option></select></label></div></details>
  <div class="actions"><button class="primary">筛选</button><button type="button" class="ghost" data-identity-refresh>清除筛选 / 刷新</button><button type="button" class="ghost" data-identity-export>导出当前结果</button></div></form>
- <div class="drilldown-header"><p>共 <strong>${result.total}</strong> 条 · 每行代表${({accounts:"一个平台注册账号",guests:"一个未关联注册账号的安装",installations:"一个安装实例",devices:"一个可识别设备",legacy:"一条历史匿名资料"})[scope]}</p><span class="muted">截至 ${formatTime(result.asOf)}</span></div>
- ${result.items.length?`<div class="table-wrap identity-table"><table><thead><tr><th>${account?"用户 / 编号":"设备名称 / 短编号"}</th>${account?"<th>业务资料</th>":""}<th>设备与版本</th><th>首次有证据使用</th><th>最近前台活跃</th><th>${account?"账号状态":"记录来源"}</th><th>操作</th></tr></thead>
- <tbody>${result.items.map(row=>`<tr><td><strong>${escapeHtml(row.display_name)}</strong><div class="subtle">${escapeHtml(row.short_code||"未生成")}</div>${account?`<div>${escapeHtml(row.phone||"手机号未填写")}</div>`:""}</td>
+ <div class="drilldown-header"><p>共 <strong>${result.total}</strong> 条 · 每行代表${({accounts:"一个平台注册账号",guests:"一个未关联注册账号的安装",installations:"一个安装实例",devices:"一个可识别设备",legacy:"一条历史匿名资料",students:"一个学校与学号组合"})[scope]}</p><span class="muted">截至 ${formatTime(result.asOf)}</span></div>
+ ${result.items.length?`<div class="table-wrap identity-table"><table><thead><tr><th>${account?"学号 / 平台账号":"学号 / 账号 / 设备"}</th>${account?"<th>预约资料（非学校绑定）</th>":""}<th>设备与版本</th><th>首次有证据使用</th><th>最近前台活跃</th><th>${account?"账号状态":"记录来源"}</th><th>操作</th></tr></thead>
+ <tbody>${result.items.map(row=>`<tr><td><strong>${escapeHtml(row.display_name)}</strong><div class="subtle">${escapeHtml(row.bound_student_id?"长沙理工大学 · "+(row.platform_label||""):row.platform_label||row.short_code||"未生成")}</div>${account?`<div>${escapeHtml(row.phone||"手机号未填写")}</div>`:""}</td>
  ${account?`<td>${escapeHtml(row.reservation_name||"姓名未填写")}<div class="subtle">${escapeHtml(row.reservation_student_id||"学号未填写")}</div></td>`:""}
  <td>${escapeHtml(row.model_label||"型号未上报")}<div class="subtle">Android ${escapeHtml(row.android_version||"未上报")} · App ${escapeHtml(row.last_app_version_name||"未上报")}</div></td>
  <td>${formatTime(row.first_evidence_at)}</td><td>${formatTime(row.foreground_at)}</td><td>${account?accountBadge(row.account_status):`<span class="badge">${escapeHtml(sourceLabels[row.activation_source]||"已识别")}</span><div class="subtle">${row.device_id?"":"设备未识别"}</div>`}</td>
- <td><div class="actions">${account?`<button class="ghost" data-action="user-details" data-id="${escapeHtml(row.id)}">详情</button>${row.account_status!=="DELETED"?`<button class="ghost" data-identity-edit="${escapeHtml(JSON.stringify(row))}">编辑资料</button><button class="ghost" data-action="edit-user" data-user="${escapeHtml(JSON.stringify(row))}">状态</button>`:""}`:`<button class="ghost" data-identity-detail="${escapeHtml(JSON.stringify(row))}">详情</button>${scope==="devices"?`<button class="ghost" data-identity-mapping="${escapeHtml(JSON.stringify(row))}">备注 / 型号</button>`:""}`}</div></td></tr>`).join("")}</tbody></table></div>`:'<div class="empty card">没有符合条件的记录；可调整筛选或刷新。</div>'}
+ <td><div class="actions">${account?`<button class="ghost" data-identity-detail="${escapeHtml(JSON.stringify(row))}">详情 / 关联</button><button class="ghost" data-action="user-details" data-id="${escapeHtml(row.id)}">业务记录</button>${row.account_status!=="DELETED"?`<button class="ghost" data-identity-edit="${escapeHtml(JSON.stringify(row))}">编辑资料</button><button class="ghost" data-action="edit-user" data-user="${escapeHtml(JSON.stringify(row))}">状态</button>`:""}`:`<button class="ghost" data-identity-detail="${escapeHtml(JSON.stringify(row))}">详情</button>${scope==="devices"?`<button class="ghost" data-identity-mapping="${escapeHtml(JSON.stringify(row))}">备注 / 型号</button>`:""}`}</div></td></tr>`).join("")}</tbody></table></div>`:'<div class="empty card">没有符合条件的记录；可调整筛选或刷新。</div>'}
  ${drilldownPagination(result,"users",f)}${identityHelp}`;
 }
 renderers.users=renderIdentityRecords;
@@ -1766,7 +1793,8 @@ content.addEventListener("click",async event=>{
   if(b.hasAttribute("data-identity-refresh"))return navigate("users",{scope:state.filters.scope});
   if(b.hasAttribute("data-identity-export")){
    const result=await api("/api/v1/admin/identity-records?"+new URLSearchParams({...state.filters,export:"true"}));
-   const cols=[["display_name","显示名称"],["short_code","编号"],["phone","手机号"],["reservation_name","姓名"],["reservation_student_id","学号"],["model_label","型号"],["android_version","Android"],["last_app_version_name","App版本"],["first_evidence_at","首次有证据使用"],["foreground_at","最近前台活跃"],["activation_source","来源"]];
+   const cols=[["display_name","显示名称"],["short_code","编号"],["phone","手机号"],["reservation_name","姓名"],["reservation_student_id","预约填写学号"],["school_id","绑定学校"],["bound_student_id","绑定学号"],["platform_label","关联平台账号"],["association_export","全部关联及状态"],["model_label","型号"],["android_version","Android"],["last_app_version_name","App版本"],["first_evidence_at","首次有证据使用"],["foreground_at","最近前台活跃"],["activation_source","来源"]];
+   result.items.forEach(r=>r.association_export=(r.associated_accounts||[]).map(a=>[a.nickname,a.user_code,a.current?"当前账号":"历史账号",...(a.school_bindings||[]).map(b=>b.school_id+":"+b.student_id+" "+(b.current?"当前":"历史")+" "+b.source)].join(" | ")).join("; "));
    const cell=v=>'"'+String(v??"").replace(/^[=+\-@\t\r]/,"'$&").replaceAll('"','""')+'"';
    const csv="\ufeff"+[cols.map(x=>cell(x[1])).join(","),...result.items.map(r=>cols.map(([k])=>cell(k.endsWith("_at")?formatTime(r[k]):r[k])).join(","))].join("\r\n");
    const url=URL.createObjectURL(new Blob([csv],{type:"text/csv;charset=utf-8"}));const a=document.createElement("a");
@@ -1798,10 +1826,10 @@ content.addEventListener("click",async event=>{
   }
   if(b.dataset.identityDetail){
    const r=JSON.parse(b.dataset.identityDetail);
-   return openDialog("设备与安装详情",`<div class="stack"><h4>${escapeHtml(r.display_name)}</h4><p>${escapeHtml(r.short_code)} · ${escapeHtml(r.association_state||"可识别设备")}</p>
-   <h4>设备资料</h4><p>厂商 ${escapeHtml(r.manufacturer||"未上报")} · 品牌 ${escapeHtml(r.brand||"未上报")} · 原始型号 ${escapeHtml(r.model_raw||"未上报")}</p>
+   return openDialog("账号、学校与设备关联",`<div class="stack"><h4>${escapeHtml(r.display_name)}</h4><p>${escapeHtml(r.short_code)} · ${escapeHtml(r.association_state||"可识别设备")}</p>
+   ${identityRelations(r)}<h4>设备资料</h4><p>厂商 ${escapeHtml(r.manufacturer||"未上报")} · 品牌 ${escapeHtml(r.brand||"未上报")} · 原始型号 ${escapeHtml(r.model_raw||"未上报")}</p>
    <p>Android ${escapeHtml(r.android_version||"未上报")} / API ${escapeHtml(r.sdk_int||"未上报")} · App ${escapeHtml(r.last_app_version_name||"未上报")} (${escapeHtml(r.last_app_version_code||"—")})</p>
-   <h4>活动与来源</h4><p>首次有证据使用：${formatTime(r.first_evidence_at)}</p><p>首次收到上报：${formatTime(r.first_received_at)}</p><p>最近前台活跃：${formatTime(r.foreground_at)}</p><p>资料更新：${formatTime(r.profile_updated_at)}</p><p>${escapeHtml(sourceLabels[r.activation_source]||"历史未确认")} · ${r.withdrawn_at?"已撤回统计":"协议 "+r.protocol_version}</p>
+   <h4>活动与来源</h4><p>首次有证据使用：${formatTime(r.first_evidence_at)}</p><p>首次收到上报：${formatTime(r.first_received_at)}</p><p>最近前台活跃：${formatTime(r.foreground_at)}</p><p>资料更新：${formatTime(r.profile_updated_at)}</p><p>${escapeHtml(sourceLabels[r.activation_source]||"历史未确认")} · ${r.withdrawn_at?"已撤回统计":"协议 "+(r.protocol_version || "未上报")}</p>
    <h4>管理备注</h4><p>${escapeHtml(r.device_note||"未填写")}</p>
    <details><summary>技术信息</summary><p class="technical">安装标识：${escapeHtml(r.installation_id||"—")}<br>设备内部编号：${escapeHtml(r.device_id||"未识别")}<br>历史查询编号：${escapeHtml((r.legacy_guest_codes||[]).join("、")||"无")}<br>型号映射：${escapeHtml(r.model_mapping_source||"原始上报；未猜测营销名称")}</p></details></div>`,async()=>{},"关闭");
   }

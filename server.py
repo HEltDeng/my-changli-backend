@@ -3424,6 +3424,13 @@ class ApiHandler(BaseHTTPRequestHandler):
         match = re.fullmatch(r"/api/v1/feedback/([^/]+)", path)
         if method == "GET" and match:
             return self.feedback_get(match.group(1)), 200
+        if method == "POST" and path == "/api/v1/school-binding":
+            data=self.body_json()
+            with connection() as db:
+                user=self.optional_user(db)
+                result=identities.school_bindings.receive(db,data,user,identities.validate_identity,identities.associate)
+                identities.invalidate_snapshots()
+                return result,200
         if method == "POST" and path == "/api/v1/installation-events":
             data=self.body_json()
             with connection() as db:

@@ -176,3 +176,13 @@ dialog::backdrop { background: rgba(13,21,35,.48); }
 
 .identity-table th { white-space: nowrap; }
 .identity-table td { line-height: 1.5; }
+
+.relation-card {padding:14px;border:1px solid #e7ecf3;border-radius:14px;margin-bottom:10px}
+.usage-trend {margin:22px 0;padding:22px}
+.trend-days {display:grid;grid-template-columns:repeat(30,minmax(22px,1fr));gap:5px;overflow-x:auto;padding:20px 0 6px}
+.trend-bars {display:flex;gap:2px;align-items:flex-end;height:150px}
+.trend-bar {height:var(--bar);min-height:4px;position:relative;flex:1;border:0;background:#3265d9;border-radius:4px 4px 0 0;cursor:pointer;padding:0}
+.trend-bar.account {background:#abc8ff}
+.trend-bar.missing {background:repeating-linear-gradient(45deg,#e1e5ec,#e1e5ec 3px,#f3f5f8 3px,#f3f5f8 6px)}
+.trend-bar span {position:absolute;top:-18px;left:0;right:0;font-size:10px;color:#66748c}
+.trend-day small {font-size:10px;color:#66748c;white-space:nowrap}
