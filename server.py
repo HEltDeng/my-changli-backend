@@ -7,6 +7,7 @@ credentials.
 
 from __future__ import annotations
 
+import campus_activities
 import base64
 import hashlib
 import hmac
@@ -81,6 +82,7 @@ ACCOUNT_STATUSES = {"ACTIVE", "LIMITED", "DISABLED", "PENDING_DELETION", "DELETE
 USER_EVENT_RESULTS = {"SUCCESS", "FAILURE", "DENIED"}
 USER_EVENT_RETENTION_DAYS = 180
 ADMIN_ROLES = {
+    "ACTIVITY_PUBLISHER",
     "SUPER_ADMIN",
     "SPORTS_OPERATOR",
     "LOST_FOUND_OPERATOR",
@@ -88,6 +90,7 @@ ADMIN_ROLES = {
     "CONTENT_OPERATOR",
 }
 ROLE_PERMISSIONS = {
+    "ACTIVITY_PUBLISHER": {"ACTIVITY_VIEW", "ACTIVITY_MANAGE"},
     "SUPER_ADMIN": {"*", "USER_PURGE"},
     "SPORTS_OPERATOR": {"SPORTS_VIEW", "SPORTS_MANAGE", "SPORTS_PII_VIEW"},
     "LOST_FOUND_OPERATOR": {"LOST_VIEW", "LOST_MANAGE", "LOST_PII_VIEW"},
@@ -1201,6 +1204,7 @@ def initialize_database() -> None:
             raise RuntimeError("SQLite WAL mode could not be enabled")
         db.executescript((ROOT / "schema.sql").read_text(encoding="utf-8"))
         identities.migrate(db)
+        campus_activities.migrate(db)
         ensure_default_app_config(db)
         ensure_column(db, "venues", "operating_status", "TEXT NOT NULL DEFAULT 'OPEN'")
         ensure_column(db, "venues", "maintenance_note", "TEXT NOT NULL DEFAULT ''")
@@ -2110,7 +2114,9 @@ def require_admin_path_access(user: sqlite3.Row, method: str, path: str) -> None
     if not bool(user["admin_enabled"]):
         raise ApiError(403, "ADMIN_DISABLED", "管理员账号已停用")
     allowed = False
-    if role == "SPORTS_OPERATOR":
+    if role == "ACTIVITY_PUBLISHER":
+        allowed = path == "/api/v1/admin/activities" or path.startswith("/api/v1/admin/activities/")
+    elif role == "SPORTS_OPERATOR":
         allowed = any(token in path for token in ("/venues", "/inventory", "/reservations", "/reservation-rules", "/overview/sports"))
     elif role == "LOST_FOUND_OPERATOR":
         allowed = "/lost-found" in path or "/overview/lost-found" in path
@@ -2426,6 +2432,8 @@ def serialize_user(user: sqlite3.Row) -> dict[str, Any]:
         "reservationProfileUpdatedAt": user["reservation_profile_updated_at"],
         "adminPermissions": sorted(admin_permissions(user)) if user["role"] == "ADMIN" else [],
         "adminRole": admin_role(user) if user["role"] == "ADMIN" else None,
+        "activityCollegeId": user["activity_college_id"] if user["role"] == "ADMIN" else None,
+        "activityPublishScope": user["activity_publish_scope"] if user["role"] == "ADMIN" else None,
         "accountStatus": user["account_status"],
         "accountStatusReason": user["account_status_reason"],
         "accountStatusChangedAt": user["account_status_changed_at"],
@@ -2702,6 +2710,8 @@ def delete_user_account_data(
         "DELETE FROM reservation_events WHERE user_id=? OR actor_user_id=?",
         (user_id, user_id),
     )
+    db.execute("DELETE FROM activity_registrations WHERE user_id=?", (user_id,))
+    db.execute("DELETE FROM activity_profiles WHERE user_id=?", (user_id,))
     db.execute("DELETE FROM reservations WHERE user_id=?", (user_id,))
     db.execute("DELETE FROM sessions WHERE user_id=?", (user_id,))
 
@@ -2809,6 +2819,8 @@ def purge_deleted_user(
         "WHERE user_id=? OR actor_user_id=?",
         (user_id, user_id),
     )
+    db.execute("DELETE FROM activity_registrations WHERE user_id=?", (user_id,))
+    db.execute("DELETE FROM activity_profiles WHERE user_id=?", (user_id,))
     db.execute("DELETE FROM reservations WHERE user_id=?", (user_id,))
     db.execute("DELETE FROM sessions WHERE user_id=?", (user_id,))
     db.execute("UPDATE feedback SET handled_by=NULL WHERE handled_by=?", (user_id,))
@@ -3258,7 +3270,7 @@ class ApiHandler(BaseHTTPRequestHandler):
 
     def send_admin_asset(self, path: str) -> None:
         relative = "index.html" if path in {"/admin", "/admin/"} else path.removeprefix("/admin/")
-        allowed_assets = {"index.html", "app.js", "styles.css", "assets/my-changli-app-icon.png"}
+        allowed_assets = {"index.html", "app.js", "activities.js", "styles.css", "assets/my-changli-app-icon.png"}
         if relative not in allowed_assets:
             raise ApiError(404, "NOT_FOUND", "管理后台资源不存在")
         target = (ADMIN_WEB / relative).resolve()
@@ -3313,6 +3325,10 @@ class ApiHandler(BaseHTTPRequestHandler):
         self.wfile.write(content)
 
     def route(self, method: str, path: str, query: dict[str, str]) -> tuple[Any, int]:
+        if path == "/api/v1/activities" or path.startswith("/api/v1/activities/") or path == "/api/v1/admin/activities" or path.startswith("/api/v1/admin/activities/"):
+            import types
+            host = types.SimpleNamespace(connection=connection, require_admin_path_access=require_admin_path_access, require_account_operation=require_account_operation, encrypt_phone=encrypt_phone, decrypt_phone=decrypt_phone, write_audit=write_audit)
+            return campus_activities.route(self, method, path, query, host)
         if method == "GET" and path == "/health":
             return {"status": "ok"}, 200
         if method == "GET" and path == "/ready":
@@ -5069,6 +5085,7 @@ class ApiHandler(BaseHTTPRequestHandler):
                     {
                         "id": row["id"], "username": row["username"],
                         "nickname": row["nickname"], "adminRole": admin_role(row),
+                        "activityCollegeId": row["activity_college_id"], "activityPublishScope": row["activity_publish_scope"],
                         "enabled": bool(row["admin_enabled"]), "createdAt": row["created_at"],
                     }
                     for row in db.execute("SELECT * FROM users WHERE role='ADMIN' ORDER BY created_at")
@@ -5125,6 +5142,10 @@ class ApiHandler(BaseHTTPRequestHandler):
                 role_name = str(data.get("adminRole", "")).upper()
                 if role_name not in ADMIN_ROLES - {"SUPER_ADMIN"}:
                     raise ApiError(400, "INVALID_ADMIN_ROLE", "运营管理员角色无效")
+                college = required_text(data, "activityCollegeId", 120) if role_name == "ACTIVITY_PUBLISHER" else None
+                publish_scope = data.get("activityPublishScope", "COLLEGE")
+                if publish_scope not in {"COLLEGE", "SCHOOL"}:
+                    raise ApiError(422,"INVALID_SCOPE","活动发布范围无效")
                 if len(password) < 12:
                     raise ApiError(400, "WEAK_PASSWORD", "管理员密码至少 12 位")
                 digest, salt = password_record(password)
@@ -5149,6 +5170,7 @@ class ApiHandler(BaseHTTPRequestHandler):
                     )
                 except sqlite3.IntegrityError as exc:
                     raise ApiError(409, "ADMIN_EXISTS", "管理员用户名已存在") from exc
+                db.execute("UPDATE users SET activity_college_id=?,activity_publish_scope=? WHERE id=?", (college,publish_scope,admin_id))
                 write_audit(db, admin["id"], "ADMIN_CREATED", "ADMIN", admin_id, {"adminRole": role_name})
                 return {"id": admin_id, "username": username, "nickname": nickname, "adminRole": role_name, "enabled": True}, 201
 
@@ -5165,6 +5187,10 @@ class ApiHandler(BaseHTTPRequestHandler):
                     raise ApiError(400, "INVALID_ADMIN_ROLE", "管理员角色无效")
                 enabled = 1 if bool(data.get("enabled", bool(target["admin_enabled"]))) else 0
                 nickname = str(data.get("nickname", target["nickname"] or "")).strip()[:40] or target["nickname"]
+                college = required_text(data, "activityCollegeId", 120) if role_name == "ACTIVITY_PUBLISHER" and "activityCollegeId" in data else target["activity_college_id"]
+                publish_scope = data.get("activityPublishScope", target["activity_publish_scope"])
+                if role_name == "ACTIVITY_PUBLISHER" and (not college or publish_scope not in {"COLLEGE","SCHOOL"}):
+                    raise ApiError(422,"INVALID_SCOPE","请绑定学院和有效发布范围")
                 target_role = admin_role(target)
                 target_enabled = bool(target["admin_enabled"])
                 demoting_or_disabling_super = (
@@ -5186,8 +5212,8 @@ class ApiHandler(BaseHTTPRequestHandler):
                             "系统必须至少保留一个启用的超级管理员，无法停用或降级最后一个超级管理员",
                         )
                 db.execute(
-                    "UPDATE users SET nickname=?,admin_role=?,admin_enabled=? WHERE id=?",
-                    (nickname, role_name, enabled, target["id"]),
+                    "UPDATE users SET nickname=?,admin_role=?,admin_enabled=?,activity_college_id=?,activity_publish_scope=? WHERE id=?",
+                    (nickname, role_name, enabled, college, publish_scope, target["id"]),
                 )
                 if not enabled:
                     db.execute("DELETE FROM sessions WHERE user_id=?", (target["id"],))

@@ -40,6 +40,10 @@
         <span class="nav-group">资料库</span>
         <button data-page="resources" data-roles="SUPER_ADMIN LIBRARY_OPERATOR">资料管理</button>
         <button data-page="resourceComplaints" data-roles="SUPER_ADMIN LIBRARY_OPERATOR">资料投诉 / 举报处理</button>
+        <span class="nav-group">活动管理</span>
+        <button data-page="activities" data-roles="SUPER_ADMIN ACTIVITY_PUBLISHER">活动列表</button>
+        <button data-page="activityEditor" data-roles="SUPER_ADMIN ACTIVITY_PUBLISHER">发布活动</button>
+        <button data-page="activityRegistrations" data-roles="SUPER_ADMIN ACTIVITY_PUBLISHER">报名记录</button>
         <span class="nav-group">内容运营</span>
         <button data-page="announcements" data-roles="SUPER_ADMIN CONTENT_OPERATOR">APP 公告</button>
         <button data-page="websiteAnnouncements" data-roles="SUPER_ADMIN CONTENT_OPERATOR">网站公告</button>
@@ -74,5 +78,6 @@
     </form>
   </dialog>
   <script src="/admin/app.js"></script>
+  <script src="/admin/activities.js"></script>
 </body>
 </html>

@@ -288,3 +288,5 @@ dialog::backdrop { background: rgba(13,21,35,.48); }
 .trend-bar.missing {background:repeating-linear-gradient(45deg,#e1e5ec,#e1e5ec 3px,#f3f5f8 3px,#f3f5f8 6px)}
 .trend-bar span {position:absolute;top:-18px;left:0;right:0;font-size:10px;color:#66748c}
 .trend-day small {font-size:10px;color:#66748c;white-space:nowrap}
+
+.activity-description { white-space: pre-wrap; overflow-wrap: anywhere; }

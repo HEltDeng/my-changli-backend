@@ -3,3 +3,5 @@ cryptography==46.0.7
 pillow==12.3.0
 pycparser==3.0
 waitress==3.0.2
+openpyxl==3.1.5
+et_xmlfile==2.0.0

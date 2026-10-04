@@ -3,7 +3,7 @@ const isolatedCandidate = ["127.0.0.1", "localhost", "candidate.mychangliapp.cn"
 if (isolatedCandidate) {
   document.title = "我的长理 · 隔离测试后台";
   document.querySelector("#login-view h1").textContent = "隔离测试后台";
-  document.querySelector("#login-view .muted").textContent = "仅使用专用测试账号与合成资料，不连接生产数据库。";
+  document.querySelector("#login-view .muted").textContent = "仅使用专用预览账号和隔离预览数据，不连接生产数据库。";
   document.querySelector(".brand-row span").textContent = "隔离测试后台";
   document.querySelector(".topbar .eyebrow").textContent = "ISOLATED CANDIDATE";
 }
@@ -373,7 +373,7 @@ async function showApp() {
     // A fresh administrator session always starts from the role-scoped
     // dashboard.  Reusing the previous role's route can otherwise land an
     // operator on a detail page before the workspace context is established.
-    state.page = "overview";
+    state.page = role === "ACTIVITY_PUBLISHER" ? "activities" : "overview";
     const activePage = document.querySelector(`#nav button[data-page="${CSS.escape(state.page)}"]`);
     if (!activePage || activePage.classList.contains("hidden")) state.page = "overview";
     $("#admin-identity").textContent = `当前管理员：${state.admin.nickname || state.admin.id} · ${roleLabels[role] || role}`;
@@ -1277,15 +1277,15 @@ content.addEventListener("click", async (event) => {
       return renderers.reservations({...state.filters, page: button.dataset.page});
     }
     if (action === "create-admin") {
-      return openDialog("创建运营管理员", `<div class="stack"><label>用户名<input name="username" maxlength="48" required></label><label>显示名称<input name="nickname" maxlength="40" required></label><label>初始密码<input name="password" type="password" minlength="12" required></label><label>角色<select name="adminRole"><option value="SPORTS_OPERATOR">体育预约运营管理员</option><option value="LOST_FOUND_OPERATOR">失物招领运营管理员</option><option value="LIBRARY_OPERATOR">资料库运营管理员</option><option value="CONTENT_OPERATOR">内容运营管理员</option></select></label><p class="muted">权限由服务端按角色强制执行，隐藏菜单不等于授权。</p></div>`, async form => {
+      return openDialog("创建运营管理员", `<div class="stack"><label>用户名<input name="username" maxlength="48" required></label><label>显示名称<input name="nickname" maxlength="40" required></label><label>初始密码<input name="password" type="password" minlength="12" required></label><label>角色<select name="adminRole"><option value="ACTIVITY_PUBLISHER">活动发布老师</option><option value="SPORTS_OPERATOR">体育预约运营管理员</option><option value="LOST_FOUND_OPERATOR">失物招领运营管理员</option><option value="LIBRARY_OPERATOR">资料库运营管理员</option><option value="CONTENT_OPERATOR">内容运营管理员</option></select></label><label>所属学院（活动老师必填）<input name="activityCollegeId" maxlength="120"></label><label>活动发布范围<select name="activityPublishScope"><option value="COLLEGE">本学院</option><option value="SCHOOL">全校可见</option></select></label><p class="muted">权限由服务端按角色强制执行，隐藏菜单不等于授权。</p></div>`, async form => {
         await api("/api/v1/admin/admins", {method:"POST", body:Object.fromEntries(form)});
         toast("运营管理员已创建"); renderers.admins();
       });
     }
     if (action === "edit-admin") {
       const item = JSON.parse(button.dataset.admin);
-      return openDialog("编辑管理员", `<div class="stack"><p><strong>${escapeHtml(item.nickname)}</strong> · ${escapeHtml(item.username)}</p><label>显示名称<input name="nickname" maxlength="40" value="${escapeHtml(item.nickname)}"></label><label>角色<select name="adminRole">${["SUPER_ADMIN","SPORTS_OPERATOR","LOST_FOUND_OPERATOR","LIBRARY_OPERATOR","CONTENT_OPERATOR"].map(role => `<option value="${role}" ${role===item.adminRole?"selected":""}>${roleLabels[role] || role}</option>`).join("")}</select></label><label class="checkbox-row"><input type="checkbox" name="enabled" ${item.enabled?"checked":""}> 启用此管理员</label><label>重置密码（留空不修改）<input type="password" name="password" minlength="12"></label><p class="muted">不能停用或降级最后一个启用的超级管理员；不会修改当前登录账号自身。</p></div>`, async form => {
-        await api(`/api/v1/admin/admins/${encodeURIComponent(item.id)}`, {method:"PATCH",body:{nickname:form.get("nickname"),adminRole:form.get("adminRole"),enabled:form.has("enabled")}});
+      return openDialog("编辑管理员", `<div class="stack"><p><strong>${escapeHtml(item.nickname)}</strong> · ${escapeHtml(item.username)}</p><label>显示名称<input name="nickname" maxlength="40" value="${escapeHtml(item.nickname)}"></label><label>角色<select name="adminRole">${["SUPER_ADMIN","ACTIVITY_PUBLISHER","SPORTS_OPERATOR","LOST_FOUND_OPERATOR","LIBRARY_OPERATOR","CONTENT_OPERATOR"].map(role => `<option value="${role}" ${role===item.adminRole?"selected":""}>${roleLabels[role] || role}</option>`).join("")}</select></label><label>所属学院<input name="activityCollegeId" value="${escapeHtml(item.activityCollegeId||'')}"></label><label>活动发布范围<select name="activityPublishScope"><option value="COLLEGE">本学院</option><option value="SCHOOL" ${item.activityPublishScope==='SCHOOL'?'selected':''}>全校可见</option></select></label><label class="checkbox-row"><input type="checkbox" name="enabled" ${item.enabled?"checked":""}> 启用此管理员</label><label>重置密码（留空不修改）<input type="password" name="password" minlength="12"></label><p class="muted">不能停用或降级最后一个启用的超级管理员；不会修改当前登录账号自身。</p></div>`, async form => {
+        await api(`/api/v1/admin/admins/${encodeURIComponent(item.id)}`, {method:"PATCH",body:{nickname:form.get("nickname"),adminRole:form.get("adminRole"),activityCollegeId:form.get("activityCollegeId"),activityPublishScope:form.get("activityPublishScope"),enabled:form.has("enabled")}});
         if (form.get("password")) await api(`/api/v1/admin/admins/${encodeURIComponent(item.id)}/reset-password`, {method:"POST",body:{password:form.get("password")}});
         toast("管理员已更新"); renderers.admins();
       });

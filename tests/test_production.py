@@ -601,7 +601,7 @@ class ProductionUnitTest(unittest.TestCase):
         self.assertEqual("12.3.0", locked["pillow"])
         self.assertEqual("3.0.2", locked["waitress"])
         self.assertEqual(
-            {"cffi", "cryptography", "pillow", "pycparser", "waitress"},
+            {"cffi", "cryptography", "pillow", "pycparser", "waitress", "openpyxl", "et_xmlfile"},
             set(locked),
         )
 

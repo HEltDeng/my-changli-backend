@@ -19,7 +19,7 @@ def main():
     if state.exists() and any(state.iterdir()) and not marker.exists():
         parser.error("Refusing a nonempty directory without the candidate marker")
     state.mkdir(parents=True, exist_ok=True)
-    marker.write_text("Synthetic candidate data only. No production import.\n", encoding="utf-8")
+    marker.write_text("Isolated preview data. No production import.\n", encoding="utf-8")
     credentials = state / "local-test-access.json"
     if not credentials.exists():
         fd = os.open(credentials, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
