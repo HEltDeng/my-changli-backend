@@ -5971,6 +5971,7 @@ class ApiHandler(BaseHTTPRequestHandler):
                 for parameter, column, allowed in (
                     ("module", "e.module", None),
                     ("eventType", "e.event_type", None),
+                    ("accountType", "u.account_type", {"PHONE", "DEVICE"}),
                     ("result", "e.result", USER_EVENT_RESULTS),
                     ("risk", "e.risk_flag", None),
                 ):
@@ -6014,7 +6015,7 @@ class ApiHandler(BaseHTTPRequestHandler):
                     values,
                 ).fetchone()["count"]
                 rows = db.execute(
-                    """SELECT e.*,u.nickname,u.phone_masked,u.account_status
+                    """SELECT e.*,u.nickname,u.phone_masked,u.account_status,u.account_type
                        FROM user_behavior_events e
                        LEFT JOIN users u ON u.id=e.user_id WHERE """ + " AND ".join(clauses) +
                     " ORDER BY e.created_at DESC LIMIT ? OFFSET ?",

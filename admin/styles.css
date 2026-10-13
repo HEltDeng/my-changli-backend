@@ -183,6 +183,7 @@ dialog::backdrop { background: rgba(13,21,35,.48); }
 .trend-bars {display:flex;gap:2px;align-items:flex-end;height:150px}
 .trend-bar {min-height:2px;position:relative;flex:1;border:0;background:#3265d9;border-radius:4px 4px 0 0;cursor:pointer;padding:0}
 .trend-bar.account {background:#abc8ff}
+.trend-bar.device {background:#278b74}
 /* CSP forbids inline styles. Quantized heights keep the chart under style-src 'self'. */
 .trend-height-0 {height:0%}
 .trend-height-1 {height:1%}

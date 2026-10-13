@@ -19,6 +19,15 @@ from runtime_config import RUNTIME
 
 PROTOCOL = 2
 DAY = 86400000
+# Actual service actions only. Background APP_ACTIVE and administrator actions
+# must never become evidence of a person's foreground use.
+SERVICE_EVENTS = (
+    'LOGIN_SUCCESS', 'USER_REGISTER', 'RESERVATION_CREATED', 'RESERVATION_CANCELLED',
+    'LOST_FOUND_PUBLISHED', 'LOST_FOUND_EDITED', 'LOST_FOUND_DELETED',
+    'LOST_FOUND_FAVORITED', 'LOST_FOUND_UNFAVORITED', 'LOST_FOUND_CLAIMED',
+    'LOST_FOUND_REPORTED', 'RESOURCE_VIEWED', 'RESOURCE_FAVORITED',
+    'RESOURCE_UNFAVORITED', 'RESOURCE_COMPLAINT_SUBMITTED', 'FEEDBACK_SUBMITTED',
+)
 _snapshots = OrderedDict()
 _snapshot_lock = threading.RLock()
 
@@ -292,6 +301,8 @@ def query_rows(db,q):
     except (TypeError,ValueError): raise ApiError(422,"INVALID_TIME","统计时间无效")
     if as_of>now_ms()+300000 or as_of<0: raise ApiError(422,"INVALID_TIME","统计时间无效")
     if q.get("activity","") not in {"","5m","today","7d","30d","month","day"}: raise ApiError(422,"INVALID_FILTER","活跃范围无效")
+    if q.get("activitySource", "foreground") not in {"foreground", "account", "service", "login"}:
+        raise ApiError(422,"INVALID_FILTER","使用记录来源无效")
     start,end=business_day_bounds_ms(datetime.fromtimestamp(as_of/1000,BUSINESS_TIMEZONE).date())
     rows=[]
     installs=[dict(r) for r in db.execute("""SELECT i.*,d.display_model,d.model_mapping_source,d.admin_note AS device_note
@@ -311,6 +322,22 @@ def query_rows(db,q):
     event_times={}
     account_times={}
     device_times={}
+    service_times={}
+    account_service_times={}
+    login_times={}
+    service_events=db.execute("""SELECT e.user_id,e.installation_id,e.created_at,e.event_type,u.account_type
+        FROM user_behavior_events e JOIN users u ON u.id=e.user_id
+        LEFT JOIN installations i ON i.installation_id=e.installation_id
+        WHERE u.role='USER' AND u.account_status!='DELETED' AND e.result='SUCCESS'
+        AND e.client_source='APP' AND e.created_at<=? AND COALESCE(i.is_test,0)=0
+        AND e.event_type IN ("""+','.join('?' for _ in SERVICE_EVENTS)+')', (as_of,*SERVICE_EVENTS))
+    for e in service_events:
+        if e['installation_id']:
+            service_times.setdefault(e['installation_id'],[]).append(e['created_at'])
+        if e['account_type']=='PHONE':
+            account_service_times.setdefault(e['user_id'],[]).append(e['created_at'])
+            if e['event_type']=='LOGIN_SUCCESS':
+                login_times.setdefault(e['user_id'],[]).append(e['created_at'])
     for e in events:
         event_times.setdefault(e["installation_id"],[]).append(e["effective_at"])
         if e["event_user_id"]: account_times.setdefault(e["event_user_id"],[]).append(e["effective_at"])
@@ -321,6 +348,8 @@ def query_rows(db,q):
         if did: device_times.setdefault(did,[]).append(e["effective_at"])
     for i in installs:
         i["_activity"]=event_times.get(i["installation_id"],[])
+        i['_service_activity']=service_times.get(i['installation_id'],[])
+        i['last_service_at']=max(i['_service_activity'],default=None)
         i["foreground_at"]=active.get(i["installation_id"])
         i["model_label"]=model_label(i)
     if scope in {"accounts","legacy"}:
@@ -336,6 +365,10 @@ def query_rows(db,q):
             row.update(id=u["id"],display_name=u["nickname"] if scope=="accounts" else "游客 · 型号未上报",
                 short_code=u["user_code"],first_evidence_at=min([i["first_evidence_at"] for i in associated if i["first_evidence_at"]],default=None),
                 foreground_at=max(account_times.get(u["id"],[]),default=None), _activity=account_times.get(u["id"],[]),
+                _account_activity=account_times.get(u['id'],[])+account_service_times.get(u['id'],[]),
+                _login_activity=login_times.get(u['id'],[]),
+                last_service_at=max(account_service_times.get(u['id'],[]),default=None),
+                last_login_at=max(login_times.get(u['id'],[]),default=None),
                 _installation_ids=[i["installation_id"] for i in associated],
                 installation_count=len(associated),device_count=len({i["device_id"] for i in associated if i["device_id"]}),
                 association_state="已验证安装关联" if associated else "历史关联未确认")
@@ -353,7 +386,7 @@ def query_rows(db,q):
                 "_installation_ids":[i["installation_id"] for i in items]})
     elif scope!="students":
         for i in installs:
-            if not i["activation_at"] or i["activation_at"]>as_of: continue
+            if not q.get('_includeService') and q.get('includeService')!='true' and (not i["activation_at"] or i["activation_at"]>as_of): continue
             if scope=="guests" and i["ever_registered"]: continue
             rows.append({**i,"id":i["installation_id"],"short_code":code("I",i["installation_id"]),
                 "display_name":"游客 · "+model_label(i) if not i["ever_registered"] else model_label(i),
@@ -418,6 +451,8 @@ def query_rows(db,q):
             start,end=business_day_bounds_ms(datetime.fromtimestamp(as_of/1000,BUSINESS_TIMEZONE).date())
     selected=[]
     for row in rows:
+        if scope in {'installations','guests'} and q.get('includeService')!='true' and not q.get('_includeService'):
+            if not row.get('activation_at') or row['activation_at']>as_of: continue
         if q.get("userId") and q["userId"] not in [a["id"] for a in row.get("associated_accounts",[])]: continue
         status=q.get("status","")
         if status and row.get("account_status")!=status: continue
@@ -426,10 +461,17 @@ def query_rows(db,q):
         if q.get("unidentified")=="true" and row.get("device_id"): continue
         if q.get("firstActivation")=="today" and not (
             row.get("activation_source")=="NEW_INSTALL" and start<=(row.get("activation_at") or 0)<end): continue
+        if q.get('created'):
+            if q['created'] not in {'today','7d'}: raise ApiError(422,'INVALID_FILTER','注册时间范围无效')
+            created_start,_=activity_window(q['created'],as_of)
+            if not created_start<=row.get('created_at',0)<=as_of: continue
+        if q.get('profileReported')=='yes' and not row.get('model_raw'): continue
+        if q.get('profileReported')=='no' and row.get('model_raw'): continue
         activity=q.get("activity")
         if activity:
             threshold,until=activity_window(activity,as_of,q.get("day"))
-            if not any(threshold<=t<=until for t in row.get("_activity",[])): continue
+            field={'foreground':'_activity','account':'_account_activity','service':'_service_activity','login':'_login_activity'}[q.get('activitySource','foreground')]
+            if not any(threshold<=t<=until for t in row.get(field,[])): continue
         if q.get("profile")=="complete" and not (row.get("reservation_name") and row.get("reservation_student_id")): continue
         if q.get("profile")=="missing" and row.get("reservation_name") and row.get("reservation_student_id"): continue
         if any(q.get(key) and q[key].lower() not in str(row.get(field) or "").lower() for key,field in
@@ -494,8 +536,8 @@ def snapshot(db, owner=""):
         db.execute("SELECT count(*) FROM installations").fetchone()
         at=now_ms()
         scopes=("accounts","guests","installations","devices","legacy","students")
-        captured={scope:query_rows(db,{"scope":scope,"asOf":str(at),"_allStatuses":True})[0] for scope in scopes}
-        coverage=db.execute("SELECT MIN(effective_at) FROM installation_events WHERE kind IN ('ACTIVATE','FOREGROUND')").fetchone()[0]
+        captured={scope:query_rows(db,{"scope":scope,"asOf":str(at),"_allStatuses":True,"_includeService":True})[0] for scope in scopes}
+        coverage=min((t for r in captured['installations'] for t in r.get('_activity',[])),default=None)
         definitions={
             "activated":{"scope":"installations"},"devices":{"scope":"devices"},
             "activatedDevices":{"scope":"devices"},"registered":{"scope":"accounts"},
@@ -508,6 +550,13 @@ def snapshot(db, owner=""):
         for scope,prefix in (("devices","device"),("accounts","account")):
             for name,window in (("Recent","5m"),("Today","today"),("Week","7d"),("Month","30d"),("CalendarMonth","month")):
                 definitions[prefix+name]={"scope":scope,"activity":window}
+                if scope=='accounts': definitions[prefix+name]['activitySource']='account'
+                definitions['service'+name]={'scope':'installations','includeService':'true','activitySource':'service','activity':window}
+        definitions['registeredToday']={'scope':'accounts','created':'today'}
+        definitions['registeredWeek']={'scope':'accounts','created':'7d'}
+        definitions['loginToday']={'scope':'accounts','activity':'today','activitySource':'login'}
+        definitions['profileReported']={'scope':'installations','includeService':'true','profileReported':'yes'}
+        definitions['profileMissing']={'scope':'installations','includeService':'true','profileReported':'no'}
         definitions["activeUnidentified"]={"scope":"installations","activity":"today","unidentified":"true"}
         key=uuid.uuid4().hex
         with _snapshot_lock:
@@ -517,21 +566,28 @@ def snapshot(db, owner=""):
         for name,q in definitions.items():
             filters={**q,"asOf":str(at),"snapshot":key}
             metrics[name]={"count":len(query_rows(db,{**filters,"_admin":owner})[0]),"filters":filters}
-        account_coverage=db.execute("SELECT MIN(effective_at) FROM installation_events WHERE protocol_version>=3 AND kind IN ('ACTIVATE','FOREGROUND')").fetchone()[0]
+        account_coverage=db.execute("""SELECT MIN(e.effective_at) FROM installation_events e JOIN installations i ON i.installation_id=e.installation_id
+            WHERE e.protocol_version>=3 AND e.kind IN ('ACTIVATE','FOREGROUND') AND i.is_test=0
+            AND e.effective_at<=? AND e.received_at<=?""",(at,at)).fetchone()[0]
+        service_coverage=min((t for r in captured['installations'] for t in r.get('_service_activity',[])),default=None)
+        account_activity_coverage=min((t for r in captured['accounts'] if r.get('account_status')!='DELETED' for t in r.get('_account_activity',[])),default=None)
         trend=[]
         start,_=business_day_bounds_ms(datetime.fromtimestamp(at/1000,BUSINESS_TIMEZONE).date())
         for offset in range(29,-1,-1):
             begin=start-offset*DAY;end=min(begin+DAY,at+1)
             day=datetime.fromtimestamp(begin/1000,BUSINESS_TIMEZONE).strftime("%Y-%m-%d")
             covered=coverage is not None and coverage<end
-            counts={scope:sum(any(begin<=t<end for t in row.get("_activity",[])) for row in captured[scope]
+            counts={scope:sum(any(begin<=t<end for t in row.get('_account_activity' if scope=='accounts' else '_activity',[])) for row in captured[scope]
                 if row.get("account_status")!="DELETED") for scope in ("devices","accounts")}
             trend.append({"day":day,"devices":counts["devices"] if covered else None,
-                "accounts":counts["accounts"] if account_coverage is not None and account_coverage<end else None,
+                "accounts":counts["accounts"] if account_activity_coverage is not None and account_activity_coverage<end else None,
+                'serviceInstallations':sum(any(begin<=t<end for t in row.get('_service_activity',[])) for row in captured['installations']) if service_coverage is not None and service_coverage<end else None,
                 "unidentified":sum(not r.get("device_id") and any(begin<=t<end for t in r.get("_activity",[])) for r in captured["installations"]) if covered else None,
                 "filters":{"scope":"devices","activity":"day","day":day,"asOf":str(at),"snapshot":key}})
         return {"asOf":at,"timezone":"Asia/Shanghai","metrics":metrics,"trend":trend,
-            "coverage":{"firstTrustedEventAt":coverage,"firstAccountProtocolEventAt":account_coverage,"accountAttribution":"仅事件发生时可验证账号；旧事件不反推",
-                        "note":"仅覆盖已同意且成功收到的前台使用；未收到不代表无人使用。近30日按含今日的30个北京时间日。"}}
+            "coverage":{"firstTrustedEventAt":coverage,"firstAccountProtocolEventAt":account_coverage,
+                        'firstServiceEventAt':service_coverage,'firstAccountActivityAt':account_activity_coverage,
+                        "accountAttribution":"成功登录、注册、业务操作或可验证账号的前台事件按平台注册账号去重；匿名安装认证不算注册账号登录",
+                        "note":"后端使用按收到成功业务记录的安装去重，不等于人数或完整 App 日活。账号使用另含已验证前台事件；设备前台统计仅覆盖授权并成功上报的设备。未观测到不代表无人使用。近30日按含今日的30个北京时间日。"}}
     finally:
         if own: db.commit()
